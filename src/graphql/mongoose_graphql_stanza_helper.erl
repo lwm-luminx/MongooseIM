@@ -2,7 +2,7 @@
 
 -import(mongoose_graphql_helper, [null_to_undefined/1, make_error/2]).
 
--export([get_last_messages/5, row_to_map/1, handle_event/1]).
+-export([get_last_messages/5, row_to_map/1, handle_event/1, handle_event/2]).
 
 -include("mongoose.hrl").
 -include("jlib.hrl").
@@ -24,20 +24,34 @@ get_last_messages(Caller, Limit, With, Before, CheckUser) ->
     end.
 
 -spec handle_event(term()) -> {ok, map() | null}.
-handle_event({route, Acc}) ->
+handle_event(Event) ->
+    handle_event(Event, #{presences => false}).
+
+%% @doc Converts an event for a subscription stream. Messages are always passed,
+%% and presences only when requested.
+-spec handle_event(term(), #{presences := boolean()}) -> {ok, map() | null}.
+handle_event({route, Acc}, #{presences := Presences}) ->
     {From, _To, Packet} = mongoose_acc:packet(Acc),
     case Packet of
         Stanza = #xmlel{name = <<"message">>} ->
-            StanzaID = exml_query:attr(Stanza, <<"id">>, <<>>),
-            Timestamp = os:system_time(microsecond),
-            stanza_result(From, Timestamp, StanzaID, Stanza);
+            route_result(From, Stanza);
+        Stanza = #xmlel{name = <<"presence">>} when Presences ->
+            route_result(From, Stanza);
         _ ->
             {ok, null} % Skip other stanza types
     end;
-handle_event({message, Dir, {UserPid, Jid}, Stanza}) ->
+handle_event(Event, _Opts) ->
+    handle_other_event(Event).
+
+route_result(From, Stanza) ->
+    StanzaID = exml_query:attr(Stanza, <<"id">>, <<>>),
+    Timestamp = os:system_time(microsecond),
+    stanza_result(From, Timestamp, StanzaID, Stanza).
+
+handle_other_event({message, Dir, {UserPid, Jid}, Stanza}) ->
     Timestamp = os:system_time(microsecond),
     trace_result(Timestamp, UserPid, Jid, Dir, Stanza);
-handle_event(Msg) ->
+handle_other_event(Msg) ->
     ?UNEXPECTED_INFO(Msg),
     {ok, null}.
 
