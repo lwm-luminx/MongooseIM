@@ -53,6 +53,8 @@ admin_stanza_cases() ->
 
 admin_sse_cases() ->
     [admin_subscribe_for_messages,
+     admin_subscribe_for_messages_with_resource,
+     admin_subscribe_for_messages_with_resource_in_use,
      admin_subscribe_for_messages_to_unknown_user].
 
 admin_mam_cases() ->
@@ -81,6 +83,8 @@ domain_admin_stanza_cases() ->
 user_stanza_cases() ->
     [user_send_message,
      user_subscribe_for_messages,
+     user_subscribe_for_messages_with_resource,
+     user_subscribe_for_messages_with_resource_in_use,
      user_send_message_without_from,
      user_send_message_with_spoofed_from,
      user_send_message_headline,
@@ -190,6 +194,27 @@ admin_subscribe_for_messages_story(Config, Alice, Bob) ->
     escalus:assert(is_message, Stanza),
     sse_helper:stop_sse(Stream).
 
+admin_subscribe_for_messages_with_resource(Config) ->
+    escalus:fresh_story_with_config(Config, [{alice, 1}, {bob, 1}],
+                                    fun admin_subscribe_for_messages_with_resource_story/3).
+
+admin_subscribe_for_messages_with_resource_story(Config, Alice, Bob) ->
+    To = escalus_client:short_jid(Bob),
+    {200, Stream} = subscribe_for_messages(To, <<"sse-res">>, Config),
+    assert_message_to_resource_is_streamed(Alice, To, <<"sse-res">>, Stream).
+
+admin_subscribe_for_messages_with_resource_in_use(Config) ->
+    escalus:fresh_story_with_config(Config, [{bob, 1}],
+                                    fun admin_subscribe_for_messages_with_resource_in_use_story/2).
+
+admin_subscribe_for_messages_with_resource_in_use_story(Config, Bob) ->
+    To = escalus_client:short_jid(Bob),
+    Res = subscribe_for_messages(To, escalus_client:resource(Bob), Config),
+    ?assertEqual(<<"resource_conflict">>, get_err_code(Res)),
+    %% Bob's session was not taken over
+    escalus_client:send(Bob, escalus_stanza:chat_to(escalus_client:full_jid(Bob), <<"Hi!">>)),
+    escalus:assert(is_chat_message, [<<"Hi!">>], escalus:wait_for_stanza(Bob)).
+
 user_send_message(Config) ->
     escalus:fresh_story_with_config(Config, [{alice, 1}, {bob, 1}],
                                     fun user_send_message_story/3).
@@ -216,6 +241,39 @@ user_subscribe_for_messages_story(Config, Alice, Bob) ->
         graphql_helper:get_value([data, stanza, subscribeForMessages], Event),
     {ok, Stanza} = exml:parse(StanzaBin),
     escalus:assert(is_message, Stanza),
+    sse_helper:stop_sse(Stream).
+
+user_subscribe_for_messages_with_resource(Config) ->
+    escalus:fresh_story_with_config(Config, [{alice, 1}, {bob, 1}],
+                                    fun user_subscribe_for_messages_with_resource_story/3).
+
+user_subscribe_for_messages_with_resource_story(Config, Alice, Bob) ->
+    To = escalus_client:short_jid(Bob),
+    {200, Stream} = user_subscribe_for_messages(Bob, <<"sse-res">>, Config),
+    assert_message_to_resource_is_streamed(Alice, To, <<"sse-res">>, Stream).
+
+user_subscribe_for_messages_with_resource_in_use(Config) ->
+    escalus:fresh_story_with_config(Config, [{bob, 1}],
+                                    fun user_subscribe_for_messages_with_resource_in_use_story/2).
+
+user_subscribe_for_messages_with_resource_in_use_story(Config, Bob) ->
+    Res = user_subscribe_for_messages(Bob, escalus_client:resource(Bob), Config),
+    ?assertEqual(<<"resource_conflict">>, get_err_code(Res)),
+    %% Bob's session was not taken over
+    escalus_client:send(Bob, escalus_stanza:chat_to(escalus_client:full_jid(Bob), <<"Hi!">>)),
+    escalus:assert(is_chat_message, [<<"Hi!">>], escalus:wait_for_stanza(Bob)).
+
+%% A message sent to the full JID with the chosen resource is delivered to the stream
+assert_message_to_resource_is_streamed(Sender, BareJID, Resource, Stream) ->
+    From = escalus_client:full_jid(Sender),
+    To = <<BareJID/binary, "/", Resource/binary>>,
+    escalus:send(Sender, escalus_stanza:chat(From, To, <<"Hi!">>)),
+    Event = sse_helper:wait_for_event(Stream),
+    #{<<"stanza">> := StanzaBin, <<"sender">> := From} =
+        graphql_helper:get_value([data, stanza, subscribeForMessages], Event),
+    {ok, Stanza} = exml:parse(StanzaBin),
+    escalus:assert(is_message, Stanza),
+    ?assertEqual(To, exml_query:attr(Stanza, <<"to">>)),
     sse_helper:stop_sse(Stream).
 
 user_send_message_without_from(Config) ->
@@ -584,8 +642,16 @@ subscribe_for_messages(Caller, Config) ->
     Vars = #{caller => Caller},
     execute_command_sse(<<"stanza">>, <<"subscribeForMessages">>, Vars, Config).
 
+subscribe_for_messages(Caller, Resource, Config) ->
+    Vars = #{caller => Caller, resource => Resource},
+    execute_command_sse(<<"stanza">>, <<"subscribeForMessages">>, Vars, Config).
+
 user_subscribe_for_messages(User, Config) ->
     execute_user_command_sse(<<"stanza">>, <<"subscribeForMessages">>, User, #{}, Config).
+
+user_subscribe_for_messages(User, Resource, Config) ->
+    Vars = #{resource => Resource},
+    execute_user_command_sse(<<"stanza">>, <<"subscribeForMessages">>, User, Vars, Config).
 
 get_last_messages(Caller, With, Before, Config) ->
     Vars = #{caller => Caller, with => With, before => Before},

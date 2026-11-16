@@ -21,8 +21,12 @@ type StanzaAdminMutation @protected{
 }
 
 type StanzaAdminSubscription @protected{
-  "Subscribe for the given user's incoming messages"
-  subscribeForMessages(caller: JID!): StanzaMap
+  """
+  Subscribe for the given user's incoming messages.
+  The subscription opens a session with the given resource, or with a random one if it is not provided.
+  A resource that is already in use is not taken over.
+  """
+  subscribeForMessages(caller: JID!, resource: ResourceName): StanzaMap
     @protected(type: DOMAIN, args: ["caller"])
   "Subscribe for XMPP traffic"
   subscribeForTraffic(limit: Int!): TraceMap
