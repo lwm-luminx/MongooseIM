@@ -26,6 +26,7 @@
          remove_archive/3,
          delete_messages/3,
          remove_domain/3,
+         moderate_room_message/3,
          get_mam_muc_gdpr_data/3]).
 
 %% Called from mod_mam_muc_rdbms_async_pool_writer
@@ -94,6 +95,7 @@ hooks(HostType) ->
         {mam_muc_lookup_messages, HostType, fun ?MODULE:lookup_messages/3, #{}, 50},
         {mam_muc_remove_archive, HostType, fun ?MODULE:remove_archive/3, #{}, 50},
         {mam_muc_delete_messages, HostType, fun ?MODULE:delete_messages/3, #{}, 50},
+        {moderate_room_message, HostType, fun ?MODULE:moderate_room_message/3, #{}, 50},
         {get_mam_muc_gdpr_data, HostType, fun ?MODULE:get_mam_muc_gdpr_data/3, #{}, 50}
     ].
 
@@ -125,6 +127,10 @@ register_prepared_queries(Opts) ->
                              " WHERE room_id = ? AND sender_id = ? "
                              " AND origin_id = ?"
                              " ORDER BY id DESC", LimitSQL/binary>>),
+    mongoose_rdbms:prepare(mam_muc_select_message_to_moderate, mam_muc_message,
+                           [room_id, id],
+                           <<"SELECT origin_id, message FROM mam_muc_message"
+                             " WHERE room_id = ? AND id = ?">>),
     mongoose_rdbms:prepare(mam_muc_select_messages_to_retract_on_stanza_id, mam_muc_message,
                            [room_id, sender_id, id],
                            <<"SELECT origin_id, message FROM mam_muc_message"
@@ -289,6 +295,43 @@ make_tombstone(HostType, ArcID, _RetractionId,
     Tombstone = mod_mam_utils:tombstone(RetractionInfo1, ArcJID),
     TombstoneData = mam_encoder:encode_packet(Tombstone, Env),
     execute_make_tombstone(HostType, TombstoneData, ArcID, MessID).
+
+%% Moderation logic (XEP-0425)
+-spec moderate_room_message(Acc, Params, Extra) -> {ok, Acc} when
+    Acc :: ok | {error, item_not_found},
+    Params :: mod_muc_room:moderate_message_params(),
+    Extra :: gen_hook:extra().
+moderate_room_message(Acc, Params = #{room_jid := RoomJID}, #{host_type := HostType}) ->
+    case mod_mam_utils:is_mam_muc_enabled(RoomJID#jid.lserver, HostType)
+         andalso mod_mam_utils:has_message_retraction(mod_mam_muc, HostType) of
+        true ->
+            {ok, moderate_room_message(HostType, Params)};
+        false ->
+            {ok, Acc}
+    end.
+
+-spec moderate_room_message(host_type(), mod_muc_room:moderate_message_params()) ->
+    ok | {error, item_not_found}.
+moderate_room_message(HostType, Params = #{room_jid := RoomJID, stanza_id := BinStanzaID}) ->
+    try mod_mam_utils:external_binary_to_mess_id(BinStanzaID) of
+        MessID ->
+            ArcID = mod_mam_muc:archive_id_int(HostType, RoomJID),
+            Env = env_vars(HostType, RoomJID),
+            {selected, Rows} =
+                mongoose_rdbms:execute_successfully(HostType, mam_muc_select_message_to_moderate,
+                                                    [ArcID, MessID]),
+            case mam_decoder:decode_retraction_info(Env, Rows, {stanza_id, BinStanzaID}) of
+                skip ->
+                    {error, item_not_found};
+                #{packet := Packet} ->
+                    Tombstone = mod_mam_utils:moderated_tombstone(Packet, Params),
+                    TombstoneData = mam_encoder:encode_packet(Tombstone, Env),
+                    execute_make_tombstone(HostType, TombstoneData, ArcID, MessID),
+                    ok
+            end
+    catch throw:invalid_stanza_id ->
+            {error, item_not_found}
+    end.
 
 execute_select_messages_to_retract(HostType, ArcID, SenderID, {origin_id, OriginID}) ->
     mongoose_rdbms:execute_successfully(HostType, mam_muc_select_messages_to_retract_on_origin_id,

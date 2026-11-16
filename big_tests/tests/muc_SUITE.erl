@@ -71,6 +71,7 @@
 -define(NS_MUC_REQUEST, <<"http://jabber.org/protocol/muc#request">>).
 -define(NS_MUC_ROOMCONFIG, <<"http://jabber.org/protocol/muc#roomconfig">>).
 -define(NS_MUC_STABLE_ID, <<"http://jabber.org/protocol/muc#stable_id">>).
+-define(NS_MESSAGE_MODERATE, <<"urn:xmpp:message-moderate:1">>).
 
 
 -define(assert_equal(E, V), (
@@ -3501,6 +3502,7 @@ disco_info_with_mam(Config) ->
 muc_namespaces() ->
     [?NS_MUC,
      ?NS_MUC_STABLE_ID,
+     ?NS_MESSAGE_MODERATE,
      <<"muc_public">>,
      <<"muc_persistent">>,
      <<"muc_open">>,
@@ -3725,7 +3727,8 @@ disco_info_locked_room(Config) ->
                      Alice, stanza_to_room(escalus_stanza:iq_get(?NS_DISCO_INFO,[]), RoomName)),
 
         %% THEN receives MUC features
-        Namespaces = [?NS_MUC, ?NS_MUC_STABLE_ID, <<"muc_public">>, <<"muc_temporary">>,
+        Namespaces = [?NS_MUC, ?NS_MUC_STABLE_ID, ?NS_MESSAGE_MODERATE,
+                      <<"muc_public">>, <<"muc_temporary">>,
                       <<"muc_open">>, <<"muc_semianonymous">>, <<"muc_moderated">>,
                       <<"muc_unsecured">>],
         has_features(Stanza, Namespaces)

@@ -28,6 +28,9 @@ The following criteria are used to find the original message:
 
 If more than one message matches the criteria, only the most recent one is retracted. To avoid this case, it is recommended to use a unique identifier (UUID) as the origin ID.
 
+#### Moderated retraction
+Messages retracted by room moderators with [XEP-0425: Moderated Message Retraction](https://xmpp.org/extensions/xep-0425.html) are replaced in the room archive with a tombstone that keeps the moderator's occupant JID and the reason. See [`mod_muc`](mod_muc.md#message-moderation) for details. This also requires an RDBMS backend and the [`message_retraction`](#modulesmod_mammessage_retraction) option.
+
 #### Retraction on the stanza-id
 This module also implements an extension to the XEP, where it allows to specify the [`stanza-id`](https://xmpp.org/extensions/xep-0359.html#stanza-id) as [created by](https://xmpp.org/extensions/xep-0313.html#archives_id) the server's MAM, instead of the `origin-id` that the original [XEP-0424](https://xmpp.org/extensions/xep-0424.html) specifies. It announces this capability under the namespace `urn:esl:message-retract-by-stanza-id:0`. This is specially useful in groupchats where the `stanza-id` of a message is shared and known for all participants.
 
