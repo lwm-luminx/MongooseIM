@@ -2168,6 +2168,7 @@ mod_mam_pm(_Config) ->
     ?cfgh(P ++ [archive_groupchats], true, T(#{<<"archive_groupchats">> => true})),
     ?cfgh(P ++ [same_mam_id_for_peers], true, T(#{<<"same_mam_id_for_peers">> => true})),
     ?errh(T(#{<<"host">> => <<"muc.@HOST@">>})), % muc-only
+    ?errh(T(#{<<"delete_messages_of_removed_users">> => true})), % muc-only
     ?errh(T(#{<<"archive_groupchats">> => <<"not really">>})),
     ?errh(T(#{<<"same_mam_id_for_peers">> => <<"not really">>})).
 
@@ -2182,6 +2183,9 @@ mod_mam_muc(_Config) ->
     ?errh(T(#{<<"host">> => [<<"valid.@HOST@">>]})),
     ?errh(T(#{<<"host">> => <<"invalid.sub@HOST@">>})),
     ?errh(T(#{<<"host">> => <<"invalid.sub.@HOST@.as.well">>})),
+    ?cfgh(P ++ [delete_messages_of_removed_users], true,
+          T(#{<<"delete_messages_of_removed_users">> => true})),
+    ?errh(T(#{<<"delete_messages_of_removed_users">> => <<"yes">>})),
     ?errh(T(#{<<"archive_groupchats">> => true})), % pm-only
     ?errh(T(#{<<"same_mam_id_for_peers">> => true})). % pm-only
 

@@ -8,6 +8,9 @@ type MAMAdminMutation @protected{
   "Delete messages archived before the given date from the archives of all rooms of a MUC service. Returns the number of deleted messages"
   deleteOldRoomMessages(mucDomain: DomainName!, before: DateTime!): Int
     @protected(type: DOMAIN, args: ["mucDomain"]) @use(modules: ["mod_mam_muc"], args: ["mucDomain"])
+  "Delete messages that a user sent to rooms, archived before the given date or at any time if no date is given. Returns the number of deleted messages"
+  deleteUserRoomMessages(user: JID!, before: DateTime): Int
+    @protected(type: DOMAIN, args: ["user"]) @use(modules: ["mod_mam_muc"], args: ["user"])
   "Delete messages archived before the given date from a user's one-to-one archive. Returns the number of deleted messages"
   deleteUserMessages(user: JID!, before: DateTime!): Int
     @protected(type: DOMAIN, args: ["user"]) @use(modules: ["mod_mam_pm"], args: ["user"])

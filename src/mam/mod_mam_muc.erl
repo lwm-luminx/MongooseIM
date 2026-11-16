@@ -42,6 +42,7 @@
 
 %% ejabberd room handlers
 -export([disco_muc_features/3,
+         remove_user/3,
          filter_room_packet/3,
          forget_room/3]).
 
@@ -241,6 +242,24 @@ room_process_mam_iq(Acc, From, To, IQ, #{host_type := HostType}) ->
                            can_access_room => can_access_room(HostType, Acc, From, To)}),
             {Acc, return_action_not_allowed_error_iq(Reason, IQ)}
     end.
+
+%% @doc Delete the messages that a removed user sent to rooms, when
+%% `delete_messages_of_removed_users' is enabled.
+-spec remove_user(Acc, Params, Extra) -> {ok, Acc} when
+      Acc :: mongoose_acc:t(),
+      Params :: #{jid := jid:jid()},
+      Extra :: gen_hook:extra().
+remove_user(Acc, #{jid := #jid{luser = LUser, lserver = LServer}}, #{host_type := HostType}) ->
+    Params = #{scope => {sender, LServer, LUser}, before_id => mod_mam_utils:max_message_id()},
+    case mongoose_hooks:mam_muc_delete_messages(HostType, Params) of
+        {ok, Count} ->
+            ?LOG_INFO(#{what => mam_muc_removed_user_messages_deleted, count => Count,
+                        user => LUser, server => LServer});
+        {error, not_supported} ->
+            ?LOG_WARNING(#{what => mam_muc_removed_user_messages_not_deleted,
+                           reason => not_supported, user => LUser, server => LServer})
+    end,
+    {ok, Acc}.
 
 -spec forget_room(Acc, Params, Extra) -> {ok, Acc} when
     Acc :: term(),
@@ -679,7 +698,19 @@ hooks(HostType) ->
     [{disco_muc_features, HostType, fun ?MODULE:disco_muc_features/3, #{}, 99},
      {filter_room_packet, HostType, fun ?MODULE:filter_room_packet/3, #{}, 60},
      {forget_room, HostType, fun ?MODULE:forget_room/3, #{}, 90},
-     {get_personal_data, HostType, fun ?MODULE:get_personal_data/3, #{}, 50}].
+     {get_personal_data, HostType, fun ?MODULE:get_personal_data/3, #{}, 50}]
+    ++ remove_user_hooks(HostType).
+
+%% Run before mod_mam_pm, which can remove the user from the archive users table,
+%% where the backend looks up the messages' sender.
+remove_user_hooks(HostType) ->
+    case gen_mod:get_module_opt(HostType, ?MODULE, delete_messages_of_removed_users) of
+        true ->
+            [{remove_user, HostType, fun ?MODULE:remove_user/3, #{}, 40},
+             {anonymous_purge, HostType, fun ?MODULE:remove_user/3, #{}, 40}];
+        false ->
+            []
+    end.
 
 add_iq_handlers(HostType, Opts) ->
     IQDisc = gen_mod:get_opt(iqdisc, Opts, parallel),

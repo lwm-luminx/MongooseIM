@@ -100,6 +100,8 @@
          incremental_delete_domain/5,
          delete_in_batches/4,
          prepare_delete_messages/5,
+         prepare_delete_sender_messages/2,
+         max_message_id/0,
          delete_messages_args/2,
          db_message_codec/2, db_jid_codec/2]).
 
@@ -1374,6 +1376,26 @@ prepare_delete_messages(#{delete_domain_limit := Limit}, Table, ArchiveColumn,
                            delete_messages_sql(Table, ArchiveColumn, Limit, [server])),
     ok.
 
+%% @doc Prepare the query deleting messages that a user sent to any room, archived before a
+%% given message ID. Senders are listed in `mam_server_user' like the archive owners.
+-spec prepare_delete_sender_messages(#{delete_domain_limit := pos_integer() | infinity},
+                                     Query :: atom()) -> ok.
+prepare_delete_sender_messages(#{delete_domain_limit := infinity}, Query) ->
+    mongoose_rdbms:prepare(Query, mam_muc_message,
+                           ['mam_server_user.server', 'mam_server_user.user_name', id],
+                           <<"DELETE FROM mam_muc_message WHERE sender_id IN "
+                             "(SELECT id FROM mam_server_user WHERE server = ? AND user_name = ?)"
+                             " AND id < ?">>);
+prepare_delete_sender_messages(#{delete_domain_limit := Limit}, Query) ->
+    LimitSQL = rdbms_queries:limit(Limit),
+    mongoose_rdbms:prepare(Query, mam_muc_message,
+                           ['mam_server_user.server', 'mam_server_user.user_name', id],
+                           <<"DELETE FROM mam_muc_message WHERE (room_id, id) IN "
+                             "(SELECT * FROM (SELECT msg.room_id, msg.id FROM mam_muc_message msg"
+                             " INNER JOIN mam_server_user msu ON msu.id = msg.sender_id"
+                             " WHERE msu.server = ? AND msu.user_name = ? AND msg.id < ?",
+                             LimitSQL/binary, ") AS T)">>).
+
 -spec delete_messages_sql(atom(), atom(), pos_integer() | infinity, [atom()]) -> binary().
 delete_messages_sql(Table, ArchiveColumn, infinity, FilterColumns) ->
     T = atom_to_binary(Table),
@@ -1397,7 +1419,14 @@ archive_filter_sql(Prefix, Columns) ->
     Conditions = [<<Prefix/binary, (atom_to_binary(Column))/binary, " = ?">> || Column <- Columns],
     iolist_to_binary(lists:join(<<" AND ">>, Conditions)).
 
+%% @doc The highest possible message ID, to delete messages archived at any time.
+-spec max_message_id() -> mod_mam:message_id().
+max_message_id() ->
+    ?BIGINT_MAX.
+
 -spec delete_messages_args(mod_mam:delete_messages_scope(), mod_mam:message_id()) -> [term()].
+delete_messages_args({sender, LServer, LUser}, BeforeID) ->
+    [LServer, LUser, BeforeID];
 delete_messages_args({archive, LServer, LUser}, BeforeID) ->
     [LServer, LUser, BeforeID];
 delete_messages_args({server, LServer}, BeforeID) ->

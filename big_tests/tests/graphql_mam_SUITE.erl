@@ -13,6 +13,7 @@
 -define(ROOM_DELETE_PATH, [data, mam, deleteRoomMessages]).
 -define(OLD_ROOM_DELETE_PATH, [data, mam, deleteOldRoomMessages]).
 -define(USER_DELETE_PATH, [data, mam, deleteUserMessages]).
+-define(USER_ROOM_DELETE_PATH, [data, mam, deleteUserRoomMessages]).
 -define(OLD_DELETE_PATH, [data, mam, deleteOldMessages]).
 
 %% Messages are archived at these dates, and deleted before the cut-off date
@@ -25,7 +26,8 @@ suite() ->
 all() ->
     [{group, admin_http},
      {group, admin_cli},
-     {group, domain_admin}].
+     {group, domain_admin},
+     {group, removed_users}].
 
 groups() ->
     [{admin_http, [], admin_groups()},
@@ -34,7 +36,8 @@ groups() ->
      {admin_mam, [], admin_mam_tests()},
      {admin_mam_not_configured, [], mam_not_configured_tests()},
      {domain_admin_mam, [], domain_admin_mam_tests()},
-     {domain_admin_mam_not_configured, [], mam_not_configured_tests()}].
+     {domain_admin_mam_not_configured, [], mam_not_configured_tests()},
+     {removed_users, [], removed_users_tests()}].
 
 admin_groups() ->
     [{group, admin_mam},
@@ -48,6 +51,8 @@ admin_mam_tests() ->
     [delete_room_messages,
      delete_room_messages_from_empty_archive,
      delete_old_room_messages,
+     delete_user_room_messages,
+     delete_all_user_room_messages,
      delete_user_messages,
      delete_old_messages,
      delete_room_messages_unknown_muc_server,
@@ -59,12 +64,18 @@ domain_admin_mam_tests() ->
     [delete_room_messages,
      delete_room_messages_from_empty_archive,
      delete_old_room_messages,
+     delete_user_room_messages,
+     delete_all_user_room_messages,
      delete_user_messages,
      delete_old_messages,
      domain_admin_delete_room_messages_no_permission,
      domain_admin_delete_old_room_messages_no_permission,
      domain_admin_delete_user_messages_no_permission,
+     domain_admin_delete_user_room_messages_no_permission,
      domain_admin_delete_old_messages_no_permission].
+
+removed_users_tests() ->
+    [removed_user_room_messages_are_deleted].
 
 mam_not_configured_tests() ->
     [delete_room_messages_mam_not_configured,
@@ -96,6 +107,15 @@ init_per_group(GroupName, Config) when GroupName =:= admin_mam;
     MAMOpts = mam_helper:config_opts(
                 #{pm => #{},
                   muc => #{host => subhost_pattern(muc_helper:muc_host_pattern())},
+                  async_writer => #{enabled => false}}),
+    dynamic_modules:ensure_modules(host_type(), [{mod_mam, MAMOpts}]),
+    Config;
+init_per_group(removed_users, Config) ->
+    muc_helper:load_muc(),
+    MAMOpts = mam_helper:config_opts(
+                #{pm => #{},
+                  muc => #{host => subhost_pattern(muc_helper:muc_host_pattern()),
+                           delete_messages_of_removed_users => true},
                   async_writer => #{enabled => false}}),
     dynamic_modules:ensure_modules(host_type(), [{mod_mam, MAMOpts}]),
     Config;
@@ -149,6 +169,45 @@ delete_old_room_messages(Config) ->
     ?assertEqual(1, room_archive_size(Room1)),
     ?assertEqual(1, room_archive_size(Room2)).
 
+delete_user_room_messages(Config) ->
+    escalus:fresh_story_with_config(Config, [{alice, 1}, {bob, 1}],
+                                    fun delete_user_room_messages_story/3).
+
+delete_user_room_messages_story(Config, Alice, Bob) ->
+    Room1 = fresh_room_name(),
+    Room2 = fresh_room_name(),
+    [put_client_room_msgs(Room, Sender) || Room <- [Room1, Room2], Sender <- [Alice, Bob]],
+    Res = delete_user_room_messages(escalus_client:short_jid(Alice), ?BEFORE, Config),
+    ?assertEqual(4, get_ok_value(?USER_ROOM_DELETE_PATH, Res)),
+    %% Alice's latest message and all of Bob's messages are left in each room
+    ?assertEqual(4, room_archive_size(Room1)),
+    ?assertEqual(4, room_archive_size(Room2)).
+
+delete_all_user_room_messages(Config) ->
+    escalus:fresh_story_with_config(Config, [{alice, 1}, {bob, 1}],
+                                    fun delete_all_user_room_messages_story/3).
+
+delete_all_user_room_messages_story(Config, Alice, Bob) ->
+    Room = fresh_room_name(),
+    put_client_room_msgs(Room, Alice),
+    put_client_room_msgs(Room, Bob),
+    Res = delete_user_room_messages(escalus_client:short_jid(Alice), null, Config),
+    ?assertEqual(3, get_ok_value(?USER_ROOM_DELETE_PATH, Res)),
+    ?assertEqual(3, room_archive_size(Room)).
+
+removed_user_room_messages_are_deleted(Config) ->
+    escalus:fresh_story_with_config(Config, [{alice, 1}, {bob, 1}],
+                                    fun removed_user_room_messages_are_deleted_story/3).
+
+removed_user_room_messages_are_deleted_story(_Config, Alice, Bob) ->
+    Room = fresh_room_name(),
+    put_client_room_msgs(Room, Alice),
+    put_client_room_msgs(Room, Bob),
+    {ok, _} = rpc_apply(mongoose_account_api, unregister_user,
+                        [escalus_client:username(Alice), escalus_client:server(Alice)]),
+    %% Only Bob's messages are left
+    ?assertEqual(3, room_archive_size(Room)).
+
 delete_user_messages(Config) ->
     escalus:fresh_story_with_config(Config, [{alice, 1}, {bob, 1}], fun delete_user_messages_story/3).
 
@@ -198,6 +257,10 @@ domain_admin_delete_user_messages_no_permission(Config) ->
     get_unauthorized(delete_user_messages(<<"user@", (secondary_domain())/binary>>,
                                           ?BEFORE, Config)).
 
+domain_admin_delete_user_room_messages_no_permission(Config) ->
+    get_unauthorized(delete_user_room_messages(<<"user@", (secondary_domain())/binary>>,
+                                               ?BEFORE, Config)).
+
 domain_admin_delete_old_messages_no_permission(Config) ->
     get_unauthorized(delete_old_messages(secondary_domain(), ?BEFORE, Config)).
 
@@ -236,11 +299,22 @@ archive_size(Client) ->
 
 %% Archive one room message on each of ?DATES
 put_room_msgs(Room) ->
+    SenderJID = mongoose_helper:make_jid(<<"sender">>, domain(), <<"res">>),
+    put_room_msgs(Room, SenderJID, <<"nick">>).
+
+%% Archive one room message from the client on each of ?DATES
+put_client_room_msgs(Room, Client) ->
+    SenderJID = mongoose_helper:make_jid(escalus_client:username(Client),
+                                         escalus_client:server(Client),
+                                         escalus_client:resource(Client)),
+    put_room_msgs(Room, SenderJID, escalus_client:username(Client)).
+
+put_room_msgs(Room, SenderJID, Nick) ->
     MUCHost = muc_helper:muc_host(),
     RoomJID = mongoose_helper:make_jid(Room, MUCHost, <<>>),
     RoomArcID = rpc_apply(mod_mam_muc, archive_id, [MUCHost, Room]),
-    SenderJID = mongoose_helper:make_jid(<<"sender">>, domain(), <<"res">>),
-    SrcJID = mongoose_helper:make_jid(Room, MUCHost, <<"nick">>),
+    SrcJID = mongoose_helper:make_jid(Room, MUCHost, Nick),
+    Before = room_archive_size(Room),
     [ok = rpc_apply(mod_mam_muc, archive_message_for_ct,
                     [#{message_id => message_id(DateTime),
                        archive_id => RoomArcID,
@@ -251,7 +325,7 @@ put_room_msgs(Room) ->
                        direction => incoming,
                        packet => escalus_stanza:groupchat_to(room_jid(Room), <<"Hi">>)}])
      || DateTime <- ?DATES],
-    mam_helper:wait_for_room_archive_size(MUCHost, Room, 3).
+    mam_helper:wait_for_room_archive_size(MUCHost, Room, Before + 3).
 
 room_archive_size(Room) ->
     rpc_apply(mod_mam_muc, archive_size, [muc_helper:muc_host(), Room]).
@@ -270,6 +344,10 @@ delete_room_messages(Room, Before, Config) ->
 delete_old_room_messages(MUCDomain, Before, Config) ->
     Vars = #{<<"mucDomain">> => MUCDomain, <<"before">> => Before},
     execute_command(<<"mam">>, <<"deleteOldRoomMessages">>, Vars, Config).
+
+delete_user_room_messages(User, Before, Config) ->
+    Vars = #{<<"user">> => User, <<"before">> => Before},
+    execute_command(<<"mam">>, <<"deleteUserRoomMessages">>, Vars, Config).
 
 delete_user_messages(User, Before, Config) ->
     Vars = #{<<"user">> => User, <<"before">> => Before},

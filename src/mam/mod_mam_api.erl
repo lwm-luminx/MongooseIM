@@ -8,6 +8,7 @@
 
 -export([delete_room_messages/2,
          delete_old_room_messages/2,
+         delete_user_room_messages/2,
          delete_user_messages/2,
          delete_old_messages/2]).
 
@@ -43,6 +44,23 @@ delete_old_room_messages(MUCDomain, Before) ->
             format_result(mongoose_hooks:mam_muc_delete_messages(HostType, Params));
         {error, not_found} ->
             ?MUC_SERVER_NOT_FOUND_RESULT
+    end.
+
+%% @doc Delete messages that a user sent to rooms, archived before `Before',
+%% or at any time when `Before' is `undefined'.
+-spec delete_user_room_messages(jid:jid(), mod_mam:unix_timestamp() | undefined) ->
+          delete_result().
+delete_user_room_messages(#jid{luser = LUser, lserver = LServer}, Before) ->
+    case mongoose_domain_api:get_domain_host_type(LServer) of
+        {ok, HostType} ->
+            BeforeID = case Before of
+                           undefined -> mod_mam_utils:max_message_id();
+                           _ -> before_id(Before)
+                       end,
+            Params = #{scope => {sender, LServer, LUser}, before_id => BeforeID},
+            format_result(mongoose_hooks:mam_muc_delete_messages(HostType, Params));
+        {error, not_found} ->
+            ?DOMAIN_NOT_FOUND_RESULT
     end.
 
 %% @doc Delete messages archived before `Before' from the one-to-one archive of a user.
