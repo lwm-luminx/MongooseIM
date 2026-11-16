@@ -59,6 +59,7 @@
 {suites, "tests", graphql_external_services_SUITE}.
 {suites, "tests", graphql_metric_SUITE}.
 {suites, "tests", graphql_blocklist_SUITE}.
+{suites, "tests", graphql_blocking_SUITE}.
 {suites, "tests", inbox_SUITE}.
 {suites, "tests", inbox_extensions_SUITE}.
 {suites, "tests", login_SUITE}.

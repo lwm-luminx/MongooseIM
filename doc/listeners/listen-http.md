@@ -163,7 +163,7 @@ When set, the token is accepted only if its `aud` claim is equal to this value, 
 Name of the claim containing the domain that the token holder administers.
 
 ### `listen.http.handlers.mongoose_graphql_handler.allowed_categories`
-* **Syntax:** non-empty array of strings. Allowed values: `"checkAuth", "account", "domain", "last", "muc", "muc_light", "session", "stanza", "roster", "vcard", "private", "metric", "stat", "gdpr", "mnesia", "server", "inbox", "http_upload", "offline", "token", "cets"`
+* **Syntax:** non-empty array of strings. Allowed values: `"checkAuth", "account", "domain", "last", "muc", "muc_light", "session", "stanza", "roster", "vcard", "private", "metric", "stat", "gdpr", "mnesia", "server", "inbox", "http_upload", "offline", "token", "cets", "broadcast", "blocklist", "blocking"`
 * **Default:** all GraphQL categories enabled
 * **Example:** `allowed_categories = ["domain", "last"]`
 

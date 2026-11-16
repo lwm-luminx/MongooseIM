@@ -25,6 +25,19 @@ The resource is then respectively user's nickname in case of `muc` or user's bar
 
 Note: When a blocked user sends a message to a room, the server does not respond with an error but silently ignores it, i.e. doesn't deliver it to the user that issued the blocking.
 
+## Admin API
+
+The users' blocking lists can be managed with the `blocking` category of the [GraphQL admin API](../graphql-api/Admin-GraphQL.md),
+or with `mongooseimctl blocking`:
+
+* `getBlockingList(user)` returns the JIDs blocked by the user,
+* `block(user, jids)` blocks the JIDs for the user, and returns the blocked JIDs,
+* `unblock(user, jids)` unblocks the JIDs for the user, and returns the JIDs that were blocked before.
+
+The changes have the same effect as the blocking command sent by the user:
+the user's online resources receive the blocking push, and the presences of the affected contacts are updated.
+A domain admin can manage the blocking lists of the users in their domain.
+
 ## Options
 
 Same as in [`mod_privacy`](./mod_privacy.md#options).
