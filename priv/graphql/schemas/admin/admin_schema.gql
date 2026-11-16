@@ -82,6 +82,8 @@ type AdminMutation @protected{
   externalServices: ExternalServicesAdminMutation
   "Deleting old Offline messages"
   offline: OfflineAdminMutation
+  "Message archive management"
+  mam: MAMAdminMutation
   "OAUTH user token management"
   token: TokenAdminMutation
   "Mnesia internal database management"

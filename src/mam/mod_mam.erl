@@ -76,6 +76,13 @@
                                     %% Only in mod_mam_muc_rdbms_arch:retract_message/2
                                     sender_id => archive_id()}.
 
+%% Which archives to delete messages from: one archive (of a user or a room),
+%% or all archives of a domain (users) or of a MUC service (rooms).
+-type delete_messages_scope() :: {archive, jid:lserver(), jid:luser()} | {server, jid:lserver()}.
+-type delete_messages_params() :: #{scope := delete_messages_scope(),
+                                    %% Delete messages with IDs lower than this one
+                                    before_id := message_id()}.
+
 -export_type([rewriter_fun/0,
               borders/0,
               preference/0,
@@ -84,6 +91,8 @@
               unix_timestamp/0,
               archive_id/0,
               lookup_result/0,
+              delete_messages_scope/0,
+              delete_messages_params/0,
               lookup_result_map/0,
               message_row/0,
               message_id/0,
