@@ -63,6 +63,22 @@ When using ElasticSearch MAM backend, the value provided in `full-text-search` f
 If you're using our official ElasticSearch mappings from `priv/elasticsearch` then the query analyzer is set to `english`.
 Also note that the default separator for the search query is `AND` (which roughly means that ElasticSearch will search for messages containing all the terms provided in the query string).
 
+### Deleting old messages
+
+The [GraphQL admin API](../graphql-api/Admin-GraphQL.md) can delete messages archived before a given date, for example to enforce a retention period:
+
+* `mam.deleteRoomMessages(room, before)` deletes them from the archive of one MUC room,
+* `mam.deleteOldRoomMessages(mucDomain, before)` from the archives of all rooms of a MUC service,
+* `mam.deleteUserMessages(user, before)` from the one-to-one archive of one user,
+* `mam.deleteOldMessages(domain, before)` from the one-to-one archives of all users of a domain.
+* `mam.deleteUserRoomMessages(user, before)` deletes the messages sent by one user from the archives of all MUC rooms of the user's host type. When `before` is omitted, all of them are deleted.
+
+Each command returns the number of deleted messages.
+The same commands are available in `mongooseimctl` as `mam deleteRoomMessages` and so on.
+Unlike [message retraction](#message-retraction), which keeps a tombstone in place of the retracted message, these commands remove the messages from the database.
+Only the `rdbms` backend supports them; with other backends they return a `not_supported` error.
+Large deletions can be split into batches with [`delete_domain_limit`](#modulesmod_mamdelete_domain_limit).
+
 ## Options
 
 ### `modules.mod_mam.backend`
@@ -194,6 +210,15 @@ The MUC host that will be archived if MUC archiving is enabled.
 
 !!! Warning
     If you are using MUC Light, make sure this option is set to the MUC Light domain
+
+#### `modules.mod_mam.muc.delete_messages_of_removed_users`
+* **Syntax:** boolean
+* **Default:** `false`
+* **Example:** `modules.mod_mam.muc.delete_messages_of_removed_users = true`
+
+When enabled, removing a user account (or purging an anonymous user) also deletes the messages that the user sent to MUC rooms from the room archives.
+By default these messages stay in the room archives after the account is removed.
+Only the `rdbms` backend supports this option.
 
 #### Example
 
@@ -351,6 +376,7 @@ See [Message Archive Management extensions](../open-extensions/mam.md).
 * **Example:** `modules.mod_mam.delete_domain_limit = 10000`
 
 Domain deletion can be an expensive operation, as it requires to delete potentially many thousands of records from the DB. By default, the delete operation deletes everything in a transaction, but it might be desired, to handle timeouts and table locks more gracefully, to delete the records in batches. This limit establishes the size of the batch.
+It also applies to [deleting old messages](#deleting-old-messages) with the admin API.
 
 #### `modules.mod_mam.db_jid_format`
 

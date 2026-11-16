@@ -284,7 +284,7 @@ reply_error(Msg, Req, State) ->
     {stop, Reply, State}.
 
 allowed_categories() ->
-    [<<"checkAuth">>, <<"account">>, <<"domain">>, <<"last">>, <<"muc">>, <<"muc_light">>,
+    [<<"checkAuth">>, <<"account">>, <<"domain">>, <<"last">>, <<"mam">>, <<"muc">>, <<"muc_light">>,
      <<"session">>, <<"stanza">>, <<"roster">>, <<"vcard">>, <<"private">>, <<"metric">>,
      <<"stat">>, <<"gdpr">>, <<"mnesia">>, <<"server">>, <<"inbox">>, <<"http_upload">>,
      <<"offline">>, <<"token">>, <<"cets">>, <<"broadcast">>, <<"blocklist">>].
