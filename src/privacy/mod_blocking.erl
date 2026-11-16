@@ -12,6 +12,10 @@
 -export([supported_features/0]).
 -export([config_spec/0]).
 
+%% API
+-export([get_blocking_list/3,
+         set_blocking_list/5]).
+
 -export([
          process_iq_get/3,
          process_iq_set/3,
@@ -58,6 +62,35 @@ c2s_hooks(HostType) ->
      {user_send_iq, HostType, fun ?MODULE:user_send_iq/3, #{}, 50},
      {foreign_event, HostType, fun ?MODULE:foreign_event/3, #{}, 50}
     ].
+
+%% API
+
+%% @doc Returns the user's blocking list (XEP-0191).
+-spec get_blocking_list(mongooseim:host_type(), jid:luser(), jid:lserver()) ->
+          {ok, [listitem()]} | {error, term()}.
+get_blocking_list(HostType, LUser, LServer) ->
+    case mod_privacy_backend:get_privacy_list(HostType, LUser, LServer, <<"blocking">>) of
+        {ok, List} -> {ok, List};
+        {error, not_found} -> {ok, []};
+        {error, Reason} -> {error, Reason};
+        Other -> {error, Other}
+    end.
+
+%% @doc Blocks or unblocks the given JIDs for the user, as if the user sent
+%% the blocking command (XEP-0191). The user's online resources get the
+%% blocking push, and the presence to the affected contacts is updated.
+-spec set_blocking_list(mongooseim:host_type(), jid:luser(), jid:lserver(),
+                        blocking_type(), [jid:literal_jid(), ...]) ->
+          {ok, [jid:literal_jid()]} | {error, term()}.
+set_blocking_list(HostType, LUser, LServer, Type, JIDs = [_ | _]) ->
+    maybe
+        {ok, CurrList} ?= get_blocking_list(HostType, LUser, LServer),
+        {ok, Changed, List, NType} ?=
+            modify_blocking_list(HostType, LUser, LServer, Type, JIDs, CurrList),
+        UserList = #userlist{name = <<"blocking">>, list = List, needdb = false},
+        broadcast_blocking_command(HostType, LUser, LServer, UserList, Changed, NType),
+        {ok, Changed}
+    end.
 
 -spec user_send_iq(mongoose_acc:t(), mongoose_c2s_hooks:params(), map()) ->
     mongoose_c2s_hooks:result().
@@ -140,14 +173,7 @@ disco_local_features(Acc, _, _) ->
 process_iq_get(Acc, #{from := #jid{luser = LUser, lserver = LServer},
                iq := #iq{xmlns = ?NS_BLOCKING}}, _) ->
     HostType = mongoose_acc:host_type(Acc),
-    Res = case mod_privacy_backend:get_privacy_list(HostType, LUser, LServer, <<"blocking">>) of
-              {error, not_found} ->
-                  {ok, []};
-              {ok, L} ->
-                  {ok, L};
-              E ->
-                  {error, E}
-          end,
+    Res = get_blocking_list(HostType, LUser, LServer),
     IqRes = case Res of
                 {ok, Lst} ->
                     {result, blocking_query_response(Lst)};
@@ -169,14 +195,10 @@ process_iq_set(Acc, #{from := From, iq := #iq{xmlns = ?NS_BLOCKING, sub_el = Sub
     #xmlel{name = BType} = SubEl,
     Type = parse_command_type(BType),
     Usrs = exml_query:paths(SubEl, [{element, <<"item">>}, {attr, <<"jid">>}]),
-    CurrList = case mod_privacy_backend:get_privacy_list(HostType, LUser, LServer, <<"blocking">>) of
-                  {ok, List} ->
-                      List;
-                  {error, not_found} ->
-                      [];
-                  {error, Reason} ->
-                      {error, Reason}
-              end,
+    CurrList = case get_blocking_list(HostType, LUser, LServer) of
+                   {ok, List} -> List;
+                   {error, Reason} -> {error, Reason}
+               end,
     %% process
     {Acc1, Res} = process_blocking_iq_set(Type, Acc, LUser, LServer, CurrList, Usrs),
     %% respond / notify
@@ -210,18 +232,27 @@ process_blocking_iq_set(block, Acc, _, _, _, []) ->
 process_blocking_iq_set(Type, Acc, LUser, LServer, CurrList, Usrs) ->
     %% check who is being added / removed
     HostType = mongoose_acc:host_type(Acc),
+    case modify_blocking_list(HostType, LUser, LServer, Type, Usrs, CurrList) of
+        {ok, _, _, _} = Result ->
+            {Acc, Result};
+        {error, not_found} ->
+            {Acc, {error, mongoose_xmpp_errors:item_not_found()}};
+        {error, _Reason} ->
+            {Acc, {error, mongoose_xmpp_errors:internal_server_error()}}
+    end.
+
+-spec modify_blocking_list(mongooseim:host_type(), jid:luser(), jid:lserver(),
+                           blocking_type(), [binary()], [listitem()]) ->
+          {ok, [binary()], [listitem()], block | unblock | unblock_all} | {error, term()}.
+modify_blocking_list(HostType, LUser, LServer, Type, Usrs, CurrList) ->
     {NType, Changed, NewList} = blocking_list_modify(Type, Usrs, CurrList),
     case mod_privacy_backend:replace_privacy_list(HostType, LUser, LServer, <<"blocking">>, NewList) of
         {error, E} ->
             {error, E};
         ok ->
             case mod_privacy_backend:set_default_list(HostType, LUser, LServer, <<"blocking">>) of
-                ok ->
-                    {Acc, {ok, Changed, NewList, NType}};
-                {error, not_found} ->
-                    {Acc, {error, mongoose_xmpp_errors:item_not_found()}};
-                {error, _Reason} ->
-                {Acc, {error, mongoose_xmpp_errors:internal_server_error()}}
+                ok -> {ok, Changed, NewList, NType};
+                {error, Reason} -> {error, Reason}
             end
     end.
 
@@ -232,7 +263,8 @@ complete_iq_set(blocking_command, Acc, _, _, {error, Reason}) ->
 complete_iq_set(blocking_command, Acc, LUser, LServer, {ok, Changed, List, Type}) ->
     UserList = #userlist{name = <<"blocking">>, list = List, needdb = false},
     % send the list to all users c2s processes (resources) to make it effective immediately
-    broadcast_blocking_command(Acc, LUser, LServer, UserList, Changed, Type),
+    HostType = mongoose_acc:host_type(Acc),
+    broadcast_blocking_command(HostType, LUser, LServer, UserList, Changed, Type),
     % return a response here so that c2s sets the list in its state
     {Acc, {result, [], UserList}}.
 %%complete_iq_set(blocking_command, _, _, _) ->
@@ -305,11 +337,10 @@ make_blocking_list_entry(J) ->
 
 %% @doc send iq confirmation to all of the user's resources
 %% if we unblock all contacts then we don't list who's been unblocked
-broadcast_blocking_command(Acc, LUser, LServer, UserList, _Changed, unblock_all) ->
-    broadcast_blocking_command(Acc, LUser, LServer, UserList, [], unblock);
-broadcast_blocking_command(Acc, LUser, LServer, UserList, Changed, Type) ->
+broadcast_blocking_command(HostType, LUser, LServer, UserList, _Changed, unblock_all) ->
+    broadcast_blocking_command(HostType, LUser, LServer, UserList, [], unblock);
+broadcast_blocking_command(HostType, LUser, LServer, UserList, Changed, Type) ->
     Item = {blocking, UserList, Type, Changed},
-    HostType = mongoose_acc:host_type(Acc),
     mod_privacy:broadcast_item(HostType, LUser, LServer, ?MODULE, Item).
 
 -spec blocking_query_response([mod_privacy:list_name()]) -> exml:element().

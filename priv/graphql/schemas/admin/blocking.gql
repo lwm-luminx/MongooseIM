@@ -1,0 +1,21 @@
+"""
+Allow admin to get the users' blocking lists (XEP-0191).
+"""
+type BlockingAdminQuery @protected @use(modules: ["mod_blocking"]) {
+  "Get the JIDs blocked by the user"
+  getBlockingList(user: JID!): [JID!]
+    @protected(type: DOMAIN, args: ["user"]) @use(args: ["user"])
+}
+
+"""
+Allow admin to manage the users' blocking lists (XEP-0191).
+The changes take effect immediately in the user's sessions, as if the user sent the blocking command.
+"""
+type BlockingAdminMutation @protected @use(modules: ["mod_blocking"]) {
+  "Block the JIDs for the user. Returns the blocked JIDs."
+  block(user: JID!, jids: [JID!]!): [JID!]
+    @protected(type: DOMAIN, args: ["user"]) @use(args: ["user"])
+  "Unblock the JIDs for the user. Returns the JIDs that were blocked before."
+  unblock(user: JID!, jids: [JID!]!): [JID!]
+    @protected(type: DOMAIN, args: ["user"]) @use(args: ["user"])
+}
