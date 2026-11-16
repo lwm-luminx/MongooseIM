@@ -18,15 +18,23 @@ Configure MAM with different storage backends:
 `mod_mam` is a meta-module that ensures all relevant `mod_mam_*` modules are loaded and properly configured.
 
 ### Message retraction
-This module supports [XEP-0424: Message Retraction](http://xmpp.org/extensions/xep-0424.html) with RDBMS storage backends. When a [retraction message](https://xmpp.org/extensions/xep-0424.html#example-4) is received, the MAM module finds the message to retract and replaces it with a tombstone.
+This module supports [XEP-0424: Message Retraction](http://xmpp.org/extensions/xep-0424.html) with RDBMS storage backends. When a [retraction message](https://xmpp.org/extensions/xep-0424.html#usecase) is received, the MAM module finds the message to retract and replaces it with a tombstone. The retraction message itself is archived as well.
 
-The following criteria are used to find the original message:
+Both versions of the XEP are supported:
 
-* The `id` attribute specified in the `apply-to` element of the retraction message has to be the same as the `id` attribute of the `origin-id` (or `stanza-id` when configured, see [below](#retraction-on-the-stanza-id)) element of the original message.
+* The current version (`urn:xmpp:message-retract:1`) uses a top-level `retract` element. Its `id` attribute refers to:
+    * the `stanza-id` assigned by the room, for messages of type `groupchat` (if the `id` is not a valid stanza ID, it is treated as an origin ID),
+    * the `id` attribute of the original message, for other messages. The archive stores it as the origin ID when the message has no `origin-id` element.
+
+    The tombstone is a `<retracted xmlns='urn:xmpp:message-retract:1'/>` element whose `id` attribute is the `id` of the retraction message.
+* The older version (`urn:xmpp:message-retract:0`) wraps the `retract` element in an `apply-to` element (XEP-0422). Its `id` attribute has to be the same as the `id` attribute of the `origin-id` (or `stanza-id` when configured, see [below](#retraction-on-the-stanza-id)) element of the original message.
+
+In both cases:
+
 * Both messages need to originate from the same user.
 * Both messages need to be addressed to the same user.
 
-If more than one message matches the criteria, only the most recent one is retracted. To avoid this case, it is recommended to use a unique identifier (UUID) as the origin ID.
+If more than one message matches the criteria, only the most recent one is retracted. To avoid this case, it is recommended to use a unique identifier (UUID) as the message ID or origin ID.
 
 #### Moderated retraction
 Messages retracted by room moderators with [XEP-0425: Moderated Message Retraction](https://xmpp.org/extensions/xep-0425.html) are replaced in the room archive with a tombstone that keeps the moderator's occupant JID and the reason. See [`mod_muc`](mod_muc.md#message-moderation) for details. This also requires an RDBMS backend and the [`message_retraction`](#modulesmod_mammessage_retraction) option.
