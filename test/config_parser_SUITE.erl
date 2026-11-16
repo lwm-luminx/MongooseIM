@@ -605,7 +605,38 @@ listen_http_handlers_graphql(_Config) ->
     ?err(T(#{<<"allowed_categories">> => [<<"invalid">>]})),
     ?err(T(#{<<"schema_endpoint">> => <<"wrong_endpoint">>})),
     ?err(T(#{<<"sse_idle_timeout">> => 0})),
-    ?err(http_handler_raw(mongoose_graphql_handler, #{})).
+    ?err(http_handler_raw(mongoose_graphql_handler, #{})),
+    test_listen_http_handler_graphql_jwt(P, T).
+
+test_listen_http_handler_graphql_jwt(P, T) ->
+    Key = #{<<"secret">> => #{<<"value">> => <<"secret">>}, <<"algorithm">> => <<"HS256">>},
+    J = fun(Opts) -> T(#{<<"jwt">> => Opts}) end,
+    ?cfg(P ++ [jwt], #{keys => [#{secret => {value, <<"secret">>}, algorithm => hs256}],
+                       domain_key => <<"domain">>},
+         J(#{<<"keys">> => [Key]})),
+    ?cfg(P ++ [jwt, keys], [#{kid => <<"k1">>, secret => {env, "JWT_KEY"}, algorithm => rs256}],
+         J(#{<<"keys">> => [#{<<"kid">> => <<"k1">>,
+                              <<"secret">> => #{<<"env">> => <<"JWT_KEY">>},
+                              <<"algorithm">> => <<"RS256">>}]})),
+    ?cfg(P ++ [jwt, issuer], <<"iss">>, J(#{<<"keys">> => [Key], <<"issuer">> => <<"iss">>})),
+    ?cfg(P ++ [jwt, audience], <<"aud">>, J(#{<<"keys">> => [Key], <<"audience">> => <<"aud">>})),
+    ?cfg(P ++ [jwt, domain_key], <<"dom">>,
+         J(#{<<"keys">> => [Key], <<"domain_key">> => <<"dom">>})),
+    ?cfg(P ++ [schema_endpoint], domain_admin,
+         T(#{<<"schema_endpoint">> => <<"domain_admin">>, <<"jwt">> => #{<<"keys">> => [Key]}})),
+    ?err(J(#{})),
+    ?err(J(#{<<"keys">> => []})),
+    ?err(J(#{<<"keys">> => [maps:remove(<<"algorithm">>, Key)]})),
+    ?err(J(#{<<"keys">> => [maps:remove(<<"secret">>, Key)]})),
+    ?err(J(#{<<"keys">> => [Key#{<<"algorithm">> => <<"none">>}]})),
+    ?err(J(#{<<"keys">> => [Key#{<<"kid">> => <<>>}]})),
+    ?err(J(#{<<"keys">> => [Key#{<<"secret">> => #{<<"value">> => <<"s">>,
+                                                   <<"env">> => <<"JWT_KEY">>}}]})),
+    ?err(J(#{<<"keys">> => [Key], <<"issuer">> => <<>>})),
+    ?err(J(#{<<"keys">> => [Key], <<"audience">> => <<>>})),
+    ?err(J(#{<<"keys">> => [Key], <<"unknown">> => <<"x">>})),
+    %% The user endpoint authenticates with the auth methods of the user's host type
+    ?err(T(#{<<"schema_endpoint">> => <<"user">>, <<"jwt">> => #{<<"keys">> => [Key]}})).
 
 test_listen_http_handler_creds(P, T) ->
     CredsRaw = #{<<"username">> => <<"user">>, <<"password">> => <<"pass">>},
