@@ -4,7 +4,7 @@
 -export([send_chat_message/5, send_headline_message/6, send_stanza/3, lookup_recent_messages/5]).
 
 %% Event API
--export([open_session/2, close_session/1]).
+-export([open_session/2, open_session/3, close_session/1]).
 
 -include("jlib.hrl").
 -include("mongoose_rsm.hrl").
@@ -57,8 +57,16 @@ lookup_recent_messages(User, With, Before, Limit, CheckUser) ->
 
 -spec open_session(jid:jid(), boolean()) -> {unknown_user, iodata()} | {ok, stream()}.
 open_session(User, CheckUser) ->
-    M = #{user => User, check_user => CheckUser},
-    fold(M, [fun get_host_type/1, fun check_user/1, fun do_open_session/1]).
+    open_session(User, CheckUser, undefined).
+
+%% @doc Opens a session for the user, with the given resource or a random one.
+%% A resource that is already in use is not taken over.
+-spec open_session(jid:jid(), boolean(), jid:resource() | undefined) ->
+          {unknown_user | invalid_resource | resource_conflict, iodata()} | {ok, stream()}.
+open_session(User, CheckUser, Resource) ->
+    M = #{user => User, check_user => CheckUser, resource => Resource},
+    fold(M, [fun get_host_type/1, fun check_user/1, fun check_resource/1,
+             fun do_open_session/1]).
 
 -spec close_session(stream()) -> {ok, closed}.
 close_session(#{jid := Jid = #jid{lserver = S}, sid := Sid, host_type := HostType}) ->
@@ -178,13 +186,24 @@ lookup_messages(#{user := UserJid, with := WithJid, before := Before, limit := L
     {ok, {_, _, Rows}} = mod_mam_pm:lookup_messages(HostType, Params),
     {ok, {Rows, Limit2}}.
 
-do_open_session(#{host_type := HostType, user := Jid}) ->
-    Sid = ejabberd_sm:make_new_sid(),
+check_resource(#{resource := undefined, user := Jid} = M) ->
     UUID = uuid:uuid_to_string(uuid:get_v4(), binary_standard),
-    Resource = <<"sse-", UUID/binary>>,
-    NewJid = jid:replace_resource(Jid, Resource),
-    ejabberd_sm:open_session(HostType, Sid, NewJid, 1, #{}),
-    {ok, #{sid => Sid, jid => NewJid, host_type => HostType}}.
+    M#{session_jid => jid:replace_resource(Jid, <<"sse-", UUID/binary>>)};
+check_resource(#{resource := Resource, user := Jid} = M) ->
+    case jid:replace_resource(Jid, Resource) of
+        error ->
+            {invalid_resource, <<"Invalid resource">>};
+        SessionJid ->
+            case ejabberd_sm:get_session_pid(SessionJid) of
+                none -> M#{session_jid => SessionJid};
+                _ -> {resource_conflict, <<"Resource is already in use">>}
+            end
+    end.
+
+do_open_session(#{host_type := HostType, session_jid := Jid}) ->
+    Sid = ejabberd_sm:make_new_sid(),
+    ejabberd_sm:open_session(HostType, Sid, Jid, 1, #{}),
+    {ok, #{sid => Sid, jid => Jid, host_type => HostType}}.
 
 %% Helpers
 

@@ -6,6 +6,11 @@ The new GraphQL user API contains all commands from the client REST API and prov
 
 **Subscriptions** can be executed with the GET method, and are handled with [Server-Sent Events (SSE)](https://html.spec.whatwg.org/multipage/server-sent-events.html). The endpoint URL is the same as for regular queries with the addition of `/sse`, e.g. `http://localhost:5561/api/graphql/sse`.
 
+The `stanza.subscribeForMessages` subscription opens an XMPP session for the user, which lasts as long as the SSE connection.
+By default, the session has a random resource. Pass the `resource` argument to choose it, so that the session can be addressed with a known full JID.
+For example, after subscribing with `resource: "web"`, you can join a room with `muc.enterRoom(room: ..., nick: ..., resource: "web")`,
+and the room's messages are delivered to the subscription. Leave the room with `muc.exitRoom` before closing the subscription, because closing it doesn't send an unavailable presence. If the resource is already in use by another session, the subscription returns the `resource_conflict` error.
+
 ## Authentication
 
 MongooseIM uses *Basic Authentication* as the authentication method for the GraphQL API.
