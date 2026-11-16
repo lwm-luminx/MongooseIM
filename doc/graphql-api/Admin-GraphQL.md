@@ -20,6 +20,7 @@ The admin per domain can be disabled by the global admin with the command <a hre
 ## Authentication
 
 MongooseIM uses *Basic Authentication* as an authentication method for the GraphQL API.
+The admin endpoints can also accept [JSON Web Tokens](#json-web-tokens).
 
 *Basic authentication* is a simple authentication scheme built into the HTTP protocol.
 Each HTTP request to the GraphQL API has to contain the Authorization header
@@ -42,6 +43,20 @@ The authorization as a domain admin the base64-encoded string should have the fo
 
 - `DOMAIN` is the domain to authorize,
 - `PASSWORD` is the password for the given domain.
+
+### JSON Web Tokens
+
+When the `jwt` section is configured for the [GraphQL handler](../listeners/listen-http.md#listenhttphandlersmongoose_graphql_handlerjwt-only-for-admin-and-domain_admin),
+both admin endpoints also accept *Bearer authentication* with a [JSON Web Token](https://jwt.io):
+the `Authorization` header contains the word `Bearer` followed by a space and the token.
+This makes it possible to issue short-lived tokens to each caller, and to rotate the signing keys without redeploying the callers.
+
+The token needs a valid signature, an `exp` (expiration time) claim, and the `iss` and `aud` claims when the issuer and audience are configured.
+On the domain admin endpoint, the token also needs a claim with the domain name (`domain` by default).
+The domain has to exist, and the token holder gets the same permissions as the domain admin authenticated with a password.
+The domain admin password does not need to be set for the token to work.
+
+The password authentication remains available alongside the tokens.
 
 ## GraphiQL
 
