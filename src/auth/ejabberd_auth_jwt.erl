@@ -42,12 +42,14 @@
         ]).
 
 %% Config spec callbacks
--export([process_jwt_secret/1, process_algorithm/1]).
+-export([process_jwt_secret/1, process_algorithm/1, process_jwt_opts/1]).
 
 -include("mongoose.hrl").
 -include("mongoose_config_spec.hrl").
 
 -type algorithm() :: hs256 | rs256 | es256 | hs384 | rs384 | es384 | hs512 | rs512 | es512.
+-type secret() :: binary() | {env, string()}.
+-type key() :: #{kid := binary() | undefined, algorithm := algorithm(), secret := secret()}.
 
 %%%----------------------------------------------------------------------
 %%% API
@@ -55,27 +57,47 @@
 
 -spec start(HostType :: mongooseim:host_type()) -> ok.
 start(HostType) ->
-    JWTSecret = get_jwt_secret(HostType),
-    persistent_term:put({?MODULE, HostType, jwt_secret}, JWTSecret),
+    persistent_term:put({?MODULE, HostType, keys}, read_keys(HostType)),
     ok.
 
 -spec stop(HostType :: mongooseim:host_type()) -> ok.
-stop(_HostType) ->
-    persistent_term:erase(jwt_secret),
+stop(HostType) ->
+    persistent_term:erase({?MODULE, HostType, keys}),
     ok.
 
 -spec config_spec() -> mongoose_config_spec:config_section().
 config_spec() ->
     #section{
        items = #{<<"secret">> => jwt_secret_config_spec(),
-                 <<"algorithm">> => #option{type = binary,
-                                            validate = {enum, maps:keys(algorithms())},
-                                            process = fun ?MODULE:process_algorithm/1},
+                 <<"algorithm">> => algorithm_config_spec(),
+                 <<"keys">> => #list{items = jwt_key_config_spec(),
+                                     validate = unique_non_empty},
                  <<"username_key">> => #option{type = atom,
-                                               validate = non_empty}
+                                               validate = non_empty},
+                 <<"domain_key">> => #option{type = atom,
+                                             validate = non_empty},
+                 <<"issuer">> => #option{type = binary,
+                                         validate = non_empty},
+                 <<"audience">> => #option{type = binary,
+                                           validate = non_empty}
                 },
-       required = all
+       required = [<<"username_key">>],
+       process = fun ?MODULE:process_jwt_opts/1
       }.
+
+jwt_key_config_spec() ->
+    #section{
+       items = #{<<"kid">> => #option{type = binary,
+                                      validate = non_empty},
+                 <<"secret">> => jwt_secret_config_spec(),
+                 <<"algorithm">> => algorithm_config_spec()},
+       required = [<<"secret">>, <<"algorithm">>]
+      }.
+
+algorithm_config_spec() ->
+    #option{type = binary,
+            validate = {enum, maps:keys(algorithms())},
+            process = fun ?MODULE:process_algorithm/1}.
 
 jwt_secret_config_spec() ->
     #section{
@@ -92,6 +114,13 @@ process_jwt_secret([V]) -> V.
 
 process_algorithm(Alg) -> maps:get(Alg, algorithms()).
 
+%% Either a single key ('secret' with 'algorithm'), or a list of 'keys', or both.
+process_jwt_opts(Opts = #{secret := _, algorithm := _}) -> Opts;
+process_jwt_opts(#{secret := _}) -> error(#{what => jwt_algorithm_missing});
+process_jwt_opts(#{algorithm := _}) -> error(#{what => jwt_secret_missing});
+process_jwt_opts(Opts = #{keys := [_ | _]}) -> Opts;
+process_jwt_opts(_) -> error(#{what => jwt_secret_missing}).
+
 -spec supports_sasl_module(binary(), cyrsasl:sasl_module()) -> boolean().
 supports_sasl_module(_, Module) -> Module =:= cyrsasl_plain.
 
@@ -105,33 +134,20 @@ authorize(Creds) ->
                      LServer :: jid:lserver(),
                      Password :: binary()) -> boolean().
 check_password(HostType, LUser, LServer, Password) ->
-    Key = case persistent_term:get({?MODULE, HostType, jwt_secret}) of
-              Key1 when is_binary(Key1) -> Key1;
-              {env, Var} -> list_to_binary(os:getenv(Var))
-          end,
-    Alg = mongoose_config:get_opt([{auth, HostType}, jwt, algorithm]),
-    case jwerl:verify(Password, Alg, Key) of
+    Opts = mongoose_config:get_opt([{auth, HostType}, jwt]),
+    case verify_token(HostType, Password) of
         {ok, TokenData} ->
-            UserKey = mongoose_config:get_opt([{auth,HostType}, jwt, username_key]),
-            case maps:find(UserKey, TokenData) of
-                {ok, LUser} ->
-                    %% Login username matches $token_user_key in TokenData
+            case check_claims(TokenData, LUser, LServer, Opts) of
+                ok ->
                     ?LOG_INFO(#{what => jwt_success_auth,
                                 text => <<"Successfully authenticated with JWT">>,
-                                user => LUser, server => LServer,
-                                token => TokenData}),
+                                user => LUser, server => LServer}),
                     true;
-                {ok, ExpectedUser} ->
-                    ?LOG_WARNING(#{what => wrong_jwt_user,
-                                   text => <<"JWT contains wrond user">>,
-                                   expected_user => ExpectedUser,
-                                   user => LUser, server => LServer}),
-                    false;
-                error ->
-                    ?LOG_WARNING(#{what => missing_jwt_key,
-                                   text => <<"Missing key {user_key} in JWT data">>,
-                                   user_key => UserKey, token => TokenData,
-                                   user => LUser, server => LServer}),
+                {error, Reason} ->
+                    %% The claims are not logged, as they might contain personal data
+                    ?LOG_WARNING(#{what => jwt_claims_check_failed,
+                                   text => <<"JWT claims do not match the user">>,
+                                   reason => Reason, user => LUser, server => LServer}),
                     false
             end;
         {error, Reason} ->
@@ -141,7 +157,6 @@ check_password(HostType, LUser, LServer, Password) ->
                            user => LUser, server => LServer}),
             false
     end.
-
 
 -spec check_password(HostType :: mongooseim:host_type(),
                      LUser :: jid:luser(),
@@ -171,19 +186,111 @@ supported_features() -> [dynamic_domains].
 %%% Internal helpers
 %%%----------------------------------------------------------------------
 
-% A direct path to a file is read only once during startup,
-% a path in environment variable is read on every auth request.
--spec get_jwt_secret(mongooseim:host_type()) -> binary() | {env, string()}.
-get_jwt_secret(HostType) ->
-    case mongoose_config:get_opt([{auth, HostType}, jwt, secret]) of
-        {value, JWTSecret} ->
-            JWTSecret;
-        {env, Env} ->
-            {env, Env};
-        {file, Path} ->
-            {ok, JWTSecret} = file:read_file(Path),
-            JWTSecret
+%% @doc Tries the configured keys in order. If the token header has a 'kid',
+%% only the keys with that 'kid' and the keys without one are tried.
+-spec verify_token(mongooseim:host_type(), binary()) -> {ok, map()} | {error, term()}.
+verify_token(HostType, Token) ->
+    try jwerl:header(Token) of
+        Header when is_map(Header) ->
+            Keys = matching_keys(maps:get(kid, Header, undefined),
+                                 persistent_term:get({?MODULE, HostType, keys})),
+            verify_with_keys(Token, Keys, {error, no_matching_key});
+        _ ->
+            {error, invalid_token}
+    catch _:_ ->
+            {error, invalid_token}
     end.
+
+-spec matching_keys(binary() | undefined, [key()]) -> [key()].
+matching_keys(Kid, Keys) when is_binary(Kid) ->
+    [Key || Key = #{kid := KeyKid} <- Keys, KeyKid =:= Kid orelse KeyKid =:= undefined];
+matching_keys(_, Keys) ->
+    Keys.
+
+-spec verify_with_keys(binary(), [key()], {error, term()}) -> {ok, map()} | {error, term()}.
+verify_with_keys(_Token, [], LastError) ->
+    LastError;
+verify_with_keys(Token, [#{algorithm := Alg, secret := Secret} | Keys], _LastError) ->
+    Result = case secret_value(Secret) of
+                 {ok, Key} ->
+                     %% Errors are not logged, as they could contain the token
+                     try jwerl:verify(Token, Alg, Key)
+                     catch _:_ -> {error, invalid_token}
+                     end;
+                 {error, _} = SecretError ->
+                     SecretError
+             end,
+    case Result of
+        {ok, TokenData} when is_map(TokenData) -> {ok, TokenData};
+        {error, _} = Error -> verify_with_keys(Token, Keys, Error);
+        _ -> verify_with_keys(Token, Keys, {error, invalid_token})
+    end.
+
+-spec secret_value(secret()) -> {ok, binary()} | {error, {env_var_not_set, string()}}.
+secret_value({env, Var}) ->
+    case os:getenv(Var) of
+        false -> {error, {env_var_not_set, Var}};
+        Value -> {ok, list_to_binary(Value)}
+    end;
+secret_value(Key) when is_binary(Key) ->
+    {ok, Key}.
+
+-spec check_claims(map(), jid:luser(), jid:lserver(), map()) -> ok | {error, atom()}.
+check_claims(TokenData, LUser, LServer, Opts = #{username_key := UserKey}) ->
+    Checks = [{UserKey, {equal, LUser}, wrong_user}]
+        ++ [{DomainKey, {equal, LServer}, wrong_domain}
+            || DomainKey <- [maps:get(domain_key, Opts, undefined)], DomainKey =/= undefined]
+        ++ [{iss, {equal, Issuer}, wrong_issuer}
+            || Issuer <- [maps:get(issuer, Opts, undefined)], Issuer =/= undefined]
+        ++ [{aud, {contains, Audience}, wrong_audience}
+            || Audience <- [maps:get(audience, Opts, undefined)], Audience =/= undefined],
+    check_claims(TokenData, Checks).
+
+check_claims(_TokenData, []) ->
+    ok;
+check_claims(TokenData, [{Claim, Expected, Error} | Checks]) ->
+    case claim_matches(get_claim(Claim, TokenData), Expected) of
+        true -> check_claims(TokenData, Checks);
+        false -> {error, Error}
+    end.
+
+%% jwerl decodes claim names to existing atoms only
+get_claim(Claim, TokenData) ->
+    case maps:find(Claim, TokenData) of
+        {ok, Value} -> Value;
+        error -> maps:get(atom_to_binary(Claim), TokenData, undefined)
+    end.
+
+%% The 'aud' claim can be a string or a list of strings (RFC 7519)
+claim_matches(Value, {equal, Value}) -> true;
+claim_matches(Value, {contains, Value}) -> true;
+claim_matches(Values, {contains, Value}) when is_list(Values) -> lists:member(Value, Values);
+claim_matches(_, _) -> false.
+
+%% The keys from 'secret' and 'keys'. A file is read only once during startup,
+%% and an environment variable is read on every auth request.
+-spec read_keys(mongooseim:host_type()) -> [key()].
+read_keys(HostType) ->
+    Opts = mongoose_config:get_opt([{auth, HostType}, jwt]),
+    SingleKey = case Opts of
+                    #{secret := Secret, algorithm := Alg} ->
+                        [#{kid => undefined, algorithm => Alg, secret => read_secret(Secret)}];
+                    #{} ->
+                        []
+                end,
+    SingleKey ++ [#{kid => maps:get(kid, Key, undefined),
+                    algorithm => Alg,
+                    secret => read_secret(Secret)}
+                  || Key = #{algorithm := Alg, secret := Secret} <- maps:get(keys, Opts, [])].
+
+-spec read_secret({value, binary()} | {env, string()} | {file, string()}) -> secret().
+read_secret({value, Secret}) ->
+    Secret;
+read_secret({env, Env}) ->
+    {env, Env};
+read_secret({file, Path}) ->
+    {ok, Secret} = file:read_file(Path),
+    Secret.
 
 %% Explicit mapping, because the atoms are owned by jwerl and might not exist yet
 -spec algorithms() -> #{binary() => algorithm()}.
