@@ -153,7 +153,10 @@ admin_muc_tests() ->
 
 admin_muc_with_mam_tests() ->
     [admin_get_room_messages,
-     admin_try_get_nonexistent_room_messages].
+     admin_try_get_nonexistent_room_messages,
+     admin_moderate_message,
+     admin_try_moderate_unknown_message,
+     admin_try_moderate_message_in_nonexistent_room].
 
 admin_muc_not_configured_tests() ->
     [admin_delete_room_muc_not_configured,
@@ -162,6 +165,7 @@ admin_muc_not_configured_tests() ->
      admin_get_room_config_muc_not_configured,
      admin_invite_user_muc_not_configured,
      admin_kick_user_muc_not_configured,
+     admin_moderate_message_muc_not_configured,
      admin_send_message_to_room_muc_not_configured,
      admin_send_private_message_muc_not_configured,
      admin_get_room_messages_muc_or_mam_not_configured,
@@ -192,6 +196,7 @@ domain_admin_muc_tests() ->
      admin_kick_user,
      admin_try_kick_user_from_room_without_moderators,
      domain_admin_kick_user_no_permission,
+     domain_admin_moderate_message_no_permission,
      admin_send_message_to_room,
      domain_admin_send_message_to_room_no_permission,
      admin_send_private_message,
@@ -341,6 +346,7 @@ end_per_testcase(TC, Config) ->
 -define(LIST_ROOMS_PATH, [data, muc, listRooms]).
 -define(INVITE_USER_PATH, [data, muc, inviteUser]).
 -define(KICK_USER_PATH, [data, muc, kickUser]).
+-define(MODERATE_MESSAGE_PATH, [data, muc, moderateMessage]).
 -define(DELETE_ROOM_PATH, [data, muc, deleteRoom]).
 -define(SEND_MESSAGE_PATH, [data, muc, sendMessageToRoom]).
 -define(SEND_PRIV_MESG_PATH, [data, muc, sendPrivateMessage]).
@@ -673,6 +679,66 @@ admin_get_room_messages_story(Config, Alice, Bob) ->
         get_ok_value(?GET_MESSAGES_PATH, Res),
     ?assertMatch({ok, #xmlel{name = <<"message">>}}, exml:parse(StanzaXML)).
 
+admin_moderate_message(Config) ->
+    muc_helper:story_with_room(Config, [], [{alice, 1}, {bob, 1}],
+                               fun admin_moderate_message_story/3).
+
+admin_moderate_message_story(Config, Alice, Bob) ->
+    RoomJID = #jid{luser = RoomName, lserver = MUCDomain} =
+        jid:from_binary(?config(room_jid, Config)),
+    RoomJIDBin = jid:to_binary(RoomJID),
+    enter_room(RoomJID, Bob, <<"Bobek">>),
+    enter_room(RoomJID, Alice, <<"Ali">>),
+    escalus:wait_for_stanzas(Bob, 2),
+    send_message_to_room(RoomJID, Bob, <<"Buy cheap watches!">>, Config),
+    Msg = escalus:wait_for_stanza(Bob),
+    StanzaId = exml_query:path(Msg, [{element, <<"stanza-id">>}, {attr, <<"id">>}]),
+    mam_helper:wait_for_room_archive_size(MUCDomain, RoomName, 1),
+    Reason = <<"Spam">>,
+    Res = moderate_message(RoomJID, StanzaId, Reason, Config),
+    ?assertNotEqual(nomatch, binary:match(get_ok_value(?MODERATE_MESSAGE_PATH, Res),
+                                          <<"successfully">>)),
+    %% Bob receives the retraction from the room itself
+    Retraction = escalus:wait_for_stanza(Bob),
+    ?assertEqual(RoomJIDBin, exml_query:attr(Retraction, <<"from">>)),
+    Retract = exml_query:subelement_with_ns(Retraction, <<"urn:xmpp:message-retract:1">>),
+    ?assertEqual(StanzaId, exml_query:attr(Retract, <<"id">>)),
+    ?assertEqual(RoomJIDBin, exml_query:path(Retract, [{element, <<"moderated">>},
+                                                       {attr, <<"by">>}])),
+    ?assertEqual(Reason, exml_query:path(Retract, [{element, <<"reason">>}, cdata])),
+    case mam_helper:backend() of
+        rdbms ->
+            %% The room archive has a tombstone in place of the message
+            Res2 = get_room_messages(RoomJID, 50, null, Config),
+            #{<<"stanzas">> := [#{<<"stanza">> := StanzaXML}]} =
+                get_ok_value(?GET_MESSAGES_PATH, Res2),
+            {ok, Tombstone} = exml:parse(StanzaXML),
+            ?assertEqual(undefined, exml_query:subelement(Tombstone, <<"body">>)),
+            ?assertMatch(#xmlel{name = <<"retracted">>},
+                         exml_query:subelement_with_ns(Tombstone,
+                                                       <<"urn:xmpp:message-retract:1">>));
+        _ ->
+            ok
+    end.
+
+admin_try_moderate_unknown_message(Config) ->
+    case mam_helper:backend() of
+        rdbms ->
+            muc_helper:story_with_room(Config, [], [{alice, 1}],
+                                       fun admin_try_moderate_unknown_message_story/2);
+        _ ->
+            {skip, "message moderation is supported only by the rdbms backend"}
+    end.
+
+admin_try_moderate_unknown_message_story(Config, _Alice) ->
+    RoomJID = jid:from_binary(?config(room_jid, Config)),
+    Res = moderate_message(RoomJID, <<"B2GIQ57T4T81">>, null, Config),
+    ?assertNotEqual(nomatch, binary:match(get_err_msg(Res), <<"not found">>)).
+
+admin_try_moderate_message_in_nonexistent_room(Config) ->
+    Res = moderate_message(?NONEXISTENT_ROOM2, <<"B2GIQ57T4T81">>, null, Config),
+    ?assertNotEqual(nomatch, binary:match(get_err_msg(Res), <<"not found">>)).
+
 admin_try_get_nonexistent_room_messages(Config) ->
     Res = get_room_messages(?NONEXISTENT_ROOM, null, null, Config),
     ?assertNotEqual(nomatch, binary:match(get_err_msg(Res), <<"not found">>)).
@@ -885,6 +951,10 @@ admin_kick_user_muc_not_configured(Config) ->
     Res = kick_user(get_room_name(), <<"nick">>, <<"reason">>, Config),
     get_not_loaded(Res).
 
+admin_moderate_message_muc_not_configured(Config) ->
+    Res = moderate_message(get_room_name(), <<"B2GIQ57T4T81">>, null, Config),
+    get_not_loaded(Res).
+
 admin_send_message_to_room_muc_not_configured(Config) ->
     escalus:fresh_story_with_config(Config, [{alice, 1}],
         fun admin_send_message_to_room_muc_not_configured_story/2).
@@ -1012,6 +1082,10 @@ domain_admin_invite_user_no_permission_story(Config, Alice, Bob) ->
 domain_admin_kick_user_no_permission(Config) ->
     get_unauthorized(kick_user(?NONEXISTENT_ROOM, <<"ali">>, null, Config)),
     get_unauthorized(kick_user(?EXTERNAL_DOMAIN_ROOM, <<"ali">>, null, Config)).
+
+domain_admin_moderate_message_no_permission(Config) ->
+    get_unauthorized(moderate_message(?NONEXISTENT_ROOM, <<"id">>, null, Config)),
+    get_unauthorized(moderate_message(?EXTERNAL_DOMAIN_ROOM, <<"id">>, null, Config)).
 
 domain_admin_send_message_to_room_no_permission(Config) ->
     muc_helper:story_with_room(Config, [], [{alice_bis, 1}],
@@ -2002,6 +2076,10 @@ invite_user(Room, Sender, Recipient, Reason, Config) ->
 kick_user(Room, Nick, Reason, Config) ->
     Vars = #{room => jid:to_binary(Room), nick => Nick, reason => Reason},
     execute_command(<<"muc">>, <<"kickUser">>, Vars, Config).
+
+moderate_message(Room, StanzaId, Reason, Config) ->
+    Vars = #{room => jid:to_binary(Room), stanzaId => StanzaId, reason => Reason},
+    execute_command(<<"muc">>, <<"moderateMessage">>, Vars, Config).
 
 send_message_to_room(Room, From, Body, Config) ->
     Vars = #{room => jid:to_binary(Room), from => user_to_full_bin(From), body => Body},

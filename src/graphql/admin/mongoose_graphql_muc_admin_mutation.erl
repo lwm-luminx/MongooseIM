@@ -22,6 +22,8 @@ execute(_Ctx, _Obj, <<"sendPrivateMessage">>, Args) ->
     send_private_message(Args);
 execute(_Ctx, _Obj, <<"changeRoomConfiguration">>, Args) ->
     change_room_config(Args);
+execute(_Ctx, _Obj, <<"moderateMessage">>, Args) ->
+    moderate_message(Args);
 execute(_Ctx, _Obj, <<"deleteRoom">>, Args) ->
     delete_room(Args);
 execute(_Ctx, _Obj, <<"setUserRole">>, Args) ->
@@ -55,6 +57,11 @@ kick_user(#{<<"room">> := RoomJID, <<"nick">> := Nick, <<"reason">> := Reason}) 
     Reason2 = null_to_default(Reason, mongoose_graphql_muc_helper:default_kick_reason("admin")),
     Res = mod_muc_api:kick_user_from_room(RoomJID, Nick, Reason2),
     format_result(Res, #{room => jid:to_binary(RoomJID)}).
+
+-spec moderate_message(map()) -> {ok, binary()} | {error, resolver_error()}.
+moderate_message(#{<<"room">> := RoomJID, <<"stanzaId">> := StanzaID, <<"reason">> := Reason}) ->
+    Res = mod_muc_api:moderate_message(RoomJID, StanzaID, null_to_undefined(Reason)),
+    format_result(Res, #{room => jid:to_binary(RoomJID), stanza_id => StanzaID}).
 
 -spec send_message_to_room(map()) -> {ok, binary()}.
 send_message_to_room(#{<<"room">> := RoomJID, <<"from">> := SenderJID, <<"body">> := Message}) ->

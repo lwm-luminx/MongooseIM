@@ -17,6 +17,9 @@ type MUCAdminMutation @protected @use(modules: ["mod_muc"]){
   "Send a private message to a MUC room user"
   sendPrivateMessage(room: BareJID!, from: FullJID!, toNick: ResourceName!, body: String!): String
     @protected(type: DOMAIN, args: ["from"]) @use(args: ["room"])
+  "Retract a message from a MUC room as a moderator (XEP-0425). The message is identified by its stanza ID"
+  moderateMessage(room: BareJID!, stanzaId: String!, reason: String): String
+    @protected(type: DOMAIN, args: ["room"]) @use(args: ["room"])
   "Remove a MUC room"
   deleteRoom(room: BareJID!, reason: String): String
     @protected(type: DOMAIN, args: ["room"]) @use(args: ["room"])

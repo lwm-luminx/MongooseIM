@@ -36,6 +36,7 @@
          is_groupchat/1,
          should_page_be_flipped/1,
          tombstone/2,
+         moderated_tombstone/2,
          wrap_message/6,
          wrap_message/7,
          result_set/4,
@@ -482,6 +483,22 @@ retracted_element(#{retract_on := stanza_id,
                                         <<"by">> => jid:to_bare_binary(LocJid)}} |
                        MaybeOriginId
                       ]}.
+
+%% @doc Replaces the content of a message retracted by a room moderator (XEP-0425).
+-spec moderated_tombstone(exml:element(), mod_muc_room:moderate_message_params()) ->
+    exml:element().
+moderated_tombstone(Packet, #{by := ByJID, reason := Reason}) ->
+    Timestamp = calendar:system_time_to_rfc3339(erlang:system_time(second), [{offset, "Z"}]),
+    Moderated = #xmlel{name = <<"moderated">>,
+                       attrs = #{<<"xmlns">> => ?NS_MESSAGE_MODERATE,
+                                 <<"by">> => jid:to_binary(ByJID)}},
+    ReasonEls = [#xmlel{name = <<"reason">>, children = [#xmlcdata{content = Reason}]}
+                 || is_binary(Reason)],
+    Retracted = #xmlel{name = <<"retracted">>,
+                       attrs = #{<<"xmlns">> => ?NS_RETRACT_1,
+                                 <<"stamp">> => list_to_binary(Timestamp)},
+                       children = [Moderated | ReasonEls]},
+    Packet#xmlel{children = [Retracted]}.
 
 -spec maybe_append_origin_id(retraction_info()) -> [exml:element()].
 maybe_append_origin_id(#{origin_id := OriginID}) when is_binary(OriginID), <<>> =/= OriginID ->

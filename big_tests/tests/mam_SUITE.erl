@@ -404,10 +404,15 @@ muc_stanzaid_cases() ->
 muc_retract_cases() ->
     [retract_muc_message,
      retract_muc_message_on_stanza_id,
-     retract_wrong_muc_message].
+     retract_wrong_muc_message,
+     moderate_muc_message,
+     moderate_muc_message_by_participant_is_forbidden,
+     moderate_unknown_muc_message,
+     moderate_muc_message_without_retract_element].
 
 disabled_muc_retract_cases() ->
-    [retract_muc_message].
+    [retract_muc_message,
+     moderate_muc_message].
 
 muc_configurable_archiveid_cases() ->
     [
@@ -912,7 +917,11 @@ maybe_skip(C, Config) when C =:= retract_message;
                            C =:= retract_message_on_stanza_id;
                            C =:= retract_muc_message;
                            C =:= retract_muc_message_on_stanza_id;
-                           C =:= retract_wrong_muc_message ->
+                           C =:= retract_wrong_muc_message;
+                           C =:= moderate_muc_message;
+                           C =:= moderate_muc_message_by_participant_is_forbidden;
+                           C =:= moderate_unknown_muc_message;
+                           C =:= moderate_muc_message_without_retract_element ->
     ConfList = rdbms_configs(true, ct_helper:get_internal_database()),
     skip_if(not lists:member(?config(configuration, Config), ConfList),
             "message retraction not supported");
@@ -2496,6 +2505,111 @@ test_retract_muc_message(Config) ->
         ok
     end,
     escalus:story(Config, [{alice, 1}, {bob, 1}], F).
+
+moderate_muc_message(Config) ->
+    P = ?config(props, Config),
+    F = fun(Alice, Bob, Kate) ->
+        Room = ?config(room, Config),
+        RoomAddr = room_address(Room),
+        enter_room_with_alice_and_bob(Room, Alice, Bob),
+
+        %% GIVEN Bob sends a message to the room
+        Body = <<"Buy cheap watches!">>,
+        escalus:send(Bob, escalus_stanza:groupchat_to(RoomAddr, Body)),
+        BobCopyOfMessage = escalus:wait_for_stanza(Bob),
+        escalus:wait_for_stanza(Alice),
+        StanzaId = stanza_id_from_msg(BobCopyOfMessage),
+        maybe_wait_for_archive(Config),
+
+        %% WHEN Alice, the room owner, retracts it as a moderator
+        Reason = <<"Spam">>,
+        escalus:send(Alice, moderate_iq(RoomAddr, StanzaId, Reason)),
+
+        %% THEN Alice gets a result and everyone in the room gets the retraction from the room
+        AliceStanzas = escalus:wait_for_stanzas(Alice, 2),
+        escalus:assert_many([is_iq_result, is_message], AliceStanzas),
+        ModeratorJID = <<RoomAddr/binary, "/", (nick(Alice))/binary>>,
+        [assert_moderation_message(Msg, RoomAddr, StanzaId, ModeratorJID, Reason)
+         || Msg <- [escalus:wait_for_stanza(Bob) |
+                    [S || S <- AliceStanzas, escalus_pred:is_message(S)]]],
+
+        %% ... the message is gone from the room history
+        escalus:send(Kate, stanza_muc_enter_room(Room, nick(Kate))),
+        %% Kate receives three presences and the subject, without the retracted message
+        KateStanzas = escalus:wait_for_stanzas(Kate, 4),
+        Subject = lists:last(KateStanzas),
+        ?assertNotEqual(undefined, exml_query:subelement(Subject, <<"subject">>)),
+        escalus_assert:has_no_stanzas(Kate),
+
+        %% ... and the room archive has a tombstone in place of the message
+        escalus:send(Bob, stanza_to_room(stanza_archive_request(P, <<"q1">>), Room)),
+        [ArcMsg] = respond_messages(assert_respond_size(1, wait_archive_respond(Bob))),
+        Parsed = parse_forwarded_message(ArcMsg),
+        case message_retraction_is_enabled(Config) of
+            true ->
+                #forwarded_message{message_body = undefined,
+                                   message_children = [Retracted]} = Parsed,
+                ?assertEqual(<<"urn:xmpp:message-retract:1">>,
+                             exml_query:attr(Retracted, <<"xmlns">>)),
+                ?assertEqual(ModeratorJID,
+                             exml_query:path(Retracted, [{element_with_ns, <<"moderated">>,
+                                                          moderate_ns()},
+                                                         {attr, <<"by">>}])),
+                ?assertEqual(Reason, exml_query:path(Retracted, [{element, <<"reason">>}, cdata]));
+            false ->
+                #forwarded_message{message_body = Body} = Parsed
+        end
+    end,
+    escalus:story(Config, [{alice, 1}, {bob, 1}, {kate, 1}], F).
+
+moderate_muc_message_by_participant_is_forbidden(Config) ->
+    P = ?config(props, Config),
+    F = fun(Alice, Bob) ->
+        Room = ?config(room, Config),
+        RoomAddr = room_address(Room),
+        enter_room_with_alice_and_bob(Room, Alice, Bob),
+        Body = <<"Hi, Bob!">>,
+        escalus:send(Alice, escalus_stanza:groupchat_to(RoomAddr, Body)),
+        AliceCopyOfMessage = escalus:wait_for_stanza(Alice),
+        escalus:wait_for_stanza(Bob),
+        maybe_wait_for_archive(Config),
+
+        %% Bob is only a participant
+        escalus:send(Bob, moderate_iq(RoomAddr, stanza_id_from_msg(AliceCopyOfMessage), undefined)),
+        escalus:assert(is_error, [<<"auth">>, <<"forbidden">>], escalus:wait_for_stanza(Bob)),
+        escalus_assert:has_no_stanzas(Alice),
+
+        escalus:send(Bob, stanza_to_room(stanza_archive_request(P, <<"q1">>), Room)),
+        [ArcMsg] = respond_messages(assert_respond_size(1, wait_archive_respond(Bob))),
+        #forwarded_message{message_body = Body} = parse_forwarded_message(ArcMsg)
+    end,
+    escalus:story(Config, [{alice, 1}, {bob, 1}], F).
+
+moderate_unknown_muc_message(Config) ->
+    F = fun(Alice) ->
+        Room = ?config(room, Config),
+        RoomAddr = room_address(Room),
+        escalus:send(Alice, stanza_muc_enter_room(Room, nick(Alice))),
+        escalus:wait_for_stanzas(Alice, 2),
+        [escalus:send(Alice, moderate_iq(RoomAddr, Id, undefined))
+         || Id <- [<<"not-an-id">>, <<"B2GIQ57T4T81">>]],
+        [escalus:assert(is_error, [<<"cancel">>, <<"item-not-found">>], Stanza)
+         || Stanza <- escalus:wait_for_stanzas(Alice, 2)]
+    end,
+    escalus:story(Config, [{alice, 1}], F).
+
+moderate_muc_message_without_retract_element(Config) ->
+    F = fun(Alice) ->
+        Room = ?config(room, Config),
+        RoomAddr = room_address(Room),
+        escalus:send(Alice, stanza_muc_enter_room(Room, nick(Alice))),
+        escalus:wait_for_stanzas(Alice, 2),
+        Moderate = #xmlel{name = <<"moderate">>,
+                          attrs = #{<<"xmlns">> => moderate_ns(), <<"id">> => <<"B2GIQ57T4T81">>}},
+        escalus:send(Alice, escalus_stanza:to(escalus_stanza:iq(<<"set">>, [Moderate]), RoomAddr)),
+        escalus:assert(is_error, [<<"modify">>, <<"bad-request">>], escalus:wait_for_stanza(Alice))
+    end,
+    escalus:story(Config, [{alice, 1}], F).
 
 muc_archive_is_instrumented(Config) ->
     F = fun(Alice, Bob) ->
@@ -4194,6 +4308,38 @@ then_pm_message_is_received(Receiver, Body) ->
     escalus:assert(is_chat_message, [Body], escalus:wait_for_stanza(Receiver)).
 
 %% Message retraction helpers
+
+enter_room_with_alice_and_bob(Room, Alice, Bob) ->
+    escalus:send(Alice, stanza_muc_enter_room(Room, nick(Alice))),
+    escalus:send(Bob, stanza_muc_enter_room(Room, nick(Bob))),
+    %% Bob receives two presences and the room's subject
+    escalus:wait_for_stanzas(Bob, 3),
+    %% Alice receives all the stanzas Bob did as well
+    escalus:wait_for_stanzas(Alice, 3).
+
+moderate_ns() -> <<"urn:xmpp:message-moderate:1">>.
+
+moderate_iq(RoomAddr, StanzaId, Reason) ->
+    ReasonEls = [#xmlel{name = <<"reason">>, children = [#xmlcdata{content = Reason}]}
+                 || is_binary(Reason)],
+    Moderate = #xmlel{name = <<"moderate">>,
+                      attrs = #{<<"xmlns">> => moderate_ns(), <<"id">> => StanzaId},
+                      children = [#xmlel{name = <<"retract">>,
+                                         attrs = #{<<"xmlns">> => <<"urn:xmpp:message-retract:1">>}}
+                                  | ReasonEls]},
+    escalus_stanza:to(escalus_stanza:iq(<<"set">>, [Moderate]), RoomAddr).
+
+assert_moderation_message(Msg, RoomAddr, StanzaId, ModeratorJID, Reason) ->
+    escalus:assert(is_message, Msg),
+    ?assertEqual(<<"groupchat">>, exml_query:attr(Msg, <<"type">>)),
+    ?assertEqual(RoomAddr, exml_query:attr(Msg, <<"from">>)),
+    Retract = exml_query:subelement_with_ns(Msg, <<"urn:xmpp:message-retract:1">>),
+    ?assertEqual(<<"retract">>, Retract#xmlel.name),
+    ?assertEqual(StanzaId, exml_query:attr(Retract, <<"id">>)),
+    ?assertEqual(ModeratorJID, exml_query:path(Retract, [{element_with_ns, <<"moderated">>,
+                                                          moderate_ns()},
+                                                         {attr, <<"by">>}])),
+    ?assertEqual(Reason, exml_query:path(Retract, [{element, <<"reason">>}, cdata])).
 
 check_archive_after_retraction(Config, Client, ApplyToElement, Body) ->
     case message_should_be_retracted(Config) of
