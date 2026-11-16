@@ -36,6 +36,7 @@
          is_groupchat/1,
          should_page_be_flipped/1,
          tombstone/2,
+         tombstone/3,
          wrap_message/6,
          wrap_message/7,
          result_set/4,
@@ -389,8 +390,36 @@ get_retract_id(true = _Enabled, Packet) ->
 get_retract_id(false, _Packet) ->
     none.
 
+%% @doc Returns the ID of the message to retract (XEP-0424).
+%% The current version of the XEP (`urn:xmpp:message-retract:1') refers to group chat messages
+%% by the stanza ID assigned by the room, and to other messages by their 'id' attribute,
+%% which is stored as the origin ID when the message has no origin-id element.
+%% The older version (`urn:xmpp:message-retract:0') wraps the request in a fasten element.
 -spec get_retract_id(exml:element()) -> none | retraction_id().
 get_retract_id(Packet) ->
+    case exml_query:subelement_with_name_and_ns(Packet, <<"retract">>, ?NS_RETRACT_1) of
+        undefined ->
+            get_fasten_retract_id(Packet);
+        Retract ->
+            get_retract_1_id(exml_query:attr(Packet, <<"type">>),
+                             exml_query:attr(Retract, <<"id">>, <<>>))
+    end.
+
+-spec get_retract_1_id(binary() | undefined, binary()) -> none | retraction_id().
+get_retract_1_id(_Type, <<>>) ->
+    none;
+get_retract_1_id(<<"groupchat">>, Id) ->
+    try external_binary_to_mess_id(Id) of
+        _ -> {stanza_id, Id}
+    catch throw:invalid_stanza_id ->
+            %% The room did not assign stanza IDs, so the client used the origin ID
+            {origin_id, Id}
+    end;
+get_retract_1_id(_Type, Id) ->
+    {origin_id, Id}.
+
+-spec get_fasten_retract_id(exml:element()) -> none | retraction_id().
+get_fasten_retract_id(Packet) ->
     case exml_query:path(Packet, [{element_with_ns, <<"apply-to">>, ?NS_FASTEN}], none) of
         none -> none;
         Fasten ->
@@ -403,9 +432,14 @@ get_retract_id(Packet) ->
             end
     end.
 
+%% @doc Returns the origin ID of a message (XEP-0359), or its 'id' attribute if it has none.
+%% The current version of XEP-0424 refers to retracted messages by their 'id' attribute.
 get_origin_id(Packet) ->
-    exml_query:path(Packet, [{element_with_ns, <<"origin-id">>, ?NS_STANZAID},
-                             {attr, <<"id">>}], none).
+    case exml_query:path(Packet, [{element_with_ns, <<"origin-id">>, ?NS_STANZAID},
+                                  {attr, <<"id">>}], none) of
+        none -> exml_query:attr(Packet, <<"id">>, none);
+        OriginID -> OriginID
+    end.
 
 is_groupchat(<<"groupchat">>) ->
     true;
@@ -456,6 +490,28 @@ determine_result(#{}, Offset, Messages) ->
 
 tombstone(RetractionInfo = #{packet := Packet}, LocJid) ->
     Packet#xmlel{children = [retracted_element(RetractionInfo, LocJid)]}.
+
+%% @doc Like `tombstone/2', but the tombstone follows the version of XEP-0424 used
+%% by the retraction message.
+-spec tombstone(retraction_info(), exml:element(), jid:jid()) -> exml:element().
+tombstone(RetractionInfo = #{packet := Packet}, RetractionPacket, LocJid) ->
+    case exml_query:subelement_with_name_and_ns(RetractionPacket, <<"retract">>, ?NS_RETRACT_1) of
+        undefined ->
+            tombstone(RetractionInfo, LocJid);
+        _ ->
+            Packet#xmlel{children = [retracted_1_element(RetractionPacket)]}
+    end.
+
+%% The 'id' attribute refers to the retraction message, which is kept in the archive
+-spec retracted_1_element(exml:element()) -> exml:element().
+retracted_1_element(RetractionPacket) ->
+    Timestamp = calendar:system_time_to_rfc3339(erlang:system_time(second), [{offset, "Z"}]),
+    Attrs = #{<<"xmlns">> => ?NS_RETRACT_1, <<"stamp">> => list_to_binary(Timestamp)},
+    IdAttrs = case exml_query:attr(RetractionPacket, <<"id">>) of
+                  undefined -> #{};
+                  Id -> #{<<"id">> => Id}
+              end,
+    #xmlel{name = <<"retracted">>, attrs = maps:merge(Attrs, IdAttrs)}.
 
 -spec retracted_element(retraction_info(), jid:jid()) -> exml:element().
 retracted_element(#{retract_on := origin_id,
@@ -761,8 +817,9 @@ mam_features() ->
 
 retraction_features(Module, HostType) ->
     case has_message_retraction(Module, HostType) of
-        true -> [?NS_RETRACT, ?NS_RETRACT_TOMBSTONE, ?NS_ESL_RETRACT];
-        false -> [?NS_RETRACT]
+        true -> [?NS_RETRACT, ?NS_RETRACT_TOMBSTONE, ?NS_ESL_RETRACT,
+                 ?NS_RETRACT_1, ?NS_RETRACT_1_TOMBSTONE];
+        false -> [?NS_RETRACT, ?NS_RETRACT_1]
     end.
 
 groupchat_features(mod_mam_pm = Module, HostType) ->
