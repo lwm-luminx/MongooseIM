@@ -24,6 +24,7 @@ type StanzaUserSubscription @protected{
   Subscribe to incoming messages.
   The subscription opens a session with the given resource, or with a random one if it is not provided.
   A resource that is already in use is not taken over.
+  Presences sent to the session are included when 'presences' is true.
   """
-  subscribeForMessages(resource: ResourceName): StanzaMap
+  subscribeForMessages(resource: ResourceName, presences: Boolean = false): StanzaMap
 }

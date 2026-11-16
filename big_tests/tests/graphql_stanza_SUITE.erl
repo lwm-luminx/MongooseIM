@@ -55,6 +55,7 @@ admin_sse_cases() ->
     [admin_subscribe_for_messages,
      admin_subscribe_for_messages_with_resource,
      admin_subscribe_for_messages_with_resource_in_use,
+     admin_subscribe_for_messages_with_presences,
      admin_subscribe_for_messages_to_unknown_user].
 
 admin_mam_cases() ->
@@ -85,6 +86,7 @@ user_stanza_cases() ->
      user_subscribe_for_messages,
      user_subscribe_for_messages_with_resource,
      user_subscribe_for_messages_with_resource_in_use,
+     user_subscribe_for_messages_with_presences,
      user_send_message_without_from,
      user_send_message_with_spoofed_from,
      user_send_message_headline,
@@ -215,6 +217,16 @@ admin_subscribe_for_messages_with_resource_in_use_story(Config, Bob) ->
     escalus_client:send(Bob, escalus_stanza:chat_to(escalus_client:full_jid(Bob), <<"Hi!">>)),
     escalus:assert(is_chat_message, [<<"Hi!">>], escalus:wait_for_stanza(Bob)).
 
+admin_subscribe_for_messages_with_presences(Config) ->
+    escalus:fresh_story_with_config(Config, [{alice, 1}, {bob, 1}],
+                                    fun admin_subscribe_for_messages_with_presences_story/3).
+
+admin_subscribe_for_messages_with_presences_story(Config, Alice, Bob) ->
+    To = escalus_client:short_jid(Bob),
+    Vars = #{caller => To, resource => <<"sse-res">>, presences => true},
+    {200, Stream} = execute_command_sse(<<"stanza">>, <<"subscribeForMessages">>, Vars, Config),
+    assert_presence_and_message_are_streamed(Alice, To, <<"sse-res">>, Stream).
+
 user_send_message(Config) ->
     escalus:fresh_story_with_config(Config, [{alice, 1}, {bob, 1}],
                                     fun user_send_message_story/3).
@@ -262,6 +274,34 @@ user_subscribe_for_messages_with_resource_in_use_story(Config, Bob) ->
     %% Bob's session was not taken over
     escalus_client:send(Bob, escalus_stanza:chat_to(escalus_client:full_jid(Bob), <<"Hi!">>)),
     escalus:assert(is_chat_message, [<<"Hi!">>], escalus:wait_for_stanza(Bob)).
+
+user_subscribe_for_messages_with_presences(Config) ->
+    escalus:fresh_story_with_config(Config, [{alice, 1}, {bob, 1}],
+                                    fun user_subscribe_for_messages_with_presences_story/3).
+
+user_subscribe_for_messages_with_presences_story(Config, Alice, Bob) ->
+    To = escalus_client:short_jid(Bob),
+    Vars = #{resource => <<"sse-res">>, presences => true},
+    {200, Stream} = execute_user_command_sse(<<"stanza">>, <<"subscribeForMessages">>,
+                                             Bob, Vars, Config),
+    assert_presence_and_message_are_streamed(Alice, To, <<"sse-res">>, Stream).
+
+%% Both a directed presence and a message are delivered to the stream, in order
+assert_presence_and_message_are_streamed(Sender, BareJID, Resource, Stream) ->
+    From = escalus_client:full_jid(Sender),
+    To = <<BareJID/binary, "/", Resource/binary>>,
+    escalus:send(Sender, escalus_stanza:presence_direct(To, <<"available">>)),
+    escalus:send(Sender, escalus_stanza:chat(From, To, <<"Hi!">>)),
+    [Event1, Event2] = sse_helper:wait_for_events(Stream, 2, 5000),
+    [Presence, Message] = [begin
+                               #{<<"stanza">> := StanzaBin, <<"sender">> := From} =
+                                   graphql_helper:get_value([data, stanza, subscribeForMessages], E),
+                               {ok, Stanza} = exml:parse(StanzaBin),
+                               Stanza
+                           end || E <- [Event1, Event2]],
+    escalus:assert(is_presence, Presence),
+    escalus:assert(is_message, Message),
+    sse_helper:stop_sse(Stream).
 
 %% A message sent to the full JID with the chosen resource is delivered to the stream
 assert_message_to_resource_is_streamed(Sender, BareJID, Resource, Stream) ->
