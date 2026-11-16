@@ -90,6 +90,9 @@
                 http_auth_pids = [] :: [pid()],
                 %% Secret salt of the room's occupant IDs (XEP-0421)
                 occupant_id_salt :: binary() | undefined,
+                %% Hats (XEP-0317) defined in the room, and the hats worn by each bare JID
+                hats = [] :: [mod_muc_room:hat()],
+                hat_assignments = #{} :: #{jid:simple_bare_jid() => [mod_muc_room:hat_uri()]},
                 hibernate_timeout = 90000 :: timeout()
                }).
 
