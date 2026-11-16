@@ -860,7 +860,34 @@ auth_jwt(_Config) ->
                                                       <<"env">> => <<"SECRET">>}})),
     ?errh(auth_raw(<<"jwt">>, Opts#{<<"algorithm">> := <<"bruteforce">>})),
     ?errh(auth_raw(<<"jwt">>, Opts#{<<"username_key">> := <<>>})),
-    [?errh(auth_raw(<<"jwt">>, maps:without([K], Opts))) || K <- maps:keys(Opts)].
+    [?errh(auth_raw(<<"jwt">>, maps:without([K], Opts))) || K <- maps:keys(Opts)],
+    %% Several keys, selected by 'kid'
+    RawKeys = [#{<<"kid">> => <<"2026-11">>, <<"algorithm">> => <<"RS256">>,
+                 <<"secret">> => #{<<"file">> => <<"priv/jwt_secret">>}},
+               #{<<"algorithm">> => <<"HS256">>, <<"secret">> => #{<<"env">> => <<"SECRET">>}}],
+    Keys = [#{kid => <<"2026-11">>, algorithm => rs256, secret => {file, "priv/jwt_secret"}},
+            #{algorithm => hs256, secret => {env, "SECRET"}}],
+    KeysOpts = maps:without([<<"secret">>, <<"algorithm">>], Opts#{<<"keys">> => RawKeys}),
+    ?cfgh([auth, jwt], #{keys => Keys, username_key => user},
+          auth_raw(<<"jwt">>, KeysOpts)),
+    ?cfgh([auth, jwt], Config#{keys => Keys},
+          auth_raw(<<"jwt">>, Opts#{<<"keys">> => RawKeys})),
+    ?errh(auth_raw(<<"jwt">>, KeysOpts#{<<"keys">> => []})),
+    ?errh(auth_raw(<<"jwt">>, KeysOpts#{<<"keys">> => [#{<<"algorithm">> => <<"HS256">>}]})),
+    ?errh(auth_raw(<<"jwt">>, KeysOpts#{<<"keys">> => [#{<<"secret">> => #{<<"value">> => <<"s">>}}]})),
+    ?errh(auth_raw(<<"jwt">>, KeysOpts#{<<"keys">> => [#{<<"kid">> => <<>>,
+                                                       <<"algorithm">> => <<"HS256">>,
+                                                       <<"secret">> => #{<<"value">> => <<"s">>}}]})),
+    %% Claim checks
+    ?cfgh([auth, jwt, issuer], <<"https://example.com">>,
+          auth_raw(<<"jwt">>, Opts#{<<"issuer">> => <<"https://example.com">>})),
+    ?cfgh([auth, jwt, audience], <<"chat">>,
+          auth_raw(<<"jwt">>, Opts#{<<"audience">> => <<"chat">>})),
+    ?cfgh([auth, jwt, domain_key], domain,
+          auth_raw(<<"jwt">>, Opts#{<<"domain_key">> => <<"domain">>})),
+    ?errh(auth_raw(<<"jwt">>, Opts#{<<"issuer">> => <<>>})),
+    ?errh(auth_raw(<<"jwt">>, Opts#{<<"audience">> => 1})),
+    ?errh(auth_raw(<<"jwt">>, Opts#{<<"domain_key">> => <<>>})).
 
 auth_rdbms_users_number_estimate(_Config) ->
     ?cfgh([auth, rdbms, users_number_estimate], false, auth_raw(<<"rdbms">>, #{})), % default
