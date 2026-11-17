@@ -1,0 +1,3 @@
+_build
+big_tests/_build
+*.beam
