@@ -17,13 +17,14 @@ RUN ./tools/configure \
  && make rel \
  && mv _build/prod/rel/mongooseim /mongooseim
 
+# The slim image already has the OpenSSL runtime that crypto needs
 FROM erlang:${OTP_VERSION}-slim
 ARG VCS_REF=unknown
 LABEL org.opencontainers.image.source="https://github.com/lwm-luminx/MongooseIM" \
       org.opencontainers.image.revision="${VCS_REF}" \
       org.opencontainers.image.licenses="GPL-2.0-only"
 RUN apt-get update \
- && apt-get install -y --no-install-recommends libssl3 unixodbc zlib1g libexpat1 ca-certificates \
+ && apt-get install -y --no-install-recommends unixodbc zlib1g libexpat1 ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=build /mongooseim /usr/lib/mongooseim
 RUN ln -s /usr/lib/mongooseim/bin/mongooseimctl /usr/bin/mongooseimctl
