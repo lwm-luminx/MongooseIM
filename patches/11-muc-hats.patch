@@ -1,0 +1,1065 @@
+From 7bdc5a5aebfd285932e43b321713ff7401f56988 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 16 Nov 2026 21:13:49 +0000
+Subject: [PATCH] Add XEP-0317 hats to MUC rooms
+
+Rooms of a MUC service with the new 'hats' option can define hats
+(URI, title, optional hue) and give them to users by bare JID. The
+room adds the user's hats to every presence it broadcasts for them,
+strips any hats sent by clients, advertises urn:xmpp:hats:0 in disco,
+and stores hats with the room options.
+
+Hats are managed with new admin GraphQL fields in the muc category:
+setRoomHat, removeRoomHat, assignRoomHat, unassignRoomHat and
+listRoomHats.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01ETaRHXo1LmPHqZB9SXMucM
+---
+ big_tests/tests/graphql_muc_SUITE.erl         | 261 +++++++++++++++++-
+ doc/modules/mod_muc.md                        |  26 ++
+ include/mod_muc_room.hrl                      |   3 +
+ include/mongoose_ns.hrl                       |   1 +
+ priv/graphql/schemas/admin/muc.gql            |  15 +
+ priv/graphql/schemas/global/muc.gql           |  26 ++
+ .../mongoose_graphql_muc_admin_mutation.erl   |  32 ++-
+ .../mongoose_graphql_muc_admin_query.erl      |  13 +-
+ src/graphql/mongoose_graphql_muc_helper.erl   |  21 +-
+ src/muc/mod_muc.erl                           |   2 +
+ src/muc/mod_muc_api.erl                       |  58 +++-
+ src/muc/mod_muc_rdbms.erl                     |   4 +
+ src/muc/mod_muc_room.erl                      | 204 +++++++++++++-
+ test/common/config_parser_helper.erl          |   1 +
+ test/config_parser_SUITE.erl                  |   2 +
+ 15 files changed, 655 insertions(+), 14 deletions(-)
+
+diff --git a/big_tests/tests/graphql_muc_SUITE.erl b/big_tests/tests/graphql_muc_SUITE.erl
+index 510a104..181a3c7 100644
+--- a/big_tests/tests/graphql_muc_SUITE.erl
++++ b/big_tests/tests/graphql_muc_SUITE.erl
+@@ -29,6 +29,7 @@ groups() ->
+      {admin_muc_configured, [], admin_muc_tests()},
+      {admin_muc_and_mam_configured, [], admin_muc_with_mam_tests()},
+      {admin_muc_not_configured, [], admin_muc_not_configured_tests()},
++     {admin_muc_hats, [], admin_muc_hats_tests()},
+      {user_muc_configured, [parallel], user_muc_tests()},
+      {user_muc_and_mam_configured, [parallel], user_muc_with_mam_tests()},
+      {user_muc_not_configured, [parallel], user_muc_not_configured_tests()},
+@@ -42,7 +43,8 @@ user_groups() ->
+ admin_groups() ->
+     [{group, admin_muc_configured},
+      {group, admin_muc_and_mam_configured},
+-     {group, admin_muc_not_configured}].
++     {group, admin_muc_not_configured},
++     {group, admin_muc_hats}].
+ 
+ user_muc_tests() ->
+     [user_create_and_delete_room,
+@@ -148,9 +150,21 @@ admin_muc_tests() ->
+      admin_make_user_exit_room_bare_jid,
+      admin_list_room_affiliations,
+      admin_try_list_nonexistent_room_affiliations,
+-     admin_get_room_messages_muc_or_mam_not_configured
++     admin_get_room_messages_muc_or_mam_not_configured,
++     admin_try_set_room_hat_hats_disabled
+     ].
+ 
++admin_muc_hats_tests() ->
++    [admin_set_and_assign_room_hat,
++     admin_update_room_hat,
++     admin_unassign_room_hat,
++     admin_remove_room_hat,
++     admin_room_hats_override_client_hats,
++     admin_room_hats_in_disco,
++     admin_try_assign_nonexistent_room_hat,
++     admin_try_set_room_hat_with_invalid_args,
++     admin_try_set_hat_in_nonexistent_room].
++
+ admin_muc_with_mam_tests() ->
+     [admin_get_room_messages,
+      admin_try_get_nonexistent_room_messages].
+@@ -169,7 +183,8 @@ admin_muc_not_configured_tests() ->
+      admin_set_user_role_muc_not_configured,
+      admin_make_user_enter_room_muc_not_configured,
+      admin_make_user_exit_room_muc_not_configured,
+-     admin_list_room_affiliations_muc_not_configured].
++     admin_list_room_affiliations_muc_not_configured,
++     admin_set_room_hat_muc_not_configured].
+ 
+ domain_admin_muc_tests() ->
+     [admin_list_rooms,
+@@ -212,7 +227,8 @@ domain_admin_muc_tests() ->
+      admin_make_user_exit_room_bare_jid,
+      domain_admin_make_user_exit_room_no_permission,
+      admin_list_room_affiliations,
+-     domain_admin_list_room_affiliations_no_permission
++     domain_admin_list_room_affiliations_no_permission,
++     domain_admin_room_hats_no_permission
+     ].
+ 
+ init_per_suite(Config) ->
+@@ -258,6 +274,11 @@ init_per_group(Group, Config) when Group =:= admin_muc_and_mam_configured;
+         false ->
+             {skip, "No MAM backend available"}
+     end;
++init_per_group(admin_muc_hats, Config) ->
++    disable_mam(),
++    muc_helper:load_muc(domain_helper:host_type(), #{hats => true}),
++    mongoose_helper:ensure_muc_clean(),
++    Config;
+ init_per_group(Group, Config) when Group =:= admin_muc_not_configured;
+                                    Group =:= user_muc_not_configured ->
+     maybe_enable_mam(),
+@@ -328,6 +349,9 @@ end_per_group(Group, _Config) when Group =:= admin_muc_and_mam_configured;
+                                    Group =:= user_muc_and_mam_configured ->
+     ensure_muc_light_stopped(),
+     escalus_fresh:clean();
++end_per_group(admin_muc_hats, _Config) ->
++    ensure_muc_started(),
++    escalus_fresh:clean();
+ end_per_group(_Group, _Config) ->
+     escalus_fresh:clean().
+ 
+@@ -353,6 +377,13 @@ end_per_testcase(TC, Config) ->
+ -define(SET_ROLE_PATH, [data, muc, setUserRole]).
+ -define(ENTER_ROOM_PATH, [data, muc, enterRoom]).
+ -define(EXIT_ROOM_PATH, [data, muc, exitRoom]).
++-define(SET_ROOM_HAT_PATH, [data, muc, setRoomHat]).
++-define(REMOVE_ROOM_HAT_PATH, [data, muc, removeRoomHat]).
++-define(ASSIGN_ROOM_HAT_PATH, [data, muc, assignRoomHat]).
++-define(UNASSIGN_ROOM_HAT_PATH, [data, muc, unassignRoomHat]).
++-define(LIST_ROOM_HATS_PATH, [data, muc, listRoomHats]).
++-define(NS_HATS, <<"urn:xmpp:hats:0">>).
++-define(HOST_HAT, <<"http://example.com/hats#host">>).
+ 
+ -define(NONEXISTENT_ROOM, <<"room@room">>).
+ -define(NONEXISTENT_ROOM2, <<"room@", (muc_helper:muc_host())/binary>>).
+@@ -559,6 +590,185 @@ admin_try_kick_user_from_nonexistent_room(Config) ->
+     Res = kick_user(?NONEXISTENT_ROOM, <<"ali">>, null, Config),
+     ?assertNotEqual(nomatch, binary:match(get_err_msg(Res), <<"not found">>)).
+ 
++%% Hats (XEP-0317)
++
++admin_set_and_assign_room_hat(Config) ->
++    muc_helper:story_with_room(Config, [], [{alice, 1}, {bob, 1}],
++                               fun admin_set_and_assign_room_hat_story/3).
++
++admin_set_and_assign_room_hat_story(Config, Alice, Bob) ->
++    RoomJID = jid:from_binary(?config(room_jid, Config)),
++    enter_room_and_flush(RoomJID, [{Alice, <<"ali">>}, {Bob, <<"bobek">>}]),
++    Res = set_room_hat(RoomJID, ?HOST_HAT, <<"Host">>, 120.5, Config),
++    assert_success(?SET_ROOM_HAT_PATH, Res),
++    %% Nobody wears the hat yet, so no presence is broadcast
++    escalus_assert:has_no_stanzas(Bob),
++    Res2 = assign_room_hat(RoomJID, Bob, ?HOST_HAT, Config),
++    assert_success(?ASSIGN_ROOM_HAT_PATH, Res2),
++    [assert_hats(RoomJID, <<"bobek">>, [{?HOST_HAT, <<"Host">>, <<"120.5">>}], Client)
++     || Client <- [Alice, Bob]],
++    Res3 = list_room_hats(RoomJID, Config),
++    BobJID = escalus_utils:jid_to_lower(escalus_client:short_jid(Bob)),
++    ?assertEqual(#{<<"hats">> => [#{<<"uri">> => ?HOST_HAT, <<"title">> => <<"Host">>,
++                                    <<"hue">> => 120.5}],
++                   <<"assignments">> => [#{<<"jid">> => BobJID, <<"hats">> => [?HOST_HAT]}]},
++                 get_ok_value(?LIST_ROOM_HATS_PATH, Res3)),
++    %% Assigning the same hat again changes nothing
++    assert_success(?ASSIGN_ROOM_HAT_PATH, assign_room_hat(RoomJID, Bob, ?HOST_HAT, Config)),
++    ?assertEqual(get_ok_value(?LIST_ROOM_HATS_PATH, Res3),
++                 get_ok_value(?LIST_ROOM_HATS_PATH, list_room_hats(RoomJID, Config))).
++
++admin_update_room_hat(Config) ->
++    muc_helper:story_with_room(Config, [], [{alice, 1}, {bob, 1}],
++                               fun admin_update_room_hat_story/3).
++
++admin_update_room_hat_story(Config, Alice, Bob) ->
++    RoomJID = jid:from_binary(?config(room_jid, Config)),
++    enter_room_and_flush(RoomJID, [{Alice, <<"ali">>}, {Bob, <<"bobek">>}]),
++    assert_success(?SET_ROOM_HAT_PATH, set_room_hat(RoomJID, ?HOST_HAT, <<"Host">>, null, Config)),
++    assert_success(?ASSIGN_ROOM_HAT_PATH, assign_room_hat(RoomJID, Bob, ?HOST_HAT, Config)),
++    [assert_hats(RoomJID, <<"bobek">>, [{?HOST_HAT, <<"Host">>, undefined}], Client)
++     || Client <- [Alice, Bob]],
++    %% Wearers get their presence broadcast again with the new title
++    assert_success(?SET_ROOM_HAT_PATH,
++                   set_room_hat(RoomJID, ?HOST_HAT, <<"Head host">>, 0, Config)),
++    [assert_hats(RoomJID, <<"bobek">>, [{?HOST_HAT, <<"Head host">>, <<"0.0">>}], Client)
++     || Client <- [Alice, Bob]].
++
++admin_unassign_room_hat(Config) ->
++    muc_helper:story_with_room(Config, [], [{alice, 1}, {bob, 1}],
++                               fun admin_unassign_room_hat_story/3).
++
++admin_unassign_room_hat_story(Config, Alice, Bob) ->
++    RoomJID = jid:from_binary(?config(room_jid, Config)),
++    enter_room_and_flush(RoomJID, [{Alice, <<"ali">>}, {Bob, <<"bobek">>}]),
++    assert_success(?SET_ROOM_HAT_PATH, set_room_hat(RoomJID, ?HOST_HAT, <<"Host">>, null, Config)),
++    assert_success(?ASSIGN_ROOM_HAT_PATH, assign_room_hat(RoomJID, Bob, ?HOST_HAT, Config)),
++    [assert_hats(RoomJID, <<"bobek">>, [{?HOST_HAT, <<"Host">>, undefined}], Client)
++     || Client <- [Alice, Bob]],
++    assert_success(?UNASSIGN_ROOM_HAT_PATH, unassign_room_hat(RoomJID, Bob, ?HOST_HAT, Config)),
++    [assert_hats(RoomJID, <<"bobek">>, [], Client) || Client <- [Alice, Bob]],
++    ?assertMatch(#{<<"assignments">> := []},
++                 get_ok_value(?LIST_ROOM_HATS_PATH, list_room_hats(RoomJID, Config))),
++    %% Bob no longer wears the hat
++    Res = unassign_room_hat(RoomJID, Bob, ?HOST_HAT, Config),
++    ?assertNotEqual(nomatch, binary:match(get_err_msg(Res), <<"Hat not found">>)).
++
++admin_remove_room_hat(Config) ->
++    muc_helper:story_with_room(Config, [], [{alice, 1}, {bob, 1}],
++                               fun admin_remove_room_hat_story/3).
++
++admin_remove_room_hat_story(Config, Alice, Bob) ->
++    RoomJID = jid:from_binary(?config(room_jid, Config)),
++    enter_room_and_flush(RoomJID, [{Alice, <<"ali">>}, {Bob, <<"bobek">>}]),
++    assert_success(?SET_ROOM_HAT_PATH, set_room_hat(RoomJID, ?HOST_HAT, <<"Host">>, null, Config)),
++    assert_success(?ASSIGN_ROOM_HAT_PATH, assign_room_hat(RoomJID, Bob, ?HOST_HAT, Config)),
++    [assert_hats(RoomJID, <<"bobek">>, [{?HOST_HAT, <<"Host">>, undefined}], Client)
++     || Client <- [Alice, Bob]],
++    assert_success(?REMOVE_ROOM_HAT_PATH, remove_room_hat(RoomJID, ?HOST_HAT, Config)),
++    [assert_hats(RoomJID, <<"bobek">>, [], Client) || Client <- [Alice, Bob]],
++    ?assertEqual(#{<<"hats">> => [], <<"assignments">> => []},
++                 get_ok_value(?LIST_ROOM_HATS_PATH, list_room_hats(RoomJID, Config))),
++    Res = remove_room_hat(RoomJID, ?HOST_HAT, Config),
++    ?assertNotEqual(nomatch, binary:match(get_err_msg(Res), <<"Hat not found">>)).
++
++admin_room_hats_override_client_hats(Config) ->
++    muc_helper:story_with_room(Config, [], [{alice, 1}, {bob, 1}],
++                               fun admin_room_hats_override_client_hats_story/3).
++
++admin_room_hats_override_client_hats_story(Config, Alice, Bob) ->
++    RoomJID = jid:from_binary(?config(room_jid, Config)),
++    enter_room_and_flush(RoomJID, [{Alice, <<"ali">>}, {Bob, <<"bobek">>}]),
++    FakeHats = #xmlel{name = <<"hats">>, attrs = #{<<"xmlns">> => ?NS_HATS},
++                      children = [#xmlel{name = <<"hat">>,
++                                         attrs = #{<<"uri">> => <<"urn:fake">>,
++                                                   <<"title">> => <<"Owner">>}}]},
++    BobRoomJID = jid:to_binary(jid:replace_resource(RoomJID, <<"bobek">>)),
++    escalus:send(Bob, escalus_stanza:to(escalus_stanza:presence(<<"available">>, [FakeHats]),
++                                        BobRoomJID)),
++    %% Clients can't put on hats themselves
++    [assert_hats(RoomJID, <<"bobek">>, [], Client) || Client <- [Alice, Bob]],
++    assert_success(?SET_ROOM_HAT_PATH, set_room_hat(RoomJID, ?HOST_HAT, <<"Host">>, null, Config)),
++    assert_success(?ASSIGN_ROOM_HAT_PATH, assign_room_hat(RoomJID, Bob, ?HOST_HAT, Config)),
++    [assert_hats(RoomJID, <<"bobek">>, [{?HOST_HAT, <<"Host">>, undefined}], Client)
++     || Client <- [Alice, Bob]],
++    escalus:send(Bob, escalus_stanza:to(escalus_stanza:presence(<<"available">>, [FakeHats]),
++                                        BobRoomJID)),
++    [assert_hats(RoomJID, <<"bobek">>, [{?HOST_HAT, <<"Host">>, undefined}], Client)
++     || Client <- [Alice, Bob]].
++
++admin_room_hats_in_disco(Config) ->
++    muc_helper:story_with_room(Config, [], [{alice, 1}], fun admin_room_hats_in_disco_story/2).
++
++admin_room_hats_in_disco_story(Config, Alice) ->
++    RoomJID = ?config(room_jid, Config),
++    escalus:send(Alice, escalus_stanza:disco_info(RoomJID)),
++    Stanza = escalus:wait_for_stanza(Alice),
++    escalus:assert(has_feature, [?NS_HATS], Stanza).
++
++admin_try_assign_nonexistent_room_hat(Config) ->
++    muc_helper:story_with_room(Config, [], [{alice, 1}, {bob, 1}],
++                               fun admin_try_assign_nonexistent_room_hat_story/3).
++
++admin_try_assign_nonexistent_room_hat_story(Config, Alice, Bob) ->
++    RoomJID = jid:from_binary(?config(room_jid, Config)),
++    enter_room_and_flush(RoomJID, [{Alice, <<"ali">>}]),
++    Res = assign_room_hat(RoomJID, Bob, ?HOST_HAT, Config),
++    ?assertNotEqual(nomatch, binary:match(get_err_msg(Res), <<"Hat not found">>)).
++
++admin_try_set_room_hat_with_invalid_args(Config) ->
++    muc_helper:story_with_room(Config, [], [{alice, 1}],
++                               fun admin_try_set_room_hat_with_invalid_args_story/2).
++
++admin_try_set_room_hat_with_invalid_args_story(Config, Alice) ->
++    RoomJID = jid:from_binary(?config(room_jid, Config)),
++    enter_room_and_flush(RoomJID, [{Alice, <<"ali">>}]),
++    Res1 = set_room_hat(RoomJID, <<>>, <<"Host">>, null, Config),
++    ?assertNotEqual(nomatch, binary:match(get_err_msg(Res1), <<"URI cannot be empty">>)),
++    Res2 = set_room_hat(RoomJID, ?HOST_HAT, <<>>, null, Config),
++    ?assertNotEqual(nomatch, binary:match(get_err_msg(Res2), <<"title cannot be empty">>)),
++    Res3 = set_room_hat(RoomJID, ?HOST_HAT, <<"Host">>, 360, Config),
++    ?assertNotEqual(nomatch, binary:match(get_err_msg(Res3), <<"less than 360">>)),
++    Res4 = set_room_hat(RoomJID, ?HOST_HAT, <<"Host">>, -1, Config),
++    ?assertNotEqual(nomatch, binary:match(get_err_msg(Res4), <<"less than 360">>)).
++
++admin_try_set_hat_in_nonexistent_room(Config) ->
++    Res = set_room_hat(jid:from_binary(?NONEXISTENT_ROOM2), ?HOST_HAT, <<"Host">>, null, Config),
++    ?assertNotEqual(nomatch, binary:match(get_err_msg(Res), <<"not found">>)),
++    Res2 = list_room_hats(jid:from_binary(?NONEXISTENT_ROOM2), Config),
++    ?assertNotEqual(nomatch, binary:match(get_err_msg(Res2), <<"not found">>)).
++
++admin_try_set_room_hat_hats_disabled(Config) ->
++    muc_helper:story_with_room(Config, [], [{alice, 1}],
++                               fun admin_try_set_room_hat_hats_disabled_story/2).
++
++admin_try_set_room_hat_hats_disabled_story(Config, Alice) ->
++    RoomJID = jid:from_binary(?config(room_jid, Config)),
++    enter_room_and_flush(RoomJID, [{Alice, <<"ali">>}]),
++    Res = set_room_hat(RoomJID, ?HOST_HAT, <<"Host">>, null, Config),
++    ?assertNotEqual(nomatch, binary:match(get_err_msg(Res), <<"not enabled">>)),
++    Res2 = list_room_hats(RoomJID, Config),
++    ?assertNotEqual(nomatch, binary:match(get_err_msg(Res2), <<"not enabled">>)).
++
++admin_set_room_hat_muc_not_configured(Config) ->
++    RoomJID = jid:from_binary(?NONEXISTENT_ROOM2),
++    get_not_loaded(set_room_hat(RoomJID, ?HOST_HAT, <<"Host">>, null, Config)),
++    get_not_loaded(list_room_hats(RoomJID, Config)).
++
++domain_admin_room_hats_no_permission(Config) ->
++    escalus:fresh_story_with_config(Config, [{alice, 1}],
++                                    fun domain_admin_room_hats_no_permission_story/2).
++
++domain_admin_room_hats_no_permission_story(Config, Alice) ->
++    [begin
++         RoomJID = jid:from_binary(Room),
++         get_unauthorized(set_room_hat(RoomJID, ?HOST_HAT, <<"Host">>, null, Config)),
++         get_unauthorized(remove_room_hat(RoomJID, ?HOST_HAT, Config)),
++         get_unauthorized(assign_room_hat(RoomJID, Alice, ?HOST_HAT, Config)),
++         get_unauthorized(unassign_room_hat(RoomJID, Alice, ?HOST_HAT, Config)),
++         get_unauthorized(list_room_hats(RoomJID, Config))
++     end || Room <- [?NONEXISTENT_ROOM, ?EXTERNAL_DOMAIN_ROOM]].
++
+ admin_send_message_to_room(Config) ->
+     muc_helper:story_with_room(Config, [], [{alice, 1}, {bob, 1}],
+                                fun admin_send_message_to_room_story/3).
+@@ -1999,6 +2209,49 @@ invite_user(Room, Sender, Recipient, Reason, Config) ->
+              recipient => user_to_bin(Recipient), reason => Reason},
+     execute_command(<<"muc">>, <<"inviteUser">>, Vars, Config).
+ 
++set_room_hat(Room, Uri, Title, Hue, Config) ->
++    Vars = #{room => jid:to_binary(Room), uri => Uri, title => Title, hue => Hue},
++    execute_command(<<"muc">>, <<"setRoomHat">>, Vars, Config).
++
++remove_room_hat(Room, Uri, Config) ->
++    Vars = #{room => jid:to_binary(Room), uri => Uri},
++    execute_command(<<"muc">>, <<"removeRoomHat">>, Vars, Config).
++
++assign_room_hat(Room, User, Uri, Config) ->
++    Vars = #{room => jid:to_binary(Room), user => user_to_bin(User), uri => Uri},
++    execute_command(<<"muc">>, <<"assignRoomHat">>, Vars, Config).
++
++unassign_room_hat(Room, User, Uri, Config) ->
++    Vars = #{room => jid:to_binary(Room), user => user_to_bin(User), uri => Uri},
++    execute_command(<<"muc">>, <<"unassignRoomHat">>, Vars, Config).
++
++list_room_hats(Room, Config) ->
++    Vars = #{room => jid:to_binary(Room)},
++    execute_command(<<"muc">>, <<"listRoomHats">>, Vars, Config).
++
++assert_success(Path, Res) ->
++    ?assertNotEqual(nomatch, binary:match(get_ok_value(Path, Res), <<"successfully">>)).
++
++%% Enters the room with each client in turn, and drops the presences and subject they receive
++enter_room_and_flush(RoomJID, ClientsAndNicks) ->
++    [enter_room(RoomJID, Client, Nick) || {Client, Nick} <- ClientsAndNicks],
++    [escalus_client:wait_for_stanzas(Client, 10, 500) || {Client, _} <- ClientsAndNicks],
++    ok.
++
++%% Waits for the presence of Nick broadcast by the room, and checks the hats it carries
++assert_hats(RoomJID, Nick, ExpectedHats, Client) ->
++    From = jid:to_binary(jid:replace_resource(RoomJID, Nick)),
++    Presence = escalus:wait_for_stanza(Client),
++    escalus:assert(is_presence, Presence),
++    ?assertEqual(From, exml_query:attr(Presence, <<"from">>)),
++    Hats = [{exml_query:attr(Hat, <<"uri">>), exml_query:attr(Hat, <<"title">>),
++             exml_query:attr(Hat, <<"hue">>)}
++            || Hat <- exml_query:paths(Presence, [{element_with_ns, <<"hats">>, ?NS_HATS},
++                                                  {element, <<"hat">>}])],
++    ?assertEqual(ExpectedHats, Hats),
++    ?assertEqual(length(exml_query:subelements_with_name_and_ns(Presence, <<"hats">>, ?NS_HATS)),
++                 min(1, length(ExpectedHats))).
++
+ kick_user(Room, Nick, Reason, Config) ->
+     Vars = #{room => jid:to_binary(Room), nick => Nick, reason => Reason},
+     execute_command(<<"muc">>, <<"kickUser">>, Vars, Config).
+diff --git a/doc/modules/mod_muc.md b/doc/modules/mod_muc.md
+index c5f95ff..0512184 100644
+--- a/doc/modules/mod_muc.md
++++ b/doc/modules/mod_muc.md
+@@ -165,6 +165,14 @@ this option specifies the HTTP pool name to use (see [External HTTP Authenticati
+ Load all rooms at startup. Because it can be unsafe when there are many rooms,
+ it is disabled by default.
+ 
++### `modules.mod_muc.hats`
++  * **Syntax:** boolean
++  * **Default:** `false`
++  * **Example:** `hats = true`
++
++Enables [XEP-0317: Hats](https://xmpp.org/extensions/xep-0317.html) in the rooms of this service.
++See [Hats](#hats-xep-0317) below.
++
+ ### `modules.mod_muc.hibernate_timeout` 
+  * **Syntax:** non-negative integer or the string `"infinity"`
+  * **Default:** `90000` (milliseconds, 90 seconds)
+@@ -447,6 +455,24 @@ If the owner is online, a presence of a type unavailable is sent to it indicatin
+ 
+ The room's process can be recreated on demand, for example when a presence sent to it, or the owner wants to add more users to the room.
+ 
++## Hats (XEP-0317)
++
++When the `hats` option is enabled, each room can define hats: roles with a URI, a title and an optional hue,
++such as "Host" or "Moderator on duty".
++Hats are given to users by their bare JID, so they apply to every session of that user in the room.
++The room adds a `<hats xmlns='urn:xmpp:hats:0'/>` element listing the user's hats to every presence it broadcasts
++for that user, and advertises the `urn:xmpp:hats:0` feature in its disco#info.
++Any `hats` element sent by a client in its own presence is removed, so users cannot put on hats themselves.
++When a hat is defined, changed or taken off, the room broadcasts the new presence of every affected occupant.
++
++Hats are stored together with the room configuration, so they persist with persistent rooms.
++
++Hats are managed with the admin GraphQL API in the `muc` category:
++`setRoomHat`, `removeRoomHat`, `assignRoomHat`, `unassignRoomHat` and `listRoomHats`.
++The ad-hoc commands described in the XEP are not supported.
++Like other room administration operations, these only work on rooms whose process is running,
++so a room stopped by [deep hibernation](#room-deep-hibernation) has to be woken up first.
++
+ ## External HTTP Authentication
+ 
+ MUC rooms can be protected by a password that is set by the room owner.
+diff --git a/include/mod_muc_room.hrl b/include/mod_muc_room.hrl
+index 4ad66cc..e07fdd5 100644
+--- a/include/mod_muc_room.hrl
++++ b/include/mod_muc_room.hrl
+@@ -88,6 +88,9 @@
+                 room_queue = queue:new(),
+                 http_auth_pool = none :: none | mongoose_http_client:pool(),
+                 http_auth_pids = [] :: [pid()],
++                %% Hats (XEP-0317) defined in the room, and the hats worn by each bare JID
++                hats = [] :: [mod_muc_room:hat()],
++                hat_assignments = #{} :: #{jid:simple_bare_jid() => [mod_muc_room:hat_uri()]},
+                 hibernate_timeout = 90000 :: timeout()
+                }).
+ 
+diff --git a/include/mongoose_ns.hrl b/include/mongoose_ns.hrl
+index 0d9f0a7..d91747a 100644
+--- a/include/mongoose_ns.hrl
++++ b/include/mongoose_ns.hrl
+@@ -44,6 +44,7 @@
+ -define(NS_MUC_REQUEST,         <<"http://jabber.org/protocol/muc#request">>).
+ -define(NS_MUC_CONFIG,          <<"http://jabber.org/protocol/muc#roomconfig">>).
+ -define(NS_MUC_STABLE_ID,       <<"http://jabber.org/protocol/muc#stable_id">>).
++-define(NS_HATS,                <<"urn:xmpp:hats:0">>).
+ -define(NS_PING,                <<"urn:xmpp:ping">>).
+ -define(NS_PUBSUB,              <<"http://jabber.org/protocol/pubsub">>).
+ -define(NS_PUBSUB_EVENT,        <<"http://jabber.org/protocol/pubsub#event">>).
+diff --git a/priv/graphql/schemas/admin/muc.gql b/priv/graphql/schemas/admin/muc.gql
+index d387db4..2be56e9 100644
+--- a/priv/graphql/schemas/admin/muc.gql
++++ b/priv/graphql/schemas/admin/muc.gql
+@@ -35,6 +35,18 @@ type MUCAdminMutation @protected @use(modules: ["mod_muc"]){
+   "Make a user with the given nick exit the room"
+   exitRoom(room: BareJID!, user: FullJID!, nick: ResourceName!): String
+     @protected(type: DOMAIN, args: ["user"]) @use(args: ["room"])
++  "Define a hat (XEP-0317) in a MUC room, or update the title and hue of an existing one"
++  setRoomHat(room: BareJID!, uri: String!, title: String!, hue: Float): String
++    @protected(type: DOMAIN, args: ["room"]) @use(args: ["room"])
++  "Remove a hat from a MUC room, and from every user wearing it"
++  removeRoomHat(room: BareJID!, uri: String!): String
++    @protected(type: DOMAIN, args: ["room"]) @use(args: ["room"])
++  "Give a hat defined in a MUC room to a user"
++  assignRoomHat(room: BareJID!, user: BareJID!, uri: String!): String
++    @protected(type: DOMAIN, args: ["room"]) @use(args: ["room"])
++  "Take a hat off a user in a MUC room"
++  unassignRoomHat(room: BareJID!, user: BareJID!, uri: String!): String
++    @protected(type: DOMAIN, args: ["room"]) @use(args: ["room"])
+ }
+ 
+ """
+@@ -56,4 +68,7 @@ type MUCAdminQuery @protected @use(modules: ["mod_muc"]){
+   "Get the MUC room archived messages"
+   getRoomMessages(room: BareJID!, pageSize: PosInt, before: DateTime): StanzasPayload
+     @protected(type: DOMAIN, args: ["room"]) @use(args: ["room"], modules: ["mod_mam_muc"])
++  "Get the hats (XEP-0317) defined in a MUC room, and who wears them"
++  listRoomHats(room: BareJID!): MUCRoomHats
++    @protected(type: DOMAIN, args: ["room"]) @use(args: ["room"])
+ }
+diff --git a/priv/graphql/schemas/global/muc.gql b/priv/graphql/schemas/global/muc.gql
+index b4d926f..7d71960 100644
+--- a/priv/graphql/schemas/global/muc.gql
++++ b/priv/graphql/schemas/global/muc.gql
+@@ -40,6 +40,32 @@ type MUCRoomAffiliation{
+   affiliation: MUCAffiliation!
+ }
+ 
++"A hat (XEP-0317) defined in a MUC room"
++type MUCRoomHat{
++  "Unique URI of the hat"
++  uri: String!
++  "Human-readable title of the hat"
++  title: String!
++  "Hue of the hat in degrees, used by clients to color it"
++  hue: Float
++}
++
++"Hats worn by a user in a MUC room"
++type MUCRoomHatAssignment{
++  "Bare JID of the user"
++  jid: JID!
++  "URIs of the hats the user wears"
++  hats: [String!]!
++}
++
++"Hats defined in a MUC room, and who wears them"
++type MUCRoomHats{
++  "Hats defined in the room"
++  hats: [MUCRoomHat!]!
++  "Users wearing hats"
++  assignments: [MUCRoomHatAssignment!]!
++}
++
+ "MUC room description"
+ type MUCRoomDesc{
+   "Room's JID"
+diff --git a/src/graphql/admin/mongoose_graphql_muc_admin_mutation.erl b/src/graphql/admin/mongoose_graphql_muc_admin_mutation.erl
+index 5ae8439..f9bf74f 100644
+--- a/src/graphql/admin/mongoose_graphql_muc_admin_mutation.erl
++++ b/src/graphql/admin/mongoose_graphql_muc_admin_mutation.erl
+@@ -31,7 +31,15 @@ execute(_Ctx, _Obj, <<"setUserAffiliation">>, Args) ->
+ execute(_Ctx, _Obj, <<"enterRoom">>, Args) ->
+     enter_room(Args);
+ execute(_Ctx, _Obj, <<"exitRoom">>, Args) ->
+-    exit_room(Args).
++    exit_room(Args);
++execute(_Ctx, _Obj, <<"setRoomHat">>, Args) ->
++    set_room_hat(Args);
++execute(_Ctx, _Obj, <<"removeRoomHat">>, Args) ->
++    remove_room_hat(Args);
++execute(_Ctx, _Obj, <<"assignRoomHat">>, Args) ->
++    assign_room_hat(Args);
++execute(_Ctx, _Obj, <<"unassignRoomHat">>, Args) ->
++    unassign_room_hat(Args).
+ 
+ -spec create_instant_room(map()) -> {ok, map()} | {error, resolver_error()}.
+ create_instant_room(#{<<"room">> := RoomJID, <<"owner">> := OwnerJID, <<"nick">> := Nick}) ->
+@@ -104,3 +112,25 @@ enter_room(#{<<"room">> := RoomJID, <<"user">> := UserJID, <<"nick">> := Nick,
+ exit_room(#{<<"room">> := RoomJID, <<"user">> := UserJID, <<"nick">> := Nick}) ->
+     RoomJIDRes = jid:replace_resource(RoomJID, Nick),
+     mod_muc_api:exit_room(RoomJIDRes, UserJID).
++
++-spec set_room_hat(map()) -> {ok, binary()} | {error, resolver_error()}.
++set_room_hat(#{<<"room">> := RoomJID, <<"uri">> := Uri, <<"title">> := Title, <<"hue">> := Hue}) ->
++    Res = mod_muc_api:set_room_hat(RoomJID, Uri, Title, null_to_undefined(Hue)),
++    format_result(Res, #{room => jid:to_binary(RoomJID), uri => Uri}).
++
++-spec remove_room_hat(map()) -> {ok, binary()} | {error, resolver_error()}.
++remove_room_hat(#{<<"room">> := RoomJID, <<"uri">> := Uri}) ->
++    Res = mod_muc_api:remove_room_hat(RoomJID, Uri),
++    format_result(Res, #{room => jid:to_binary(RoomJID), uri => Uri}).
++
++-spec assign_room_hat(map()) -> {ok, binary()} | {error, resolver_error()}.
++assign_room_hat(#{<<"room">> := RoomJID, <<"user">> := UserJID, <<"uri">> := Uri}) ->
++    Res = mod_muc_api:assign_room_hat(RoomJID, UserJID, Uri),
++    format_result(Res, #{room => jid:to_binary(RoomJID), user => jid:to_binary(UserJID),
++                         uri => Uri}).
++
++-spec unassign_room_hat(map()) -> {ok, binary()} | {error, resolver_error()}.
++unassign_room_hat(#{<<"room">> := RoomJID, <<"user">> := UserJID, <<"uri">> := Uri}) ->
++    Res = mod_muc_api:unassign_room_hat(RoomJID, UserJID, Uri),
++    format_result(Res, #{room => jid:to_binary(RoomJID), user => jid:to_binary(UserJID),
++                         uri => Uri}).
+diff --git a/src/graphql/admin/mongoose_graphql_muc_admin_query.erl b/src/graphql/admin/mongoose_graphql_muc_admin_query.erl
+index 4699729..4085289 100644
+--- a/src/graphql/admin/mongoose_graphql_muc_admin_query.erl
++++ b/src/graphql/admin/mongoose_graphql_muc_admin_query.erl
+@@ -19,7 +19,9 @@ execute(_Ctx, _Obj, <<"listRoomAffiliations">>, Args) ->
+ execute(_Ctx, _Obj, <<"getRoomMessages">>, Args) ->
+     get_room_messages(Args);
+ execute(_Ctx, _Obj, <<"getRoomConfig">>, Args) ->
+-    get_room_config(Args).
++    get_room_config(Args);
++execute(_Ctx, _Obj, <<"listRoomHats">>, Args) ->
++    list_room_hats(Args).
+ 
+ -spec list_rooms(map()) -> {ok, map()}.
+ list_rooms(#{<<"mucDomain">> := MUCDomain, <<"from">> := FromJID,
+@@ -72,3 +74,12 @@ get_room_messages(#{<<"room">> := RoomJID, <<"pageSize">> := PageSize, <<"before
+         Err ->
+             make_error(Err, #{room => RoomJID})
+     end.
++
++-spec list_room_hats(map()) -> {ok, map()} | {error, resolver_error()}.
++list_room_hats(#{<<"room">> := RoomJID}) ->
++    case mod_muc_api:get_room_hats(RoomJID) of
++        {ok, Hats} ->
++            {ok, mongoose_graphql_muc_helper:format_hats(Hats)};
++        Error ->
++            make_error(Error, #{room => jid:to_binary(RoomJID)})
++    end.
+diff --git a/src/graphql/mongoose_graphql_muc_helper.erl b/src/graphql/mongoose_graphql_muc_helper.erl
+index 70b1cbd..17d7147 100644
+--- a/src/graphql/mongoose_graphql_muc_helper.erl
++++ b/src/graphql/mongoose_graphql_muc_helper.erl
+@@ -1,7 +1,8 @@
+ -module(mongoose_graphql_muc_helper).
+ 
+ -export([make_rooms_payload/2, make_room_desc/1, muc_room_config_to_map/1, make_muc_room_config/2,
+-         format_user/1, format_users/1, add_user_resource/2, format_affs/1]).
++         format_user/1, format_users/1, add_user_resource/2, format_affs/1,
++         format_hats/1]).
+ 
+ -export([default_kick_reason/1, default_invite_reason/1, default_room_removal_reason/1]).
+ 
+@@ -59,6 +60,24 @@ format_affs(Affs) ->
+ format_aff({JID, Aff}) ->
+     #{<<"jid">> => JID, <<"affiliation">> => Aff}.
+ 
++-spec format_hats(mod_muc_api:hats_result()) -> map().
++format_hats(#{hats := Hats, assignments := Assignments}) ->
++    #{<<"hats">> => [{ok, format_hat(Hat)} || Hat <- Hats],
++      <<"assignments">> => [{ok, #{<<"jid">> => JID, <<"hats">> => [{ok, Uri} || Uri <- Uris]}}
++                            || {JID, Uris} <- Assignments]}.
++
++format_hat(Hat = #{uri := Uri, title := Title}) ->
++    Hue = case Hat of
++              #{hue := HueBin} -> binary_to_number(HueBin);
++              _ -> null
++          end,
++    #{<<"uri">> => Uri, <<"title">> => Title, <<"hue">> => Hue}.
++
++binary_to_number(Bin) ->
++    try binary_to_float(Bin)
++    catch error:badarg -> float(binary_to_integer(Bin))
++    end.
++
+ -spec muc_room_config_to_map(mod_muc_room:config()) -> map().
+ muc_room_config_to_map(Conf) ->
+     #{<<"title">> => Conf#config.title,
+diff --git a/src/muc/mod_muc.erl b/src/muc/mod_muc.erl
+index af009c9..f0d4444 100644
+--- a/src/muc/mod_muc.erl
++++ b/src/muc/mod_muc.erl
+@@ -249,6 +249,7 @@ config_spec() ->
+                  <<"http_auth_pool">> => #option{type = atom,
+                                                  validate = pool_name},
+                  <<"load_permanent_rooms_at_startup">> => #option{type = boolean},
++                 <<"hats">> => #option{type = boolean},
+                  <<"hibernate_timeout">> => #option{type = int_or_infinity,
+                                                     validate = non_negative},
+                  <<"hibernated_room_check_interval">> => #option{type = int_or_infinity,
+@@ -282,6 +283,7 @@ defaults() ->
+       <<"max_user_conferences">> => 10,
+       <<"http_auth_pool">> => none,
+       <<"load_permanent_rooms_at_startup">> => false,
++      <<"hats">> => false,
+       <<"hibernate_timeout">> => timer:seconds(90),
+       <<"hibernated_room_check_interval">> => infinity,
+       <<"hibernated_room_timeout">> => infinity,
+diff --git a/src/muc/mod_muc_api.erl b/src/muc/mod_muc_api.erl
+index b91a023..2342228 100644
+--- a/src/muc/mod_muc_api.erl
++++ b/src/muc/mod_muc_api.erl
+@@ -25,7 +25,12 @@
+          set_role/4,
+          set_role/3,
+          delete_room/2,
+-         delete_room/3]).
++         delete_room/3,
++         get_room_hats/1,
++         set_room_hat/4,
++         remove_room_hat/2,
++         assign_room_hat/3,
++         unassign_room_hat/3]).
+ 
+ -ignore_xref([get_rooms/4, get_rooms/5, delete_room/3,
+               get_room_config/2, get_room_users/2]).
+@@ -51,7 +56,10 @@
+ 
+ -type aff_item() :: {jid:simple_jid(), mod_muc:affiliation()}.
+ 
+--export_type([user_map/0, short_room_desc/0]).
++-type hats_result() :: #{hats := [mod_muc_room:hat()],
++                         assignments := [{jid:jid(), [mod_muc_room:hat_uri()]}]}.
++
++-export_type([user_map/0, short_room_desc/0, hats_result/0]).
+ 
+ -define(ROOM_DELETED_SUCC_RESULT, {ok, "Room deleted successfully"}).
+ -define(USER_CANNOT_ACCESS_ROOM_RESULT,
+@@ -65,6 +73,8 @@
+ -define(MODERATOR_RES_NOT_FOUND_RESULT,
+         {moderator_not_found, "Resource with moderator role not found"}).
+ -define(SET_ROLE_SUCC_RESULT, {ok, "Role set successfully"}).
++-define(HATS_DISABLED_RESULT, {hats_disabled, "Hats are not enabled for this MUC service"}).
++-define(HAT_NOT_FOUND_RESULT, {hat_not_found, "Hat not found"}).
+ 
+ -spec get_rooms(jid:lserver(), jid:jid(), non_neg_integer() | undefined,
+                 non_neg_integer()) -> {ok, get_rooms_result()} | {muc_server_not_found, iolist()}.
+@@ -243,6 +253,41 @@ kick_user_from_room(RoomJID, UserJID, Nick, ReasonIn) ->
+             ?ROOM_NOT_FOUND_RESULT
+     end.
+ 
++%% Hats (XEP-0317)
++
++-spec get_room_hats(jid:jid()) -> {ok, hats_result()} | {room_not_found | hats_disabled, iolist()}.
++get_room_hats(RoomJID) ->
++    format_hats_result(mod_muc_room:get_hats(RoomJID), undefined).
++
++%% @doc Defines a hat in the room, or updates the title and hue of an existing one.
++-spec set_room_hat(jid:jid(), binary(), binary(), number() | undefined) ->
++    {ok | room_not_found | hats_disabled | bad_request, iolist()}.
++set_room_hat(_RoomJID, <<>>, _Title, _Hue) ->
++    {bad_request, "Hat URI cannot be empty"};
++set_room_hat(_RoomJID, _Uri, <<>>, _Hue) ->
++    {bad_request, "Hat title cannot be empty"};
++set_room_hat(_RoomJID, _Uri, _Title, Hue) when is_number(Hue), (Hue < 0 orelse Hue >= 360) ->
++    {bad_request, "Hat hue must be at least 0 and less than 360"};
++set_room_hat(RoomJID, Uri, Title, Hue) ->
++    Res = mod_muc_room:set_hat(RoomJID, Uri, Title, format_hue(Hue)),
++    format_hats_result(Res, "Hat set successfully").
++
++-spec remove_room_hat(jid:jid(), binary()) ->
++    {ok | room_not_found | hats_disabled | hat_not_found, iolist()}.
++remove_room_hat(RoomJID, Uri) ->
++    format_hats_result(mod_muc_room:remove_hat(RoomJID, Uri), "Hat removed successfully").
++
++-spec assign_room_hat(jid:jid(), jid:jid(), binary()) ->
++    {ok | room_not_found | hats_disabled | hat_not_found, iolist()}.
++assign_room_hat(RoomJID, UserJID, Uri) ->
++    format_hats_result(mod_muc_room:assign_hat(RoomJID, UserJID, Uri), "Hat assigned successfully").
++
++-spec unassign_room_hat(jid:jid(), jid:jid(), binary()) ->
++    {ok | room_not_found | hats_disabled | hat_not_found, iolist()}.
++unassign_room_hat(RoomJID, UserJID, Uri) ->
++    format_hats_result(mod_muc_room:unassign_hat(RoomJID, UserJID, Uri),
++                       "Hat unassigned successfully").
++
+ -spec delete_room(jid:jid(), binary()) -> {ok | room_not_found, iolist()}.
+ delete_room(RoomJID, Reason) ->
+     case mod_muc_room:delete_room(RoomJID, Reason) of
+@@ -609,3 +654,12 @@ format_affs(AffsMap) ->
+                   ({K, {V, <<>>}}) -> {K, V};
+                   ({K, V}) -> {K, V}
+               end, maps:to_list(AffsMap)).
++
++format_hue(undefined) -> undefined;
++format_hue(Hue) -> float_to_binary(float(Hue), [short]).
++
++format_hats_result(ok, Msg) -> {ok, Msg};
++format_hats_result({ok, Hats}, _Msg) -> {ok, Hats};
++format_hats_result({error, not_found}, _Msg) -> ?ROOM_NOT_FOUND_RESULT;
++format_hats_result({error, hats_disabled}, _Msg) -> ?HATS_DISABLED_RESULT;
++format_hats_result({error, hat_not_found}, _Msg) -> ?HAT_NOT_FOUND_RESULT.
+diff --git a/src/muc/mod_muc_rdbms.erl b/src/muc/mod_muc_rdbms.erl
+index 828d20d..5cc04c2 100644
+--- a/src/muc/mod_muc_rdbms.erl
++++ b/src/muc/mod_muc_rdbms.erl
+@@ -409,5 +409,9 @@ kv_to_opt({<<"subject">>, Value}) ->
+     {true, {subject, Value}};
+ kv_to_opt({<<"subject_author">>, Value}) ->
+     {true, {subject_author, Value}};
++kv_to_opt({<<"hats">>, Value}) ->
++    {true, {hats, Value}};
++kv_to_opt({<<"hat_assignments">>, Value}) ->
++    {true, {hat_assignments, Value}};
+ kv_to_opt({_Key, _Value}) ->
+     false.
+diff --git a/src/muc/mod_muc_room.erl b/src/muc/mod_muc_room.erl
+index c331ba8..4227106 100644
+--- a/src/muc/mod_muc_room.erl
++++ b/src/muc/mod_muc_room.erl
+@@ -46,6 +46,13 @@
+          can_access_room/2,
+          can_access_identity/2]).
+ 
++%% Hats (XEP-0317)
++-export([set_hat/4,
++         remove_hat/2,
++         assign_hat/3,
++         unassign_hat/3,
++         get_hats/1]).
++
+ %% gen_fsm callbacks
+ -export([init/1,
+          normal_state/2,
+@@ -111,7 +118,11 @@
+ %%%----------------------------------------------------------------------
+ %%% Types
+ %%%----------------------------------------------------------------------
+--export_type([config/0, user/0, activity/0]).
++-export_type([config/0, user/0, activity/0, hat/0, hat_uri/0]).
++
++-type hat_uri() :: binary().
++-type hat() :: #{uri := hat_uri(), title := binary(), hue => binary()}.
++-type hats_info() :: #{hats := [hat()], assignments := [{jid:jid(), [hat_uri()]}]}.
+ 
+ -type statename() :: 'locked_state' | 'normal_state'.
+ -type fsm_return() :: {'next_state', statename(), state()}
+@@ -285,6 +296,45 @@ can_access_room(RoomJID, UserJID) ->
+             Error
+     end.
+ 
++%% @doc Defines a hat in the room, or updates its title and hue.
++%% The occupants wearing an updated hat get their presence broadcast again.
++-spec set_hat(jid:jid(), hat_uri(), binary(), binary() | undefined) ->
++    ok | {error, not_found | hats_disabled}.
++set_hat(RoomJID, Uri, Title, Hue) ->
++    Hat = maps:merge(#{uri => Uri, title => Title}, maps:filter(fun(_, V) -> V =/= undefined end,
++                                                                 #{hue => Hue})),
++    sync_hats_event(RoomJID, {set_hat, Hat}).
++
++%% @doc Removes a hat from the room, and from everyone wearing it.
++-spec remove_hat(jid:jid(), hat_uri()) -> ok | {error, not_found | hat_not_found | hats_disabled}.
++remove_hat(RoomJID, Uri) ->
++    sync_hats_event(RoomJID, {remove_hat, Uri}).
++
++%% @doc Gives a hat defined in the room to the user (bare JID).
++-spec assign_hat(jid:jid(), jid:jid(), hat_uri()) ->
++    ok | {error, not_found | hat_not_found | hats_disabled}.
++assign_hat(RoomJID, UserJID, Uri) ->
++    sync_hats_event(RoomJID, {assign_hat, jid:to_lower(jid:to_bare(UserJID)), Uri}).
++
++%% @doc Takes a hat off the user (bare JID).
++-spec unassign_hat(jid:jid(), jid:jid(), hat_uri()) ->
++    ok | {error, not_found | hat_not_found | hats_disabled}.
++unassign_hat(RoomJID, UserJID, Uri) ->
++    sync_hats_event(RoomJID, {unassign_hat, jid:to_lower(jid:to_bare(UserJID)), Uri}).
++
++%% @doc Returns the hats defined in the room, and who wears them.
++-spec get_hats(jid:jid()) -> {ok, hats_info()} | {error, not_found | hats_disabled}.
++get_hats(RoomJID) ->
++    sync_hats_event(RoomJID, get_hats).
++
++sync_hats_event(RoomJID, Event) ->
++    case mod_muc:room_jid_to_pid(RoomJID) of
++        {ok, Pid} ->
++            gen_fsm_compat:sync_send_all_state_event(Pid, {hats, Event});
++        {error, Reason} ->
++            {error, Reason}
++    end.
++
+ %% @doc Return true if UserJID can read real user JIDs
+ -spec can_access_identity(RoomJID :: jid:jid(), UserJID :: jid:jid()) ->
+     {ok, boolean()} | {error, not_found}.
+@@ -664,6 +714,12 @@ handle_sync_event({can_access_identity, UserJID}, _From, StateName, StateData) -
+ handle_sync_event({change_config, Config}, _From, StateName, StateData) ->
+     {result, [], NSD} = change_config(Config, StateData),
+     reply_with_timeout({ok, NSD#state.config}, StateName, NSD);
++handle_sync_event({hats, Event}, _From, StateName, StateData) ->
++    {Reply, NewStateData} = case is_hats_enabled(StateData) of
++                                true -> handle_hats_event(Event, StateData);
++                                false -> {{error, hats_disabled}, StateData}
++                            end,
++    reply_with_timeout(Reply, StateName, NewStateData);
+ handle_sync_event({change_state, NewStateData}, _From, StateName, _StateData) ->
+     reply_with_timeout({ok, NewStateData}, StateName, NewStateData);
+ handle_sync_event(_Event, _From, StateName, StateData) ->
+@@ -2299,7 +2355,7 @@ send_new_presence_to_single(NJID, #user{jid = RealJID, nick = Nick, last_presenc
+                       Status
+               end,
+     Packet = jlib:append_subtags(
+-               Presence,
++               set_hats(RealJID, Presence, StateData),
+                [#xmlel{name = <<"x">>, attrs = #{<<"xmlns">> => ?NS_MUC_USER},
+                        children = [#xmlel{name = <<"item">>, attrs = ItemAttrs,
+                                           children = ItemEls} | Status2]}]),
+@@ -2343,7 +2399,7 @@ send_existing_presence({_LJID, #user{jid = FromJID, nick = FromNick,
+               <<"role">> => role_to_binary(FromRole)}
+     end,
+     Packet = jlib:append_subtags(
+-               Presence,
++               set_hats(FromJID, Presence, StateData),
+                [#xmlel{name = <<"x">>,
+                        attrs = #{<<"xmlns">> => ?NS_MUC_USER},
+                        children = [#xmlel{name = <<"item">>,
+@@ -2507,6 +2563,139 @@ presence(<<"unavailable">> = Type, Children) ->
+            children = Children}.
+ 
+ 
++%%%----------------------------------------------------------------------
++%%% Hats (XEP-0317)
++
++-spec is_hats_enabled(state()) -> boolean().
++is_hats_enabled(StateData) ->
++    get_opt(StateData, hats).
++
++-spec hats_features(state()) -> [mongoose_disco:feature()].
++hats_features(StateData) ->
++    case is_hats_enabled(StateData) of
++        true -> [?NS_HATS];
++        false -> []
++    end.
++
++-spec handle_hats_event(term(), state()) -> {term(), state()}.
++handle_hats_event(get_hats, StateData = #state{hats = Hats, hat_assignments = Assignments}) ->
++    AssignmentList = [{jid:make_noprep(LJID), Uris} || {LJID, Uris} <- maps:to_list(Assignments)],
++    {{ok, #{hats => Hats, assignments => lists:sort(AssignmentList)}}, StateData};
++handle_hats_event({set_hat, Hat = #{uri := Uri}}, StateData = #state{hats = Hats}) ->
++    NewHats = case find_hat(Uri, Hats) of
++                  {ok, _} -> [case H of #{uri := Uri} -> Hat; _ -> H end || H <- Hats];
++                  error -> Hats ++ [Hat]
++              end,
++    hats_changed(wearers([Uri], StateData), StateData#state{hats = NewHats});
++handle_hats_event({remove_hat, Uri}, StateData = #state{hats = Hats, hat_assignments = Assignments}) ->
++    case find_hat(Uri, Hats) of
++        {ok, _} ->
++            Wearers = wearers([Uri], StateData),
++            NewAssignments = maps:filtermap(fun(_LJID, Uris) ->
++                                                    case lists:delete(Uri, Uris) of
++                                                        [] -> false;
++                                                        NewUris -> {true, NewUris}
++                                                    end
++                                            end, Assignments),
++            hats_changed(Wearers, StateData#state{hats = [H || H = #{uri := U} <- Hats, U =/= Uri],
++                                                  hat_assignments = NewAssignments});
++        error ->
++            {{error, hat_not_found}, StateData}
++    end;
++handle_hats_event({assign_hat, LJID, Uri}, StateData = #state{hats = Hats, hat_assignments = Assignments}) ->
++    case find_hat(Uri, Hats) of
++        {ok, _} ->
++            Uris = maps:get(LJID, Assignments, []),
++            NewUris = Uris ++ [Uri || not lists:member(Uri, Uris)],
++            hats_changed([LJID], StateData#state{hat_assignments = Assignments#{LJID => NewUris}});
++        error ->
++            {{error, hat_not_found}, StateData}
++    end;
++handle_hats_event({unassign_hat, LJID, Uri}, StateData = #state{hat_assignments = Assignments}) ->
++    Uris = maps:get(LJID, Assignments, []),
++    case lists:member(Uri, Uris) of
++        true ->
++            NewAssignments = case lists:delete(Uri, Uris) of
++                                 [] -> maps:remove(LJID, Assignments);
++                                 NewUris -> Assignments#{LJID => NewUris}
++                             end,
++            hats_changed([LJID], StateData#state{hat_assignments = NewAssignments});
++        false ->
++            {{error, hat_not_found}, StateData}
++    end.
++
++%% Stores the room, and broadcasts the presences of the occupants whose hats changed
++-spec hats_changed([jid:simple_bare_jid()], state()) -> {ok, state()}.
++hats_changed(LJIDs, StateData) ->
++    store_room_if_persistent(StateData),
++    maps_foreach(fun(_LJID, #user{jid = JID}) ->
++                         case lists:member(jid:to_bare(jid:to_lower(JID)), LJIDs) of
++                             true -> send_new_presence(JID, StateData);
++                             false -> ok
++                         end
++                 end, StateData#state.users),
++    {ok, StateData}.
++
++-spec wearers([hat_uri()], state()) -> [jid:simple_bare_jid()].
++wearers(Uris, #state{hat_assignments = Assignments}) ->
++    [LJID || {LJID, WornUris} <- maps:to_list(Assignments),
++             lists:any(fun(Uri) -> lists:member(Uri, WornUris) end, Uris)].
++
++-spec find_hat(hat_uri(), [hat()]) -> {ok, hat()} | error.
++find_hat(Uri, Hats) ->
++    case [Hat || Hat = #{uri := U} <- Hats, U =:= Uri] of
++        [Hat] -> {ok, Hat};
++        [] -> error
++    end.
++
++%% @doc Replaces any hats sent by the occupant with the hats the occupant wears in the room.
++%% Clients can't put on hats themselves.
++-spec set_hats(jid:jid(), exml:element(), state()) -> exml:element().
++set_hats(JID, Presence = #xmlel{children = Children}, StateData) ->
++    case is_hats_enabled(StateData) of
++        true ->
++            Children1 = [Child || Child <- Children, not is_hats_element(Child)],
++            Presence#xmlel{children = Children1 ++ hats_elements(JID, StateData)};
++        false ->
++            Presence
++    end.
++
++is_hats_element(#xmlel{name = <<"hats">>, attrs = #{<<"xmlns">> := ?NS_HATS}}) -> true;
++is_hats_element(_) -> false.
++
++-spec hats_elements(jid:jid(), state()) -> [exml:element()].
++hats_elements(JID, #state{hats = Hats, hat_assignments = Assignments}) ->
++    LJID = jid:to_bare(jid:to_lower(JID)),
++    case maps:get(LJID, Assignments, []) of
++        [] ->
++            [];
++        Uris ->
++            HatEls = [hat_element(Hat) || Uri <- Uris, {ok, Hat} <- [find_hat(Uri, Hats)]],
++            [#xmlel{name = <<"hats">>, attrs = #{<<"xmlns">> => ?NS_HATS}, children = HatEls}]
++    end.
++
++-spec hat_element(hat()) -> exml:element().
++hat_element(Hat = #{uri := Uri, title := Title}) ->
++    Attrs = #{<<"uri">> => Uri, <<"title">> => Title},
++    #xmlel{name = <<"hat">>, attrs = case Hat of
++                                         #{hue := Hue} -> Attrs#{<<"hue">> => Hue};
++                                         _ -> Attrs
++                                     end}.
++
++%% Hats are stored as lists, so that the options can be encoded as JSON by the RDBMS backend
++-spec hats_opts(state()) -> [{atom(), list()}].
++hats_opts(#state{hats = [], hat_assignments = Assignments}) when map_size(Assignments) =:= 0 ->
++    [];
++hats_opts(#state{hats = Hats, hat_assignments = Assignments}) ->
++    [{hats, [[Uri, Title, maps:get(hue, Hat, null)] || Hat = #{uri := Uri, title := Title} <- Hats]},
++     {hat_assignments, [[jid:to_binary(LJID) | Uris] || {LJID, Uris} <- maps:to_list(Assignments)]}].
++
++decode_hat([Uri, Title, null]) -> #{uri => Uri, title => Title};
++decode_hat([Uri, Title, Hue]) -> #{uri => Uri, title => Title, hue => Hue}.
++
++decode_hat_assignments(Val) ->
++    maps:from_list([{jid:to_lower(jid:from_binary(JID)), Uris} || [JID | Uris] <- Val]).
++
+ -spec lqueue_new(integer()) -> lqueue().
+ lqueue_new(Max) ->
+     #lqueue{queue = queue:new(),
+@@ -3606,6 +3795,10 @@ set_opts([{Opt, Val} | Opts], SD=#state{config = C = #config{}}) ->
+             SD#state{subject = Val};
+         subject_author ->
+             SD#state{subject_author = Val};
++        hats ->
++            SD#state{hats = [decode_hat(Hat) || Hat <- Val]};
++        hat_assignments ->
++            SD#state{hat_assignments = decode_hat_assignments(Val)};
+         subject_timestamp ->
+             SD#state{subject_timestamp = Val};
+         _ ->
+@@ -3643,7 +3836,7 @@ make_opts(StateData) ->
+      {affiliations, maps:to_list(StateData#state.affiliations)},
+      {subject, StateData#state.subject},
+      {subject_author, StateData#state.subject_author}
+-    ].
++    ] ++ hats_opts(StateData).
+ 
+ -spec destroy_room(exml:element(), state()) -> {result, [], stop}.
+ destroy_room(DestroyEl, StateData) ->
+@@ -3728,7 +3921,8 @@ process_iq_disco_info(From, get, Lang, StateData) ->
+     HostType = StateData#state.host_type,
+     IdentityXML = mongoose_disco:identities_to_xml([identity(get_title(StateData))]),
+     FeatureXML =  mongoose_disco:get_muc_features(HostType, From, RoomJID, <<>>, Lang,
+-                                                  room_features(Config)),
++                                                  room_features(Config)
++                                                  ++ hats_features(StateData)),
+     InfoXML = iq_disco_info_extras(StateData),
+     {result, IdentityXML ++ FeatureXML ++ InfoXML, StateData}.
+ 
+diff --git a/test/common/config_parser_helper.erl b/test/common/config_parser_helper.erl
+index 1b1acb9..fe985c5 100644
+--- a/test/common/config_parser_helper.erl
++++ b/test/common/config_parser_helper.erl
+@@ -926,6 +926,7 @@ default_mod_config(mod_muc) ->
+       max_user_conferences => 10,
+       http_auth_pool => none,
+       load_permanent_rooms_at_startup => false,
++      hats => false,
+       hibernate_timeout => timer:seconds(90),
+       hibernated_room_check_interval => infinity,
+       hibernated_room_timeout => infinity,
+diff --git a/test/config_parser_SUITE.erl b/test/config_parser_SUITE.erl
+index 9a1ccce..4d18fcd 100644
+--- a/test/config_parser_SUITE.erl
++++ b/test/config_parser_SUITE.erl
+@@ -2294,6 +2294,7 @@ mod_muc(_Config) ->
+           T(<<"http_auth_pool">>, <<"external_auth">>)),
+     ?cfgh(P ++ [load_permanent_rooms_at_startup], true,
+           T(<<"load_permanent_rooms_at_startup">>, true)),
++    ?cfgh(P ++ [hats], true, T(<<"hats">>, true)),
+     ?cfgh(P ++ [hibernate_timeout], infinity,
+           T(<<"hibernate_timeout">>, <<"infinity">>)),
+     ?cfgh(P ++ [hibernated_room_check_interval], 5000,
+@@ -2324,6 +2325,7 @@ mod_muc(_Config) ->
+     ?errh(T(<<"max_user_conferences">>, -1)),
+     ?errh(T(<<"http_auth_pool">>, <<>>)),
+     ?errh(T(<<"load_permanent_rooms_at_startup">>, <<"true">>)),
++    ?errh(T(<<"hats">>, <<"yes">>)),
+     ?errh(T(<<"hibernate_timeout">>, <<"really big">>)),
+     ?errh(T(<<"hibernated_room_check_interval">>, -1)),
+     ?errh(T(<<"hibernated_room_timeout">>, false)).
+-- 
+2.43.0
+

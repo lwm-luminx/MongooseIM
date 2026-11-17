@@ -1,0 +1,494 @@
+From ad7b93f3fbbc4cceebd27d3783b2a3852f1343f2 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 16 Nov 2026 20:39:45 +0000
+Subject: [PATCH] Implement XEP-0421 occupant identifiers in MUC rooms
+
+Add the `occupant_id` option to mod_muc. When it is enabled, rooms add an
+<occupant-id xmlns='urn:xmpp:occupant-id:0'/> element to the presences,
+group chat messages and private messages they reflect, replacing any such
+element sent by the client. The ID is an HMAC of the occupant's real bare
+JID with a random per-room salt, which is stored with persistent rooms, so
+it is stable across rejoins and nick changes and does not reveal the JID.
+Rooms and the MUC service advertise the feature.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01ETaRHXo1LmPHqZB9SXMucM
+---
+ big_tests/tests/muc_SUITE.erl        | 98 ++++++++++++++++++++++++++++
+ doc/modules/mod_muc.md               | 12 ++++
+ include/mod_muc_room.hrl             |  2 +
+ include/mongoose_ns.hrl              |  1 +
+ src/muc/mod_muc.erl                  | 16 ++++-
+ src/muc/mod_muc_rdbms.erl            |  2 +
+ src/muc/mod_muc_room.erl             | 92 ++++++++++++++++++++++----
+ test/common/config_parser_helper.erl |  1 +
+ test/config_parser_SUITE.erl         |  2 +
+ 9 files changed, 212 insertions(+), 14 deletions(-)
+
+diff --git a/big_tests/tests/muc_SUITE.erl b/big_tests/tests/muc_SUITE.erl
+index dc4dab6..ccb5826 100644
+--- a/big_tests/tests/muc_SUITE.erl
++++ b/big_tests/tests/muc_SUITE.erl
+@@ -114,6 +114,7 @@ all() -> [
+           {group, room_management},
+           {group, http_auth_no_server},
+           {group, http_auth},
++          {group, occupant_id},
+           {group, hibernation},
+           {group, room_registration_race_condition},
+           {group, register},
+@@ -123,6 +124,10 @@ all() -> [
+ 
+ groups() ->
+     [
++         {occupant_id, [parallel], [occupant_id_is_advertised,
++                                    occupant_id_in_presences_and_messages,
++                                    occupant_id_is_stable_and_unique,
++                                    occupant_id_from_client_is_replaced]},
+          {hibernation, [parallel], [room_is_hibernated,
+                                     room_with_participants_is_hibernated,
+                                     hibernation_metrics_are_updated,
+@@ -430,6 +435,10 @@ init_per_group(G, Config) when G =:= http_auth_no_server;
+     muc_helper:load_muc(host_type(), #{http_auth_pool => muc_http_auth_test,
+                                        default_room => #{password_protected => true}}),
+     ConfigWithModules;
++init_per_group(occupant_id, Config) ->
++    ConfigWithModules = dynamic_modules:save_modules(host_type(), Config),
++    muc_helper:load_muc(host_type(), #{occupant_id => true}),
++    ConfigWithModules;
+ init_per_group(hibernation, Config) ->
+     Config1 = dynamic_modules:save_modules(host_type(), Config),
+     setup_mam(mam_helper:backend()),
+@@ -486,6 +495,8 @@ end_per_group(G, Config) when G =:= http_auth_no_server;
+     end,
+     ejabberd_node_utils:call_fun(mongoose_wpool, stop, [http, global, muc_http_auth_test]),
+     dynamic_modules:restore_modules(Config);
++end_per_group(occupant_id, Config) ->
++    dynamic_modules:restore_modules(Config);
+ end_per_group(hibernation, Config) ->
+     dynamic_modules:restore_modules(Config);
+ end_per_group(hibernation_failures, Config) ->
+@@ -715,6 +726,93 @@ moderator_subject_unauthorized(ConfigIn) ->
+           [room_address(?config(room, Config), <<"bob">>)], Error)
+     end).
+ 
++%% XEP-0421: Occupant identifiers
++
++-define(NS_OCCUPANT_ID, <<"urn:xmpp:occupant-id:0">>).
++
++occupant_id_is_advertised(ConfigIn) ->
++    story_with_room(ConfigIn, [], [{alice, 1}], fun(Config, Alice) ->
++        RoomInfo = escalus:send_iq_and_wait_for_result(
++                     Alice, stanza_to_room(escalus_stanza:iq_get(?NS_DISCO_INFO, []),
++                                           ?config(room, Config))),
++        escalus:assert(has_feature, [?NS_OCCUPANT_ID], RoomInfo),
++        ServiceInfo = escalus:send_iq_and_wait_for_result(
++                        Alice, escalus_stanza:to(escalus_stanza:iq_get(?NS_DISCO_INFO, []),
++                                                 muc_host())),
++        escalus:assert(has_feature, [?NS_OCCUPANT_ID], ServiceInfo)
++    end).
++
++occupant_id_in_presences_and_messages(ConfigIn) ->
++    story_with_room(ConfigIn, [], [{alice, 1}, {bob, 1}], fun(Config, Alice, Bob) ->
++        Room = ?config(room, Config),
++        escalus:send(Alice, stanza_muc_enter_room(Room, <<"alice">>)),
++        [AliceSelfPresence, _Subject] = escalus:wait_for_stanzas(Alice, 2),
++        AliceId = occupant_id(AliceSelfPresence),
++        escalus:send(Bob, stanza_muc_enter_room(Room, <<"bob">>)),
++        %% Bob gets Alice's presence, his own presence and the subject
++        [AlicePresence, BobSelfPresence, _] = escalus:wait_for_stanzas(Bob, 3),
++        ?assertEqual(AliceId, occupant_id(AlicePresence)),
++        BobId = occupant_id(BobSelfPresence),
++        ?assertEqual(BobId, occupant_id(escalus:wait_for_stanza(Alice))),
++
++        %% Messages and private messages carry the sender's occupant ID
++        escalus:send(Bob, escalus_stanza:groupchat_to(room_address(Room), <<"Hi!">>)),
++        ?assertEqual(BobId, occupant_id(escalus:wait_for_stanza(Alice))),
++        ?assertEqual(BobId, occupant_id(escalus:wait_for_stanza(Bob))),
++        escalus:send(Bob, escalus_stanza:chat_to(room_address(Room, <<"alice">>), <<"Psst">>)),
++        ?assertEqual(BobId, occupant_id(escalus:wait_for_stanza(Alice))),
++
++        %% Presence updates and leaving carry it as well
++        escalus:send(Bob, stanza_to_room(escalus_stanza:presence_show(<<"away">>), Room, <<"bob">>)),
++        ?assertEqual(BobId, occupant_id(escalus:wait_for_stanza(Alice))),
++        escalus:send(Bob, stanza_to_room(escalus_stanza:presence(<<"unavailable">>), Room, <<"bob">>)),
++        ?assertEqual(BobId, occupant_id(escalus:wait_for_stanza(Alice)))
++    end).
++
++occupant_id_is_stable_and_unique(ConfigIn) ->
++    story_with_room(ConfigIn, [], [{alice, 1}, {bob, 1}], fun(Config, Alice, Bob) ->
++        Room = ?config(room, Config),
++        escalus:send(Alice, stanza_muc_enter_room(Room, <<"alice">>)),
++        AliceId = occupant_id(hd(escalus:wait_for_stanzas(Alice, 2))),
++        escalus:send(Bob, stanza_muc_enter_room(Room, <<"bob">>)),
++        BobId = occupant_id(escalus:wait_for_stanza(Alice)),
++        escalus:wait_for_stanzas(Bob, 3),
++        ?assertNotEqual(AliceId, BobId),
++
++        %% Bob leaves and comes back with another nick: the ID stays the same
++        escalus:send(Bob, stanza_to_room(escalus_stanza:presence(<<"unavailable">>), Room, <<"bob">>)),
++        escalus:wait_for_stanza(Alice),
++        escalus:wait_for_stanza(Bob),
++        escalus:send(Bob, stanza_muc_enter_room(Room, <<"robert">>)),
++        ?assertEqual(BobId, occupant_id(escalus:wait_for_stanza(Alice)))
++    end).
++
++occupant_id_from_client_is_replaced(ConfigIn) ->
++    story_with_room(ConfigIn, [], [{alice, 1}, {bob, 1}], fun(Config, Alice, Bob) ->
++        Room = ?config(room, Config),
++        escalus:send(Alice, stanza_muc_enter_room(Room, <<"alice">>)),
++        AliceId = occupant_id(hd(escalus:wait_for_stanzas(Alice, 2))),
++        escalus:send(Bob, stanza_muc_enter_room(Room, <<"bob">>)),
++        BobId = occupant_id(escalus:wait_for_stanza(Alice)),
++        escalus:wait_for_stanzas(Bob, 3),
++
++        %% Bob tries to impersonate Alice
++        Forged = #xmlel{name = <<"occupant-id">>,
++                        attrs = #{<<"xmlns">> => ?NS_OCCUPANT_ID, <<"id">> => AliceId}},
++        Msg = #xmlel{children = Children} =
++            escalus_stanza:groupchat_to(room_address(Room), <<"I am Alice">>),
++        escalus:send(Bob, Msg#xmlel{children = Children ++ [Forged]}),
++        Received = escalus:wait_for_stanza(Alice),
++        ?assertEqual([BobId], [exml_query:attr(El, <<"id">>)
++                               || El <- exml_query:subelements_with_ns(Received, ?NS_OCCUPANT_ID)])
++    end).
++
++occupant_id(Stanza) ->
++    Id = exml_query:path(Stanza, [{element_with_ns, <<"occupant-id">>, ?NS_OCCUPANT_ID},
++                                  {attr, <<"id">>}]),
++    ?assert(is_binary(Id)),
++    Id.
++
+ %%  Examples 89-92
+ %%  Apparently user has to be in the room to kick someone, however XEP doesn't need that
+ moderator_kick(ConfigIn) ->
+diff --git a/doc/modules/mod_muc.md b/doc/modules/mod_muc.md
+index c5f95ff..7db9b31 100644
+--- a/doc/modules/mod_muc.md
++++ b/doc/modules/mod_muc.md
+@@ -165,6 +165,18 @@ this option specifies the HTTP pool name to use (see [External HTTP Authenticati
+ Load all rooms at startup. Because it can be unsafe when there are many rooms,
+ it is disabled by default.
+ 
++### `modules.mod_muc.occupant_id`
++ * **Syntax:** boolean
++ * **Default:** `false`
++ * **Example:** `occupant_id = true`
++
++Enables [XEP-0421: Occupant identifiers for semi-anonymous MUCs](https://xmpp.org/extensions/xep-0421.html) in all rooms.
++The room then adds an `<occupant-id xmlns='urn:xmpp:occupant-id:0'/>` element to every presence and message it sends on behalf of an occupant, replacing any such element sent by the client.
++The ID stays the same for a user (identified by the real bare JID) in a room, also when they change their nickname or join again, and differs between rooms.
++It is derived from the real JID with a random salt stored with the room, so other occupants can't learn the real JID from it.
++It lets clients tell whether two messages come from the same person, e.g. for message corrections and retractions.
++Both the rooms and the MUC service advertise the `urn:xmpp:occupant-id:0` feature.
++
+ ### `modules.mod_muc.hibernate_timeout` 
+  * **Syntax:** non-negative integer or the string `"infinity"`
+  * **Default:** `90000` (milliseconds, 90 seconds)
+diff --git a/include/mod_muc_room.hrl b/include/mod_muc_room.hrl
+index 4ad66cc..27cbd92 100644
+--- a/include/mod_muc_room.hrl
++++ b/include/mod_muc_room.hrl
+@@ -88,6 +88,8 @@
+                 room_queue = queue:new(),
+                 http_auth_pool = none :: none | mongoose_http_client:pool(),
+                 http_auth_pids = [] :: [pid()],
++                %% Secret salt of the room's occupant IDs (XEP-0421)
++                occupant_id_salt :: binary() | undefined,
+                 hibernate_timeout = 90000 :: timeout()
+                }).
+ 
+diff --git a/include/mongoose_ns.hrl b/include/mongoose_ns.hrl
+index 0d9f0a7..33eb4cc 100644
+--- a/include/mongoose_ns.hrl
++++ b/include/mongoose_ns.hrl
+@@ -113,6 +113,7 @@
+ -define(NS_CHAT_MARKERS,        <<"urn:xmpp:chat-markers:0">>).
+ 
+ -define(NS_FASTEN,              <<"urn:xmpp:fasten:0">>).
++-define(NS_OCCUPANT_ID,         <<"urn:xmpp:occupant-id:0">>).
+ -define(NS_RETRACT,             <<"urn:xmpp:message-retract:0">>).
+ -define(NS_RETRACT_TOMBSTONE,   <<"urn:xmpp:message-retract:0#tombstone">>).
+ 
+diff --git a/src/muc/mod_muc.erl b/src/muc/mod_muc.erl
+index af009c9..8dda8b7 100644
+--- a/src/muc/mod_muc.erl
++++ b/src/muc/mod_muc.erl
+@@ -249,6 +249,7 @@ config_spec() ->
+                  <<"http_auth_pool">> => #option{type = atom,
+                                                  validate = pool_name},
+                  <<"load_permanent_rooms_at_startup">> => #option{type = boolean},
++                 <<"occupant_id">> => #option{type = boolean},
+                  <<"hibernate_timeout">> => #option{type = int_or_infinity,
+                                                     validate = non_negative},
+                  <<"hibernated_room_check_interval">> => #option{type = int_or_infinity,
+@@ -282,6 +283,7 @@ defaults() ->
+       <<"max_user_conferences">> => 10,
+       <<"http_auth_pool">> => none,
+       <<"load_permanent_rooms_at_startup">> => false,
++      <<"occupant_id">> => false,
+       <<"hibernate_timeout">> => timer:seconds(90),
+       <<"hibernated_room_check_interval">> => infinity,
+       <<"hibernated_room_timeout">> => infinity,
+@@ -769,7 +771,7 @@ route_by_type(<<"iq">>, {From, To, Acc, Packet}, #muc_state{} = State) ->
+         #iq{type = get, xmlns = ?NS_DISCO_INFO = XMLNS, lang = Lang} = IQ ->
+             IdentityXML = mongoose_disco:identities_to_xml([identity()]),
+             FeatureXML =  mongoose_disco:get_muc_features(HostType, From, To, <<>>, Lang,
+-                                                          features()),
++                                                          features(HostType)),
+             InfoXML = mongoose_disco:get_info(HostType, ?MODULE, <<>>, Lang),
+             Res = IQ#iq{type = result,
+                         sub_el = [#xmlel{name = <<"query">>,
+@@ -929,8 +931,16 @@ identity() ->
+       type => <<"text">>,
+       name => <<"Chatrooms">>}.
+ 
+-features() ->
+-    [?NS_DISCO_INFO, ?NS_DISCO_ITEMS, ?NS_MUC, ?NS_MUC_UNIQUE, ?NS_REGISTER, ?NS_RSM, ?NS_VCARD, ?NS_CONFERENCE].
++features(HostType) ->
++    [?NS_DISCO_INFO, ?NS_DISCO_ITEMS, ?NS_MUC, ?NS_MUC_UNIQUE, ?NS_REGISTER, ?NS_RSM, ?NS_VCARD,
++     ?NS_CONFERENCE] ++ occupant_id_features(HostType).
++
++%% Occupant IDs (XEP-0421) are enabled for all rooms, so the service advertises them as well
++occupant_id_features(HostType) ->
++    case gen_mod:get_module_opt(HostType, ?MODULE, occupant_id) of
++        true -> [?NS_OCCUPANT_ID];
++        false -> []
++    end.
+ 
+ %% Disco for rooms
+ -spec iq_disco_items(muc_host(), jid:jid(), Rsm :: none | jlib:rsm_in()) -> any().
+diff --git a/src/muc/mod_muc_rdbms.erl b/src/muc/mod_muc_rdbms.erl
+index 828d20d..cded9c4 100644
+--- a/src/muc/mod_muc_rdbms.erl
++++ b/src/muc/mod_muc_rdbms.erl
+@@ -409,5 +409,7 @@ kv_to_opt({<<"subject">>, Value}) ->
+     {true, {subject, Value}};
+ kv_to_opt({<<"subject_author">>, Value}) ->
+     {true, {subject_author, Value}};
++kv_to_opt({<<"occupant_id_salt">>, Value}) ->
++    {true, {occupant_id_salt, Value}};
+ kv_to_opt({_Key, _Value}) ->
+     false.
+diff --git a/src/muc/mod_muc_room.erl b/src/muc/mod_muc_room.erl
+index c331ba8..06fb663 100644
+--- a/src/muc/mod_muc_room.erl
++++ b/src/muc/mod_muc_room.erl
+@@ -325,7 +325,8 @@ init_new(#{init_type := start_new, host_type := HostType, muc_host := Host,
+                    just_created = true,
+                    room_shaper = Shaper,
+                    http_auth_pool = HttpAuthPool,
+-                   hibernate_timeout = read_hibernate_timeout(HostType)},
++                   hibernate_timeout = read_hibernate_timeout(HostType),
++                   occupant_id_salt = new_occupant_id_salt()},
+     State1 = set_opts(DefRoomOpts, State),
+     State2 = set_affiliation(Creator, owner, State1),
+     ?LOG_INFO(ls(#{what => muc_room_started,
+@@ -368,7 +369,8 @@ init_restored(#{init_type := start_restored,
+                                  }),
+     mongoose_instrument:execute(mod_muc_process_recreations, #{host_type => HostType},
+                                 #{count => 1, jid => RoomJid}),
+-    {ok, normal_state, State, State#state.hibernate_timeout}.
++    State1 = maybe_add_occupant_id_salt(State),
++    {ok, normal_state, State1, State1#state.hibernate_timeout}.
+ 
+ %% @doc In the locked state StateData contains the same settings it previously
+ %% held for the normal_state. The fsm awaits either a confirmation or a
+@@ -902,7 +904,8 @@ can_send_broadcasts(Role, StateData) ->
+     or not (StateData#state.config)#config.moderated.
+ 
+ broadcast_room_packet(From, FromNick, Role, RMess, StateData) ->
+-    #routed_message{packet = Packet, stable_stanza_id = StableID} = RMess,
++    #routed_message{packet = Packet0, stable_stanza_id = StableID} = RMess,
++    Packet = set_occupant_id(From, Packet0, StateData),
+     TS = erlang:system_time(microsecond),
+     Affiliation = get_affiliation(From, StateData),
+     EventData = #{from_nick => FromNick, from_jid => From,
+@@ -1733,7 +1736,7 @@ strip_status(#xmlel{name = <<"presence">>, attrs = Attrs,
+ -spec add_user_presence(jid:jid(), exml:element(), state()) -> state().
+ add_user_presence(JID, Presence, StateData) ->
+     LJID = jid:to_lower(JID),
+-    FPresence = filter_presence(Presence),
++    FPresence = set_occupant_id(JID, filter_presence(Presence), StateData),
+     Users =
+     maps:update_with(
+       LJID,
+@@ -1747,7 +1750,7 @@ add_user_presence(JID, Presence, StateData) ->
+                         state()) -> state().
+ add_user_presence_un(JID, Presence, StateData) ->
+     LJID = jid:to_lower(JID),
+-    FPresence = filter_presence(Presence),
++    FPresence = set_occupant_id(JID, filter_presence(Presence), StateData),
+     Users =
+     maps:update_with(
+       LJID,
+@@ -2425,8 +2428,10 @@ send_nick_change(Presence, OldNick, JID, RealJID, Affiliation, Role,
+                                 true -> status_code(110);
+                                 false -> undefined
+                             end,
+-    Unavailable = nick_unavailable_presence(MaybePublicJID, Nick, Affiliation,
+-                                            Role, MaybeSelfPresenceCode),
++    Unavailable = set_occupant_id(RealJID,
++                                  nick_unavailable_presence(MaybePublicJID, Nick, Affiliation,
++                                                            Role, MaybeSelfPresenceCode),
++                                  S),
+     mongoose_router:route(
+         mongoose_acc:new(jid:replace_resource(S#state.jid, OldNick),
+                          Info#user.jid,
+@@ -2507,6 +2512,66 @@ presence(<<"unavailable">> = Type, Children) ->
+            children = Children}.
+ 
+ 
++%%%----------------------------------------------------------------------
++%%% Occupant identifiers (XEP-0421)
++
++-spec occupant_id_features(state()) -> [mongoose_disco:feature()].
++occupant_id_features(StateData) ->
++    case is_occupant_id_enabled(StateData) of
++        true -> [?NS_OCCUPANT_ID];
++        false -> []
++    end.
++
++-spec is_occupant_id_enabled(state()) -> boolean().
++is_occupant_id_enabled(StateData) ->
++    get_opt(StateData, occupant_id).
++
++%% @doc Replaces any occupant-id elements of a stanza reflected by the room with
++%% the occupant ID of its sender, if occupant IDs are enabled.
++-spec set_occupant_id(jid:jid() | jid:simple_jid(), exml:element(), state()) -> exml:element().
++set_occupant_id(JID, Packet = #xmlel{children = Children}, StateData) ->
++    case is_occupant_id_enabled(StateData) of
++        true ->
++            OccupantId = #xmlel{name = <<"occupant-id">>,
++                                attrs = #{<<"xmlns">> => ?NS_OCCUPANT_ID,
++                                          <<"id">> => occupant_id(JID, StateData)}},
++            Packet#xmlel{children = [Child || Child <- Children,
++                                              not is_occupant_id_element(Child)]
++                                    ++ [OccupantId]};
++        false ->
++            Packet
++    end.
++
++is_occupant_id_element(#xmlel{name = <<"occupant-id">>, attrs = #{<<"xmlns">> := ?NS_OCCUPANT_ID}}) ->
++    true;
++is_occupant_id_element(_) ->
++    false.
++
++%% The ID is stable for a user (real bare JID) in a room, and can't be computed
++%% without the room's secret salt, so it doesn't reveal the JID.
++-spec occupant_id(jid:jid() | jid:simple_jid(), state()) -> binary().
++occupant_id(JID, #state{occupant_id_salt = Salt}) ->
++    BareJID = jid:to_bare_binary(jid:to_lower(JID)),
++    Mac = crypto:mac(hmac, sha256, Salt, BareJID),
++    base64:encode(Mac, #{mode => urlsafe, padding => false}).
++
++-spec new_occupant_id_salt() -> binary().
++new_occupant_id_salt() ->
++    base64:encode(crypto:strong_rand_bytes(24)).
++
++%% Persistent rooms stored before occupant IDs were introduced have no salt.
++%% It is stored right away when occupant IDs are enabled, so that the IDs are stable.
++-spec maybe_add_occupant_id_salt(state()) -> state().
++maybe_add_occupant_id_salt(StateData = #state{occupant_id_salt = undefined}) ->
++    NewStateData = StateData#state{occupant_id_salt = new_occupant_id_salt()},
++    case is_occupant_id_enabled(NewStateData) of
++        true -> store_room_if_persistent(NewStateData);
++        false -> ok
++    end,
++    NewStateData;
++maybe_add_occupant_id_salt(StateData) ->
++    StateData.
++
+ -spec lqueue_new(integer()) -> lqueue().
+ lqueue_new(Max) ->
+     #lqueue{queue = queue:new(),
+@@ -3122,7 +3187,7 @@ send_kickban_presence1(UJID, Reason, Code, Affiliation, StateData) ->
+                 _ ->
+                 [#xmlel{name = <<"reason">>, children = [#xmlcdata{content = Reason}]}]
+                     end,
+-          Packet = #xmlel{name = <<"presence">>,
++          Packet0 = #xmlel{name = <<"presence">>,
+                           attrs = #{<<"type">> => <<"unavailable">>},
+                           children = [#xmlel{name = <<"x">>,
+                                              attrs = #{<<"xmlns">> => ?NS_MUC_USER},
+@@ -3131,6 +3196,7 @@ send_kickban_presence1(UJID, Reason, Code, Affiliation, StateData) ->
+                                                                 children = ItemEls},
+                                                          #xmlel{name = <<"status">>,
+                                                                 attrs = #{<<"code">> => Code}}]}]},
++          Packet = set_occupant_id(RealJID, Packet0, StateData),
+         mongoose_router:route(
+             mongoose_acc:new(
+                 jid:replace_resource(StateData#state.jid, Nick),
+@@ -3608,6 +3674,8 @@ set_opts([{Opt, Val} | Opts], SD=#state{config = C = #config{}}) ->
+             SD#state{subject_author = Val};
+         subject_timestamp ->
+             SD#state{subject_timestamp = Val};
++        occupant_id_salt ->
++            SD#state{occupant_id_salt = Val};
+         _ ->
+             SD
+        end,
+@@ -3643,7 +3711,8 @@ make_opts(StateData) ->
+      {affiliations, maps:to_list(StateData#state.affiliations)},
+      {subject, StateData#state.subject},
+      {subject_author, StateData#state.subject_author}
+-    ].
++    ] ++ [{occupant_id_salt, Salt} || Salt <- [StateData#state.occupant_id_salt],
++                                      Salt =/= undefined].
+ 
+ -spec destroy_room(exml:element(), state()) -> {result, [], stop}.
+ destroy_room(DestroyEl, StateData) ->
+@@ -3728,7 +3797,8 @@ process_iq_disco_info(From, get, Lang, StateData) ->
+     HostType = StateData#state.host_type,
+     IdentityXML = mongoose_disco:identities_to_xml([identity(get_title(StateData))]),
+     FeatureXML =  mongoose_disco:get_muc_features(HostType, From, RoomJID, <<>>, Lang,
+-                                                  room_features(Config)),
++                                                  room_features(Config)
++                                                  ++ occupant_id_features(StateData)),
+     InfoXML = iq_disco_info_extras(StateData),
+     {result, IdentityXML ++ FeatureXML ++ InfoXML, StateData}.
+ 
+@@ -4406,7 +4476,7 @@ route_nick_message(#routed_nick_message{decide = continue_delivery, allow_pm = t
+     StateData;
+ route_nick_message(#routed_nick_message{decide = continue_delivery, allow_pm = true,
+     online = true, packet = Packet, from = From, jid = ToJID}, StateData) ->
+-    Packet1 = maybe_add_x_element(Packet),
++    Packet1 = set_occupant_id(From, maybe_add_x_element(Packet), StateData),
+     {ok, #user{nick = FromNick}} = maps:find(jid:to_lower(From),
+         StateData#state.users),
+     mongoose_router:route(
+diff --git a/test/common/config_parser_helper.erl b/test/common/config_parser_helper.erl
+index 1b1acb9..4ff369b 100644
+--- a/test/common/config_parser_helper.erl
++++ b/test/common/config_parser_helper.erl
+@@ -926,6 +926,7 @@ default_mod_config(mod_muc) ->
+       max_user_conferences => 10,
+       http_auth_pool => none,
+       load_permanent_rooms_at_startup => false,
++      occupant_id => false,
+       hibernate_timeout => timer:seconds(90),
+       hibernated_room_check_interval => infinity,
+       hibernated_room_timeout => infinity,
+diff --git a/test/config_parser_SUITE.erl b/test/config_parser_SUITE.erl
+index 9a1ccce..37b1a7c 100644
+--- a/test/config_parser_SUITE.erl
++++ b/test/config_parser_SUITE.erl
+@@ -2294,6 +2294,7 @@ mod_muc(_Config) ->
+           T(<<"http_auth_pool">>, <<"external_auth">>)),
+     ?cfgh(P ++ [load_permanent_rooms_at_startup], true,
+           T(<<"load_permanent_rooms_at_startup">>, true)),
++    ?cfgh(P ++ [occupant_id], true, T(<<"occupant_id">>, true)),
+     ?cfgh(P ++ [hibernate_timeout], infinity,
+           T(<<"hibernate_timeout">>, <<"infinity">>)),
+     ?cfgh(P ++ [hibernated_room_check_interval], 5000,
+@@ -2323,6 +2324,7 @@ mod_muc(_Config) ->
+     ?errh(T(<<"user_presence_shaper">>, <<>>)),
+     ?errh(T(<<"max_user_conferences">>, -1)),
+     ?errh(T(<<"http_auth_pool">>, <<>>)),
++    ?errh(T(<<"occupant_id">>, <<"yes">>)),
+     ?errh(T(<<"load_permanent_rooms_at_startup">>, <<"true">>)),
+     ?errh(T(<<"hibernate_timeout">>, <<"really big">>)),
+     ?errh(T(<<"hibernated_room_check_interval">>, -1)),
+-- 
+2.43.0
+

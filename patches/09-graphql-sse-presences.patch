@@ -1,0 +1,226 @@
+From 2358fbedc9885dd117a4b2e398257c4c2e875240 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 16 Nov 2026 21:02:07 +0000
+Subject: [PATCH] Stream presences in GraphQL message subscriptions on request
+
+stanza.subscribeForMessages skips every stanza except messages, so a
+client using the subscription as its session can't follow room
+occupants or contacts coming and going.
+
+Add an optional 'presences' argument (false by default) to the user and
+admin subscriptions. When true, presences sent to the session are
+streamed as well, in the same StanzaMap format.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01ETaRHXo1LmPHqZB9SXMucM
+---
+ big_tests/tests/graphql_stanza_SUITE.erl      | 40 +++++++++++++++++++
+ doc/graphql-api/User-GraphQL.md               |  1 +
+ priv/graphql/schemas/admin/stanza.gql         |  3 +-
+ priv/graphql/schemas/user/stanza.gql          |  3 +-
+ ...oose_graphql_stanza_admin_subscription.erl |  5 ++-
+ .../mongoose_graphql_stanza_helper.erl        | 28 +++++++++----
+ ...goose_graphql_stanza_user_subscription.erl |  5 ++-
+ 7 files changed, 72 insertions(+), 13 deletions(-)
+
+diff --git a/big_tests/tests/graphql_stanza_SUITE.erl b/big_tests/tests/graphql_stanza_SUITE.erl
+index 380f984..922c614 100644
+--- a/big_tests/tests/graphql_stanza_SUITE.erl
++++ b/big_tests/tests/graphql_stanza_SUITE.erl
+@@ -55,6 +55,7 @@ admin_sse_cases() ->
+     [admin_subscribe_for_messages,
+      admin_subscribe_for_messages_with_resource,
+      admin_subscribe_for_messages_with_resource_in_use,
++     admin_subscribe_for_messages_with_presences,
+      admin_subscribe_for_messages_to_unknown_user].
+ 
+ admin_mam_cases() ->
+@@ -85,6 +86,7 @@ user_stanza_cases() ->
+      user_subscribe_for_messages,
+      user_subscribe_for_messages_with_resource,
+      user_subscribe_for_messages_with_resource_in_use,
++     user_subscribe_for_messages_with_presences,
+      user_send_message_without_from,
+      user_send_message_with_spoofed_from,
+      user_send_message_headline,
+@@ -215,6 +217,16 @@ admin_subscribe_for_messages_with_resource_in_use_story(Config, Bob) ->
+     escalus_client:send(Bob, escalus_stanza:chat_to(escalus_client:full_jid(Bob), <<"Hi!">>)),
+     escalus:assert(is_chat_message, [<<"Hi!">>], escalus:wait_for_stanza(Bob)).
+ 
++admin_subscribe_for_messages_with_presences(Config) ->
++    escalus:fresh_story_with_config(Config, [{alice, 1}, {bob, 1}],
++                                    fun admin_subscribe_for_messages_with_presences_story/3).
++
++admin_subscribe_for_messages_with_presences_story(Config, Alice, Bob) ->
++    To = escalus_client:short_jid(Bob),
++    Vars = #{caller => To, resource => <<"sse-res">>, presences => true},
++    {200, Stream} = execute_command_sse(<<"stanza">>, <<"subscribeForMessages">>, Vars, Config),
++    assert_presence_and_message_are_streamed(Alice, To, <<"sse-res">>, Stream).
++
+ user_send_message(Config) ->
+     escalus:fresh_story_with_config(Config, [{alice, 1}, {bob, 1}],
+                                     fun user_send_message_story/3).
+@@ -263,6 +275,34 @@ user_subscribe_for_messages_with_resource_in_use_story(Config, Bob) ->
+     escalus_client:send(Bob, escalus_stanza:chat_to(escalus_client:full_jid(Bob), <<"Hi!">>)),
+     escalus:assert(is_chat_message, [<<"Hi!">>], escalus:wait_for_stanza(Bob)).
+ 
++user_subscribe_for_messages_with_presences(Config) ->
++    escalus:fresh_story_with_config(Config, [{alice, 1}, {bob, 1}],
++                                    fun user_subscribe_for_messages_with_presences_story/3).
++
++user_subscribe_for_messages_with_presences_story(Config, Alice, Bob) ->
++    To = escalus_client:short_jid(Bob),
++    Vars = #{resource => <<"sse-res">>, presences => true},
++    {200, Stream} = execute_user_command_sse(<<"stanza">>, <<"subscribeForMessages">>,
++                                             Bob, Vars, Config),
++    assert_presence_and_message_are_streamed(Alice, To, <<"sse-res">>, Stream).
++
++%% Both a directed presence and a message are delivered to the stream, in order
++assert_presence_and_message_are_streamed(Sender, BareJID, Resource, Stream) ->
++    From = escalus_client:full_jid(Sender),
++    To = <<BareJID/binary, "/", Resource/binary>>,
++    escalus:send(Sender, escalus_stanza:presence_direct(To, <<"available">>)),
++    escalus:send(Sender, escalus_stanza:chat(From, To, <<"Hi!">>)),
++    [Event1, Event2] = sse_helper:wait_for_events(Stream, 2, 5000),
++    [Presence, Message] = [begin
++                               #{<<"stanza">> := StanzaBin, <<"sender">> := From} =
++                                   graphql_helper:get_value([data, stanza, subscribeForMessages], E),
++                               {ok, Stanza} = exml:parse(StanzaBin),
++                               Stanza
++                           end || E <- [Event1, Event2]],
++    escalus:assert(is_presence, Presence),
++    escalus:assert(is_message, Message),
++    sse_helper:stop_sse(Stream).
++
+ %% A message sent to the full JID with the chosen resource is delivered to the stream
+ assert_message_to_resource_is_streamed(Sender, BareJID, Resource, Stream) ->
+     From = escalus_client:full_jid(Sender),
+diff --git a/doc/graphql-api/User-GraphQL.md b/doc/graphql-api/User-GraphQL.md
+index 076319c..80ed13a 100644
+--- a/doc/graphql-api/User-GraphQL.md
++++ b/doc/graphql-api/User-GraphQL.md
+@@ -10,6 +10,7 @@ The `stanza.subscribeForMessages` subscription opens an XMPP session for the use
+ By default, the session has a random resource. Pass the `resource` argument to choose it, so that the session can be addressed with a known full JID.
+ For example, after subscribing with `resource: "web"`, you can join a room with `muc.enterRoom(room: ..., nick: ..., resource: "web")`,
+ and the room's messages are delivered to the subscription. Leave the room with `muc.exitRoom` before closing the subscription, because closing it doesn't send an unavailable presence. If the resource is already in use by another session, the subscription returns the `resource_conflict` error.
++Only messages are streamed by default. Pass `presences: true` to also receive the presences sent to the session, e.g. the presences of the room occupants after `muc.enterRoom`.
+ 
+ ## Authentication
+ 
+diff --git a/priv/graphql/schemas/admin/stanza.gql b/priv/graphql/schemas/admin/stanza.gql
+index 371c70d..abcb59b 100644
+--- a/priv/graphql/schemas/admin/stanza.gql
++++ b/priv/graphql/schemas/admin/stanza.gql
+@@ -25,8 +25,9 @@ type StanzaAdminSubscription @protected{
+   Subscribe for the given user's incoming messages.
+   The subscription opens a session with the given resource, or with a random one if it is not provided.
+   A resource that is already in use is not taken over.
++  Presences sent to the session are included when 'presences' is true.
+   """
+-  subscribeForMessages(caller: JID!, resource: ResourceName): StanzaMap
++  subscribeForMessages(caller: JID!, resource: ResourceName, presences: Boolean = false): StanzaMap
+     @protected(type: DOMAIN, args: ["caller"])
+   "Subscribe for XMPP traffic"
+   subscribeForTraffic(limit: Int!): TraceMap
+diff --git a/priv/graphql/schemas/user/stanza.gql b/priv/graphql/schemas/user/stanza.gql
+index f260a6f..6df96d2 100644
+--- a/priv/graphql/schemas/user/stanza.gql
++++ b/priv/graphql/schemas/user/stanza.gql
+@@ -24,6 +24,7 @@ type StanzaUserSubscription @protected{
+   Subscribe to incoming messages.
+   The subscription opens a session with the given resource, or with a random one if it is not provided.
+   A resource that is already in use is not taken over.
++  Presences sent to the session are included when 'presences' is true.
+   """
+-  subscribeForMessages(resource: ResourceName): StanzaMap
++  subscribeForMessages(resource: ResourceName, presences: Boolean = false): StanzaMap
+ }
+diff --git a/src/graphql/admin/mongoose_graphql_stanza_admin_subscription.erl b/src/graphql/admin/mongoose_graphql_stanza_admin_subscription.erl
+index 1d97bad..9ce2a6f 100644
+--- a/src/graphql/admin/mongoose_graphql_stanza_admin_subscription.erl
++++ b/src/graphql/admin/mongoose_graphql_stanza_admin_subscription.erl
+@@ -17,8 +17,9 @@ execute(Ctx, _Obj, <<"subscribeForTraffic">>, Args) ->
+ subscribe_for_messages(#{event := terminate, stream := Session}, _) ->
+     mongoose_stanza_api:close_session(Session),
+     {ok, null, [{stream, closed}]};
+-subscribe_for_messages(#{event := Event}, _) ->
+-    mongoose_graphql_stanza_helper:handle_event(Event);
++subscribe_for_messages(#{event := Event}, Args) ->
++    Presences = maps:get(<<"presences">>, Args, false) =:= true,
++    mongoose_graphql_stanza_helper:handle_event(Event, #{presences => Presences});
+ subscribe_for_messages(_Ctx, #{<<"caller">> := Jid} = Args) ->
+     Resource = null_to_undefined(maps:get(<<"resource">>, Args, null)),
+     case mongoose_stanza_api:open_session(Jid, true, Resource) of
+diff --git a/src/graphql/mongoose_graphql_stanza_helper.erl b/src/graphql/mongoose_graphql_stanza_helper.erl
+index 613519e..b65cd93 100644
+--- a/src/graphql/mongoose_graphql_stanza_helper.erl
++++ b/src/graphql/mongoose_graphql_stanza_helper.erl
+@@ -2,7 +2,7 @@
+ 
+ -import(mongoose_graphql_helper, [null_to_undefined/1, make_error/2]).
+ 
+--export([get_last_messages/5, row_to_map/1, handle_event/1]).
++-export([get_last_messages/5, row_to_map/1, handle_event/1, handle_event/2]).
+ 
+ -include("mongoose.hrl").
+ -include("jlib.hrl").
+@@ -24,20 +24,34 @@ get_last_messages(Caller, Limit, With, Before, CheckUser) ->
+     end.
+ 
+ -spec handle_event(term()) -> {ok, map() | null}.
+-handle_event({route, Acc}) ->
++handle_event(Event) ->
++    handle_event(Event, #{presences => false}).
++
++%% @doc Converts an event for a subscription stream. Messages are always passed,
++%% and presences only when requested.
++-spec handle_event(term(), #{presences := boolean()}) -> {ok, map() | null}.
++handle_event({route, Acc}, #{presences := Presences}) ->
+     {From, _To, Packet} = mongoose_acc:packet(Acc),
+     case Packet of
+         Stanza = #xmlel{name = <<"message">>} ->
+-            StanzaID = exml_query:attr(Stanza, <<"id">>, <<>>),
+-            Timestamp = os:system_time(microsecond),
+-            stanza_result(From, Timestamp, StanzaID, Stanza);
++            route_result(From, Stanza);
++        Stanza = #xmlel{name = <<"presence">>} when Presences ->
++            route_result(From, Stanza);
+         _ ->
+             {ok, null} % Skip other stanza types
+     end;
+-handle_event({message, Dir, {UserPid, Jid}, Stanza}) ->
++handle_event(Event, _Opts) ->
++    handle_other_event(Event).
++
++route_result(From, Stanza) ->
++    StanzaID = exml_query:attr(Stanza, <<"id">>, <<>>),
++    Timestamp = os:system_time(microsecond),
++    stanza_result(From, Timestamp, StanzaID, Stanza).
++
++handle_other_event({message, Dir, {UserPid, Jid}, Stanza}) ->
+     Timestamp = os:system_time(microsecond),
+     trace_result(Timestamp, UserPid, Jid, Dir, Stanza);
+-handle_event(Msg) ->
++handle_other_event(Msg) ->
+     ?UNEXPECTED_INFO(Msg),
+     {ok, null}.
+ 
+diff --git a/src/graphql/user/mongoose_graphql_stanza_user_subscription.erl b/src/graphql/user/mongoose_graphql_stanza_user_subscription.erl
+index e38d2a0..de4de55 100644
+--- a/src/graphql/user/mongoose_graphql_stanza_user_subscription.erl
++++ b/src/graphql/user/mongoose_graphql_stanza_user_subscription.erl
+@@ -15,8 +15,9 @@ execute(Ctx, _Obj, <<"subscribeForMessages">>, Args) ->
+ subscribe_for_messages(#{event := terminate, stream := Session}, _) ->
+     mongoose_stanza_api:close_session(Session),
+     {ok, null, [{stream, closed}]};
+-subscribe_for_messages(#{event := Event}, _) ->
+-    mongoose_graphql_stanza_helper:handle_event(Event);
++subscribe_for_messages(#{event := Event}, Args) ->
++    Presences = maps:get(<<"presences">>, Args, false) =:= true,
++    mongoose_graphql_stanza_helper:handle_event(Event, #{presences => Presences});
+ subscribe_for_messages(#{user := Jid}, Args) ->
+     Resource = null_to_undefined(maps:get(<<"resource">>, Args, null)),
+     case mongoose_stanza_api:open_session(Jid, false, Resource) of
+-- 
+2.43.0
+

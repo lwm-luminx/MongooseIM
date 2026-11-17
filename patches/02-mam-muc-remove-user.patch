@@ -1,0 +1,536 @@
+From 865c4b95f05896b0c596b4f2cfeba1b066e01ddf Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 16 Nov 2026 20:24:24 +0000
+Subject: [PATCH] Delete room messages of removed users from MUC archives
+
+Add the `muc.delete_messages_of_removed_users` option to mod_mam. When it
+is enabled, the remove_user and anonymous_purge hooks delete the messages
+the removed user sent to MUC rooms, which otherwise stay in room archives.
+
+Add the `mam.deleteUserRoomMessages` admin GraphQL command to do the same
+on demand, optionally limited to messages archived before a date.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01ETaRHXo1LmPHqZB9SXMucM
+---
+ big_tests/tests/graphql_mam_SUITE.erl         | 88 +++++++++++++++++--
+ doc/modules/mod_mam.md                        | 10 +++
+ priv/graphql/schemas/admin/mam.gql            |  3 +
+ .../mongoose_graphql_mam_admin_mutation.erl   |  5 +-
+ src/mam/mod_mam.erl                           | 15 ++--
+ src/mam/mod_mam_api.erl                       | 18 ++++
+ src/mam/mod_mam_muc.erl                       | 33 ++++++-
+ src/mam/mod_mam_muc_rdbms_arch.erl            |  4 +-
+ src/mam/mod_mam_utils.erl                     | 29 ++++++
+ test/common/config_parser_helper.erl          |  3 +-
+ test/config_parser_SUITE.erl                  |  4 +
+ 11 files changed, 198 insertions(+), 14 deletions(-)
+
+diff --git a/big_tests/tests/graphql_mam_SUITE.erl b/big_tests/tests/graphql_mam_SUITE.erl
+index e18e76f..6ef794a 100644
+--- a/big_tests/tests/graphql_mam_SUITE.erl
++++ b/big_tests/tests/graphql_mam_SUITE.erl
+@@ -13,6 +13,7 @@
+ -define(ROOM_DELETE_PATH, [data, mam, deleteRoomMessages]).
+ -define(OLD_ROOM_DELETE_PATH, [data, mam, deleteOldRoomMessages]).
+ -define(USER_DELETE_PATH, [data, mam, deleteUserMessages]).
++-define(USER_ROOM_DELETE_PATH, [data, mam, deleteUserRoomMessages]).
+ -define(OLD_DELETE_PATH, [data, mam, deleteOldMessages]).
+ 
+ %% Messages are archived at these dates, and deleted before the cut-off date
+@@ -25,7 +26,8 @@ suite() ->
+ all() ->
+     [{group, admin_http},
+      {group, admin_cli},
+-     {group, domain_admin}].
++     {group, domain_admin},
++     {group, removed_users}].
+ 
+ groups() ->
+     [{admin_http, [], admin_groups()},
+@@ -34,7 +36,8 @@ groups() ->
+      {admin_mam, [], admin_mam_tests()},
+      {admin_mam_not_configured, [], mam_not_configured_tests()},
+      {domain_admin_mam, [], domain_admin_mam_tests()},
+-     {domain_admin_mam_not_configured, [], mam_not_configured_tests()}].
++     {domain_admin_mam_not_configured, [], mam_not_configured_tests()},
++     {removed_users, [], removed_users_tests()}].
+ 
+ admin_groups() ->
+     [{group, admin_mam},
+@@ -48,6 +51,8 @@ admin_mam_tests() ->
+     [delete_room_messages,
+      delete_room_messages_from_empty_archive,
+      delete_old_room_messages,
++     delete_user_room_messages,
++     delete_all_user_room_messages,
+      delete_user_messages,
+      delete_old_messages,
+      delete_room_messages_unknown_muc_server,
+@@ -59,13 +64,19 @@ domain_admin_mam_tests() ->
+     [delete_room_messages,
+      delete_room_messages_from_empty_archive,
+      delete_old_room_messages,
++     delete_user_room_messages,
++     delete_all_user_room_messages,
+      delete_user_messages,
+      delete_old_messages,
+      domain_admin_delete_room_messages_no_permission,
+      domain_admin_delete_old_room_messages_no_permission,
+      domain_admin_delete_user_messages_no_permission,
++     domain_admin_delete_user_room_messages_no_permission,
+      domain_admin_delete_old_messages_no_permission].
+ 
++removed_users_tests() ->
++    [removed_user_room_messages_are_deleted].
++
+ mam_not_configured_tests() ->
+     [delete_room_messages_mam_not_configured,
+      delete_user_messages_mam_not_configured].
+@@ -99,6 +110,15 @@ init_per_group(GroupName, Config) when GroupName =:= admin_mam;
+                   async_writer => #{enabled => false}}),
+     dynamic_modules:ensure_modules(host_type(), [{mod_mam, MAMOpts}]),
+     Config;
++init_per_group(removed_users, Config) ->
++    muc_helper:load_muc(),
++    MAMOpts = mam_helper:config_opts(
++                #{pm => #{},
++                  muc => #{host => subhost_pattern(muc_helper:muc_host_pattern()),
++                           delete_messages_of_removed_users => true},
++                  async_writer => #{enabled => false}}),
++    dynamic_modules:ensure_modules(host_type(), [{mod_mam, MAMOpts}]),
++    Config;
+ init_per_group(GroupName, Config) when GroupName =:= admin_mam_not_configured;
+                                        GroupName =:= domain_admin_mam_not_configured ->
+     muc_helper:load_muc(),
+@@ -149,6 +169,45 @@ delete_old_room_messages(Config) ->
+     ?assertEqual(1, room_archive_size(Room1)),
+     ?assertEqual(1, room_archive_size(Room2)).
+ 
++delete_user_room_messages(Config) ->
++    escalus:fresh_story_with_config(Config, [{alice, 1}, {bob, 1}],
++                                    fun delete_user_room_messages_story/3).
++
++delete_user_room_messages_story(Config, Alice, Bob) ->
++    Room1 = fresh_room_name(),
++    Room2 = fresh_room_name(),
++    [put_client_room_msgs(Room, Sender) || Room <- [Room1, Room2], Sender <- [Alice, Bob]],
++    Res = delete_user_room_messages(escalus_client:short_jid(Alice), ?BEFORE, Config),
++    ?assertEqual(4, get_ok_value(?USER_ROOM_DELETE_PATH, Res)),
++    %% Alice's latest message and all of Bob's messages are left in each room
++    ?assertEqual(4, room_archive_size(Room1)),
++    ?assertEqual(4, room_archive_size(Room2)).
++
++delete_all_user_room_messages(Config) ->
++    escalus:fresh_story_with_config(Config, [{alice, 1}, {bob, 1}],
++                                    fun delete_all_user_room_messages_story/3).
++
++delete_all_user_room_messages_story(Config, Alice, Bob) ->
++    Room = fresh_room_name(),
++    put_client_room_msgs(Room, Alice),
++    put_client_room_msgs(Room, Bob),
++    Res = delete_user_room_messages(escalus_client:short_jid(Alice), null, Config),
++    ?assertEqual(3, get_ok_value(?USER_ROOM_DELETE_PATH, Res)),
++    ?assertEqual(3, room_archive_size(Room)).
++
++removed_user_room_messages_are_deleted(Config) ->
++    escalus:fresh_story_with_config(Config, [{alice, 1}, {bob, 1}],
++                                    fun removed_user_room_messages_are_deleted_story/3).
++
++removed_user_room_messages_are_deleted_story(_Config, Alice, Bob) ->
++    Room = fresh_room_name(),
++    put_client_room_msgs(Room, Alice),
++    put_client_room_msgs(Room, Bob),
++    {ok, _} = rpc_apply(mongoose_account_api, unregister_user,
++                        [escalus_client:username(Alice), escalus_client:server(Alice)]),
++    %% Only Bob's messages are left
++    ?assertEqual(3, room_archive_size(Room)).
++
+ delete_user_messages(Config) ->
+     escalus:fresh_story_with_config(Config, [{alice, 1}, {bob, 1}], fun delete_user_messages_story/3).
+ 
+@@ -198,6 +257,10 @@ domain_admin_delete_user_messages_no_permission(Config) ->
+     get_unauthorized(delete_user_messages(<<"user@", (secondary_domain())/binary>>,
+                                           ?BEFORE, Config)).
+ 
++domain_admin_delete_user_room_messages_no_permission(Config) ->
++    get_unauthorized(delete_user_room_messages(<<"user@", (secondary_domain())/binary>>,
++                                               ?BEFORE, Config)).
++
+ domain_admin_delete_old_messages_no_permission(Config) ->
+     get_unauthorized(delete_old_messages(secondary_domain(), ?BEFORE, Config)).
+ 
+@@ -236,11 +299,22 @@ archive_size(Client) ->
+ 
+ %% Archive one room message on each of ?DATES
+ put_room_msgs(Room) ->
++    SenderJID = mongoose_helper:make_jid(<<"sender">>, domain(), <<"res">>),
++    put_room_msgs(Room, SenderJID, <<"nick">>).
++
++%% Archive one room message from the client on each of ?DATES
++put_client_room_msgs(Room, Client) ->
++    SenderJID = mongoose_helper:make_jid(escalus_client:username(Client),
++                                         escalus_client:server(Client),
++                                         escalus_client:resource(Client)),
++    put_room_msgs(Room, SenderJID, escalus_client:username(Client)).
++
++put_room_msgs(Room, SenderJID, Nick) ->
+     MUCHost = muc_helper:muc_host(),
+     RoomJID = mongoose_helper:make_jid(Room, MUCHost, <<>>),
+     RoomArcID = rpc_apply(mod_mam_muc, archive_id, [MUCHost, Room]),
+-    SenderJID = mongoose_helper:make_jid(<<"sender">>, domain(), <<"res">>),
+-    SrcJID = mongoose_helper:make_jid(Room, MUCHost, <<"nick">>),
++    SrcJID = mongoose_helper:make_jid(Room, MUCHost, Nick),
++    Before = room_archive_size(Room),
+     [ok = rpc_apply(mod_mam_muc, archive_message_for_ct,
+                     [#{message_id => message_id(DateTime),
+                        archive_id => RoomArcID,
+@@ -251,7 +325,7 @@ put_room_msgs(Room) ->
+                        direction => incoming,
+                        packet => escalus_stanza:groupchat_to(room_jid(Room), <<"Hi">>)}])
+      || DateTime <- ?DATES],
+-    mam_helper:wait_for_room_archive_size(MUCHost, Room, 3).
++    mam_helper:wait_for_room_archive_size(MUCHost, Room, Before + 3).
+ 
+ room_archive_size(Room) ->
+     rpc_apply(mod_mam_muc, archive_size, [muc_helper:muc_host(), Room]).
+@@ -271,6 +345,10 @@ delete_old_room_messages(MUCDomain, Before, Config) ->
+     Vars = #{<<"mucDomain">> => MUCDomain, <<"before">> => Before},
+     execute_command(<<"mam">>, <<"deleteOldRoomMessages">>, Vars, Config).
+ 
++delete_user_room_messages(User, Before, Config) ->
++    Vars = #{<<"user">> => User, <<"before">> => Before},
++    execute_command(<<"mam">>, <<"deleteUserRoomMessages">>, Vars, Config).
++
+ delete_user_messages(User, Before, Config) ->
+     Vars = #{<<"user">> => User, <<"before">> => Before},
+     execute_command(<<"mam">>, <<"deleteUserMessages">>, Vars, Config).
+diff --git a/doc/modules/mod_mam.md b/doc/modules/mod_mam.md
+index 465f828..25f5d81 100644
+--- a/doc/modules/mod_mam.md
++++ b/doc/modules/mod_mam.md
+@@ -71,6 +71,7 @@ The [GraphQL admin API](../graphql-api/Admin-GraphQL.md) can delete messages arc
+ * `mam.deleteOldRoomMessages(mucDomain, before)` from the archives of all rooms of a MUC service,
+ * `mam.deleteUserMessages(user, before)` from the one-to-one archive of one user,
+ * `mam.deleteOldMessages(domain, before)` from the one-to-one archives of all users of a domain.
++* `mam.deleteUserRoomMessages(user, before)` deletes the messages sent by one user from the archives of all MUC rooms of the user's host type. When `before` is omitted, all of them are deleted.
+ 
+ Each command returns the number of deleted messages.
+ The same commands are available in `mongooseimctl` as `mam deleteRoomMessages` and so on.
+@@ -210,6 +211,15 @@ The MUC host that will be archived if MUC archiving is enabled.
+ !!! Warning
+     If you are using MUC Light, make sure this option is set to the MUC Light domain
+ 
++#### `modules.mod_mam.muc.delete_messages_of_removed_users`
++* **Syntax:** boolean
++* **Default:** `false`
++* **Example:** `modules.mod_mam.muc.delete_messages_of_removed_users = true`
++
++When enabled, removing a user account (or purging an anonymous user) also deletes the messages that the user sent to MUC rooms from the room archives.
++By default these messages stay in the room archives after the account is removed.
++Only the `rdbms` backend supports this option.
++
+ #### Example
+ 
+ The example below presents how to override common option for `muc` module specifically.
+diff --git a/priv/graphql/schemas/admin/mam.gql b/priv/graphql/schemas/admin/mam.gql
+index bb6b0a8..cacf59e 100644
+--- a/priv/graphql/schemas/admin/mam.gql
++++ b/priv/graphql/schemas/admin/mam.gql
+@@ -8,6 +8,9 @@ type MAMAdminMutation @protected{
+   "Delete messages archived before the given date from the archives of all rooms of a MUC service. Returns the number of deleted messages"
+   deleteOldRoomMessages(mucDomain: DomainName!, before: DateTime!): Int
+     @protected(type: DOMAIN, args: ["mucDomain"]) @use(modules: ["mod_mam_muc"], args: ["mucDomain"])
++  "Delete messages that a user sent to rooms, archived before the given date or at any time if no date is given. Returns the number of deleted messages"
++  deleteUserRoomMessages(user: JID!, before: DateTime): Int
++    @protected(type: DOMAIN, args: ["user"]) @use(modules: ["mod_mam_muc"], args: ["user"])
+   "Delete messages archived before the given date from a user's one-to-one archive. Returns the number of deleted messages"
+   deleteUserMessages(user: JID!, before: DateTime!): Int
+     @protected(type: DOMAIN, args: ["user"]) @use(modules: ["mod_mam_pm"], args: ["user"])
+diff --git a/src/graphql/admin/mongoose_graphql_mam_admin_mutation.erl b/src/graphql/admin/mongoose_graphql_mam_admin_mutation.erl
+index 2801d37..b6b850d 100644
+--- a/src/graphql/admin/mongoose_graphql_mam_admin_mutation.erl
++++ b/src/graphql/admin/mongoose_graphql_mam_admin_mutation.erl
+@@ -7,7 +7,7 @@
+ 
+ -include("../mongoose_graphql_types.hrl").
+ 
+--import(mongoose_graphql_helper, [make_error/2]).
++-import(mongoose_graphql_helper, [make_error/2, null_to_undefined/1]).
+ 
+ execute(_Ctx, mam, <<"deleteRoomMessages">>, #{<<"room">> := RoomJID, <<"before">> := Before}) ->
+     format_result(mod_mam_api:delete_room_messages(RoomJID, Before),
+@@ -16,6 +16,9 @@ execute(_Ctx, mam, <<"deleteOldRoomMessages">>,
+         #{<<"mucDomain">> := MUCDomain, <<"before">> := Before}) ->
+     format_result(mod_mam_api:delete_old_room_messages(MUCDomain, Before),
+                   #{mucDomain => MUCDomain});
++execute(_Ctx, mam, <<"deleteUserRoomMessages">>, #{<<"user">> := UserJID, <<"before">> := Before}) ->
++    format_result(mod_mam_api:delete_user_room_messages(UserJID, null_to_undefined(Before)),
++                  #{user => jid:to_binary(UserJID)});
+ execute(_Ctx, mam, <<"deleteUserMessages">>, #{<<"user">> := UserJID, <<"before">> := Before}) ->
+     format_result(mod_mam_api:delete_user_messages(UserJID, Before),
+                   #{user => jid:to_binary(UserJID)});
+diff --git a/src/mam/mod_mam.erl b/src/mam/mod_mam.erl
+index 3a5aa44..4017787 100644
+--- a/src/mam/mod_mam.erl
++++ b/src/mam/mod_mam.erl
+@@ -77,8 +77,11 @@
+                                     sender_id => archive_id()}.
+ 
+ %% Which archives to delete messages from: one archive (of a user or a room),
+-%% or all archives of a domain (users) or of a MUC service (rooms).
+--type delete_messages_scope() :: {archive, jid:lserver(), jid:luser()} | {server, jid:lserver()}.
++%% all archives of a domain (users) or of a MUC service (rooms),
++%% or, for room archives only, the messages a user sent to any room.
++-type delete_messages_scope() :: {archive, jid:lserver(), jid:luser()}
++                               | {server, jid:lserver()}
++                               | {sender, jid:lserver(), jid:luser()}.
+ -type delete_messages_params() :: #{scope := delete_messages_scope(),
+                                     %% Delete messages with IDs lower than this one
+                                     before_id := message_id()}.
+@@ -146,7 +149,8 @@ pm_config_spec() ->
+ 
+ muc_config_spec() ->
+     #section{items = maps:merge(common_config_items(), muc_config_items()),
+-             defaults = #{<<"host">> => mod_muc:default_host()}}.
++             defaults = #{<<"host">> => mod_muc:default_host(),
++                          <<"delete_messages_of_removed_users">> => false}}.
+ 
+ root_config_items() ->
+     Cache = mongoose_user_cache:config_spec(),
+@@ -201,7 +205,8 @@ muc_config_items() ->
+     #{<<"async_writer">> => async_config_spec(),
+       <<"host">> => #option{type = string,
+                             validate = subdomain_template,
+-                            process = fun mongoose_subdomain_utils:make_subdomain_pattern/1}}.
++                            process = fun mongoose_subdomain_utils:make_subdomain_pattern/1},
++      <<"delete_messages_of_removed_users">> => #option{type = boolean}}.
+ 
+ async_config_spec() ->
+     #section{
+@@ -258,7 +263,7 @@ mam_type_to_core_mod(muc) -> mod_mam_muc.
+ valid_core_mod_opts(mod_mam_pm) ->
+     [archive_groupchats, same_mam_id_for_peers] ++ common_opts();
+ valid_core_mod_opts(mod_mam_muc) ->
+-    [host] ++ common_opts().
++    [host, delete_messages_of_removed_users] ++ common_opts().
+ 
+ common_opts() ->
+     [async_writer,
+diff --git a/src/mam/mod_mam_api.erl b/src/mam/mod_mam_api.erl
+index 9f84c9b..14f9218 100644
+--- a/src/mam/mod_mam_api.erl
++++ b/src/mam/mod_mam_api.erl
+@@ -8,6 +8,7 @@
+ 
+ -export([delete_room_messages/2,
+          delete_old_room_messages/2,
++         delete_user_room_messages/2,
+          delete_user_messages/2,
+          delete_old_messages/2]).
+ 
+@@ -45,6 +46,23 @@ delete_old_room_messages(MUCDomain, Before) ->
+             ?MUC_SERVER_NOT_FOUND_RESULT
+     end.
+ 
++%% @doc Delete messages that a user sent to rooms, archived before `Before',
++%% or at any time when `Before' is `undefined'.
++-spec delete_user_room_messages(jid:jid(), mod_mam:unix_timestamp() | undefined) ->
++          delete_result().
++delete_user_room_messages(#jid{luser = LUser, lserver = LServer}, Before) ->
++    case mongoose_domain_api:get_domain_host_type(LServer) of
++        {ok, HostType} ->
++            BeforeID = case Before of
++                           undefined -> mod_mam_utils:max_message_id();
++                           _ -> before_id(Before)
++                       end,
++            Params = #{scope => {sender, LServer, LUser}, before_id => BeforeID},
++            format_result(mongoose_hooks:mam_muc_delete_messages(HostType, Params));
++        {error, not_found} ->
++            ?DOMAIN_NOT_FOUND_RESULT
++    end.
++
+ %% @doc Delete messages archived before `Before' from the one-to-one archive of a user.
+ -spec delete_user_messages(jid:jid(), mod_mam:unix_timestamp()) -> delete_result().
+ delete_user_messages(#jid{luser = LUser, lserver = LServer}, Before) ->
+diff --git a/src/mam/mod_mam_muc.erl b/src/mam/mod_mam_muc.erl
+index 8dfb773..bb5bcff 100644
+--- a/src/mam/mod_mam_muc.erl
++++ b/src/mam/mod_mam_muc.erl
+@@ -42,6 +42,7 @@
+ 
+ %% ejabberd room handlers
+ -export([disco_muc_features/3,
++         remove_user/3,
+          filter_room_packet/3,
+          forget_room/3]).
+ 
+@@ -242,6 +243,24 @@ room_process_mam_iq(Acc, From, To, IQ, #{host_type := HostType}) ->
+             {Acc, return_action_not_allowed_error_iq(Reason, IQ)}
+     end.
+ 
++%% @doc Delete the messages that a removed user sent to rooms, when
++%% `delete_messages_of_removed_users' is enabled.
++-spec remove_user(Acc, Params, Extra) -> {ok, Acc} when
++      Acc :: mongoose_acc:t(),
++      Params :: #{jid := jid:jid()},
++      Extra :: gen_hook:extra().
++remove_user(Acc, #{jid := #jid{luser = LUser, lserver = LServer}}, #{host_type := HostType}) ->
++    Params = #{scope => {sender, LServer, LUser}, before_id => mod_mam_utils:max_message_id()},
++    case mongoose_hooks:mam_muc_delete_messages(HostType, Params) of
++        {ok, Count} ->
++            ?LOG_INFO(#{what => mam_muc_removed_user_messages_deleted, count => Count,
++                        user => LUser, server => LServer});
++        {error, not_supported} ->
++            ?LOG_WARNING(#{what => mam_muc_removed_user_messages_not_deleted,
++                           reason => not_supported, user => LUser, server => LServer})
++    end,
++    {ok, Acc}.
++
+ -spec forget_room(Acc, Params, Extra) -> {ok, Acc} when
+     Acc :: term(),
+     Params :: #{muc_host := jid:server(), room := jid:luser()},
+@@ -679,7 +698,19 @@ hooks(HostType) ->
+     [{disco_muc_features, HostType, fun ?MODULE:disco_muc_features/3, #{}, 99},
+      {filter_room_packet, HostType, fun ?MODULE:filter_room_packet/3, #{}, 60},
+      {forget_room, HostType, fun ?MODULE:forget_room/3, #{}, 90},
+-     {get_personal_data, HostType, fun ?MODULE:get_personal_data/3, #{}, 50}].
++     {get_personal_data, HostType, fun ?MODULE:get_personal_data/3, #{}, 50}]
++    ++ remove_user_hooks(HostType).
++
++%% Run before mod_mam_pm, which can remove the user from the archive users table,
++%% where the backend looks up the messages' sender.
++remove_user_hooks(HostType) ->
++    case gen_mod:get_module_opt(HostType, ?MODULE, delete_messages_of_removed_users) of
++        true ->
++            [{remove_user, HostType, fun ?MODULE:remove_user/3, #{}, 40},
++             {anonymous_purge, HostType, fun ?MODULE:remove_user/3, #{}, 40}];
++        false ->
++            []
++    end.
+ 
+ add_iq_handlers(HostType, Opts) ->
+     IQDisc = gen_mod:get_opt(iqdisc, Opts, parallel),
+diff --git a/src/mam/mod_mam_muc_rdbms_arch.erl b/src/mam/mod_mam_muc_rdbms_arch.erl
+index c090f97..3f23cbe 100644
+--- a/src/mam/mod_mam_muc_rdbms_arch.erl
++++ b/src/mam/mod_mam_muc_rdbms_arch.erl
+@@ -113,6 +113,7 @@ register_prepared_queries(Opts) ->
+     mod_mam_utils:prepare_delete_messages(Opts, mam_muc_message, room_id,
+                                           mam_muc_delete_archive_messages,
+                                           mam_muc_delete_server_messages),
++    mod_mam_utils:prepare_delete_sender_messages(Opts, mam_muc_delete_sender_messages),
+ 
+     mongoose_rdbms:prepare(mam_muc_make_tombstone, mam_muc_message, [message, room_id, id],
+                            <<"UPDATE mam_muc_message SET message = ?, search_body = '' "
+@@ -331,7 +332,8 @@ remove_archive(Acc, #{archive_id := ArcID}, #{host_type := HostType}) ->
+ delete_messages(_Acc, #{scope := Scope, before_id := BeforeID}, #{host_type := HostType}) ->
+     Query = case Scope of
+                 {archive, _, _} -> mam_muc_delete_archive_messages;
+-                {server, _} -> mam_muc_delete_server_messages
++                {server, _} -> mam_muc_delete_server_messages;
++                {sender, _, _} -> mam_muc_delete_sender_messages
+             end,
+     Args = mod_mam_utils:delete_messages_args(Scope, BeforeID),
+     Limit = gen_mod:get_module_opt(HostType, ?MODULE, delete_domain_limit),
+diff --git a/src/mam/mod_mam_utils.erl b/src/mam/mod_mam_utils.erl
+index b64f9ea..38f0d03 100644
+--- a/src/mam/mod_mam_utils.erl
++++ b/src/mam/mod_mam_utils.erl
+@@ -100,6 +100,8 @@
+          incremental_delete_domain/5,
+          delete_in_batches/4,
+          prepare_delete_messages/5,
++         prepare_delete_sender_messages/2,
++         max_message_id/0,
+          delete_messages_args/2,
+          db_message_codec/2, db_jid_codec/2]).
+ 
+@@ -1374,6 +1376,26 @@ prepare_delete_messages(#{delete_domain_limit := Limit}, Table, ArchiveColumn,
+                            delete_messages_sql(Table, ArchiveColumn, Limit, [server])),
+     ok.
+ 
++%% @doc Prepare the query deleting messages that a user sent to any room, archived before a
++%% given message ID. Senders are listed in `mam_server_user' like the archive owners.
++-spec prepare_delete_sender_messages(#{delete_domain_limit := pos_integer() | infinity},
++                                     Query :: atom()) -> ok.
++prepare_delete_sender_messages(#{delete_domain_limit := infinity}, Query) ->
++    mongoose_rdbms:prepare(Query, mam_muc_message,
++                           ['mam_server_user.server', 'mam_server_user.user_name', id],
++                           <<"DELETE FROM mam_muc_message WHERE sender_id IN "
++                             "(SELECT id FROM mam_server_user WHERE server = ? AND user_name = ?)"
++                             " AND id < ?">>);
++prepare_delete_sender_messages(#{delete_domain_limit := Limit}, Query) ->
++    LimitSQL = rdbms_queries:limit(Limit),
++    mongoose_rdbms:prepare(Query, mam_muc_message,
++                           ['mam_server_user.server', 'mam_server_user.user_name', id],
++                           <<"DELETE FROM mam_muc_message WHERE (room_id, id) IN "
++                             "(SELECT * FROM (SELECT msg.room_id, msg.id FROM mam_muc_message msg"
++                             " INNER JOIN mam_server_user msu ON msu.id = msg.sender_id"
++                             " WHERE msu.server = ? AND msu.user_name = ? AND msg.id < ?",
++                             LimitSQL/binary, ") AS T)">>).
++
+ -spec delete_messages_sql(atom(), atom(), pos_integer() | infinity, [atom()]) -> binary().
+ delete_messages_sql(Table, ArchiveColumn, infinity, FilterColumns) ->
+     T = atom_to_binary(Table),
+@@ -1397,7 +1419,14 @@ archive_filter_sql(Prefix, Columns) ->
+     Conditions = [<<Prefix/binary, (atom_to_binary(Column))/binary, " = ?">> || Column <- Columns],
+     iolist_to_binary(lists:join(<<" AND ">>, Conditions)).
+ 
++%% @doc The highest possible message ID, to delete messages archived at any time.
++-spec max_message_id() -> mod_mam:message_id().
++max_message_id() ->
++    ?BIGINT_MAX.
++
+ -spec delete_messages_args(mod_mam:delete_messages_scope(), mod_mam:message_id()) -> [term()].
++delete_messages_args({sender, LServer, LUser}, BeforeID) ->
++    [LServer, LUser, BeforeID];
+ delete_messages_args({archive, LServer, LUser}, BeforeID) ->
+     [LServer, LUser, BeforeID];
+ delete_messages_args({server, LServer}, BeforeID) ->
+diff --git a/test/common/config_parser_helper.erl b/test/common/config_parser_helper.erl
+index 1b1acb9..d6711d5 100644
+--- a/test/common/config_parser_helper.erl
++++ b/test/common/config_parser_helper.erl
+@@ -559,6 +559,7 @@ all_modules() ->
+                            #{async_writer => config([modules, mod_mam, async_writer],
+                                                     #{enabled => false}),
+                              db_message_format => mam_message_xml,
++                             delete_messages_of_removed_users => false,
+                              host => {fqdn, <<"muc.example.com">>},
+                              user_prefs_store => mnesia},
+                        no_stanzaid_element => true,
+@@ -1194,7 +1195,7 @@ default_config([modules, mod_http_upload, s3]) ->
+ default_config([modules, mod_mam, pm]) ->
+     #{archive_groupchats => false, same_mam_id_for_peers => false};
+ default_config([modules, mod_mam, muc]) ->
+-    #{host => {prefix, <<"conference.">>}};
++    #{host => {prefix, <<"conference.">>}, delete_messages_of_removed_users => false};
+ default_config([modules, mod_mam, cache]) ->
+     #{module => internal, strategy => fifo,
+       time_to_live => 480, number_of_segments => 3};
+diff --git a/test/config_parser_SUITE.erl b/test/config_parser_SUITE.erl
+index 9a1ccce..942f97f 100644
+--- a/test/config_parser_SUITE.erl
++++ b/test/config_parser_SUITE.erl
+@@ -2168,6 +2168,7 @@ mod_mam_pm(_Config) ->
+     ?cfgh(P ++ [archive_groupchats], true, T(#{<<"archive_groupchats">> => true})),
+     ?cfgh(P ++ [same_mam_id_for_peers], true, T(#{<<"same_mam_id_for_peers">> => true})),
+     ?errh(T(#{<<"host">> => <<"muc.@HOST@">>})), % muc-only
++    ?errh(T(#{<<"delete_messages_of_removed_users">> => true})), % muc-only
+     ?errh(T(#{<<"archive_groupchats">> => <<"not really">>})),
+     ?errh(T(#{<<"same_mam_id_for_peers">> => <<"not really">>})).
+ 
+@@ -2182,6 +2183,9 @@ mod_mam_muc(_Config) ->
+     ?errh(T(#{<<"host">> => [<<"valid.@HOST@">>]})),
+     ?errh(T(#{<<"host">> => <<"invalid.sub@HOST@">>})),
+     ?errh(T(#{<<"host">> => <<"invalid.sub.@HOST@.as.well">>})),
++    ?cfgh(P ++ [delete_messages_of_removed_users], true,
++          T(#{<<"delete_messages_of_removed_users">> => true})),
++    ?errh(T(#{<<"delete_messages_of_removed_users">> => <<"yes">>})),
+     ?errh(T(#{<<"archive_groupchats">> => true})), % pm-only
+     ?errh(T(#{<<"same_mam_id_for_peers">> => true})). % pm-only
+ 
+-- 
+2.43.0
+

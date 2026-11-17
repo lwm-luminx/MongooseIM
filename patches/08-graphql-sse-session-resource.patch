@@ -1,0 +1,314 @@
+From ee34082a005315fcbbd3d0b276496d70d687b464 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 16 Nov 2026 21:00:27 +0000
+Subject: [PATCH] Let GraphQL message subscriptions choose the session resource
+
+stanza.subscribeForMessages opens a session with a random 'sse-<uuid>'
+resource that the client never learns, so the session can't be used as
+the full JID in other commands, e.g. muc.enterRoom, and messages for a
+known full JID can't reach the stream.
+
+Add an optional 'resource' argument to the user and admin
+subscriptions. A resource that is already in use returns the
+'resource_conflict' error instead of taking over the existing session.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01ETaRHXo1LmPHqZB9SXMucM
+---
+ big_tests/tests/graphql_stanza_SUITE.erl      | 66 +++++++++++++++++++
+ doc/graphql-api/User-GraphQL.md               |  5 ++
+ priv/graphql/schemas/admin/stanza.gql         |  8 ++-
+ priv/graphql/schemas/user/stanza.gql          |  8 ++-
+ ...oose_graphql_stanza_admin_subscription.erl | 10 ++-
+ ...goose_graphql_stanza_user_subscription.erl | 22 +++++--
+ src/mongoose_stanza_api.erl                   | 37 ++++++++---
+ 7 files changed, 133 insertions(+), 23 deletions(-)
+
+diff --git a/big_tests/tests/graphql_stanza_SUITE.erl b/big_tests/tests/graphql_stanza_SUITE.erl
+index 0c30578..380f984 100644
+--- a/big_tests/tests/graphql_stanza_SUITE.erl
++++ b/big_tests/tests/graphql_stanza_SUITE.erl
+@@ -53,6 +53,8 @@ admin_stanza_cases() ->
+ 
+ admin_sse_cases() ->
+     [admin_subscribe_for_messages,
++     admin_subscribe_for_messages_with_resource,
++     admin_subscribe_for_messages_with_resource_in_use,
+      admin_subscribe_for_messages_to_unknown_user].
+ 
+ admin_mam_cases() ->
+@@ -81,6 +83,8 @@ domain_admin_stanza_cases() ->
+ user_stanza_cases() ->
+     [user_send_message,
+      user_subscribe_for_messages,
++     user_subscribe_for_messages_with_resource,
++     user_subscribe_for_messages_with_resource_in_use,
+      user_send_message_without_from,
+      user_send_message_with_spoofed_from,
+      user_send_message_headline,
+@@ -190,6 +194,27 @@ admin_subscribe_for_messages_story(Config, Alice, Bob) ->
+     escalus:assert(is_message, Stanza),
+     sse_helper:stop_sse(Stream).
+ 
++admin_subscribe_for_messages_with_resource(Config) ->
++    escalus:fresh_story_with_config(Config, [{alice, 1}, {bob, 1}],
++                                    fun admin_subscribe_for_messages_with_resource_story/3).
++
++admin_subscribe_for_messages_with_resource_story(Config, Alice, Bob) ->
++    To = escalus_client:short_jid(Bob),
++    {200, Stream} = subscribe_for_messages(To, <<"sse-res">>, Config),
++    assert_message_to_resource_is_streamed(Alice, To, <<"sse-res">>, Stream).
++
++admin_subscribe_for_messages_with_resource_in_use(Config) ->
++    escalus:fresh_story_with_config(Config, [{bob, 1}],
++                                    fun admin_subscribe_for_messages_with_resource_in_use_story/2).
++
++admin_subscribe_for_messages_with_resource_in_use_story(Config, Bob) ->
++    To = escalus_client:short_jid(Bob),
++    Res = subscribe_for_messages(To, escalus_client:resource(Bob), Config),
++    ?assertEqual(<<"resource_conflict">>, get_err_code(Res)),
++    %% Bob's session was not taken over
++    escalus_client:send(Bob, escalus_stanza:chat_to(escalus_client:full_jid(Bob), <<"Hi!">>)),
++    escalus:assert(is_chat_message, [<<"Hi!">>], escalus:wait_for_stanza(Bob)).
++
+ user_send_message(Config) ->
+     escalus:fresh_story_with_config(Config, [{alice, 1}, {bob, 1}],
+                                     fun user_send_message_story/3).
+@@ -218,6 +243,39 @@ user_subscribe_for_messages_story(Config, Alice, Bob) ->
+     escalus:assert(is_message, Stanza),
+     sse_helper:stop_sse(Stream).
+ 
++user_subscribe_for_messages_with_resource(Config) ->
++    escalus:fresh_story_with_config(Config, [{alice, 1}, {bob, 1}],
++                                    fun user_subscribe_for_messages_with_resource_story/3).
++
++user_subscribe_for_messages_with_resource_story(Config, Alice, Bob) ->
++    To = escalus_client:short_jid(Bob),
++    {200, Stream} = user_subscribe_for_messages(Bob, <<"sse-res">>, Config),
++    assert_message_to_resource_is_streamed(Alice, To, <<"sse-res">>, Stream).
++
++user_subscribe_for_messages_with_resource_in_use(Config) ->
++    escalus:fresh_story_with_config(Config, [{bob, 1}],
++                                    fun user_subscribe_for_messages_with_resource_in_use_story/2).
++
++user_subscribe_for_messages_with_resource_in_use_story(Config, Bob) ->
++    Res = user_subscribe_for_messages(Bob, escalus_client:resource(Bob), Config),
++    ?assertEqual(<<"resource_conflict">>, get_err_code(Res)),
++    %% Bob's session was not taken over
++    escalus_client:send(Bob, escalus_stanza:chat_to(escalus_client:full_jid(Bob), <<"Hi!">>)),
++    escalus:assert(is_chat_message, [<<"Hi!">>], escalus:wait_for_stanza(Bob)).
++
++%% A message sent to the full JID with the chosen resource is delivered to the stream
++assert_message_to_resource_is_streamed(Sender, BareJID, Resource, Stream) ->
++    From = escalus_client:full_jid(Sender),
++    To = <<BareJID/binary, "/", Resource/binary>>,
++    escalus:send(Sender, escalus_stanza:chat(From, To, <<"Hi!">>)),
++    Event = sse_helper:wait_for_event(Stream),
++    #{<<"stanza">> := StanzaBin, <<"sender">> := From} =
++        graphql_helper:get_value([data, stanza, subscribeForMessages], Event),
++    {ok, Stanza} = exml:parse(StanzaBin),
++    escalus:assert(is_message, Stanza),
++    ?assertEqual(To, exml_query:attr(Stanza, <<"to">>)),
++    sse_helper:stop_sse(Stream).
++
+ user_send_message_without_from(Config) ->
+     escalus:fresh_story_with_config(Config, [{alice, 1}, {bob, 1}],
+                                     fun user_send_message_without_from_story/3).
+@@ -584,9 +642,17 @@ subscribe_for_messages(Caller, Config) ->
+     Vars = #{caller => Caller},
+     execute_command_sse(<<"stanza">>, <<"subscribeForMessages">>, Vars, Config).
+ 
++subscribe_for_messages(Caller, Resource, Config) ->
++    Vars = #{caller => Caller, resource => Resource},
++    execute_command_sse(<<"stanza">>, <<"subscribeForMessages">>, Vars, Config).
++
+ user_subscribe_for_messages(User, Config) ->
+     execute_user_command_sse(<<"stanza">>, <<"subscribeForMessages">>, User, #{}, Config).
+ 
++user_subscribe_for_messages(User, Resource, Config) ->
++    Vars = #{resource => Resource},
++    execute_user_command_sse(<<"stanza">>, <<"subscribeForMessages">>, User, Vars, Config).
++
+ get_last_messages(Caller, With, Before, Config) ->
+     Vars = #{caller => Caller, with => With, before => Before},
+     execute_command(<<"stanza">>, <<"getLastMessages">>, Vars, Config).
+diff --git a/doc/graphql-api/User-GraphQL.md b/doc/graphql-api/User-GraphQL.md
+index 4d132ab..076319c 100644
+--- a/doc/graphql-api/User-GraphQL.md
++++ b/doc/graphql-api/User-GraphQL.md
+@@ -6,6 +6,11 @@ The new GraphQL user API contains all commands from the client REST API and prov
+ 
+ **Subscriptions** can be executed with the GET method, and are handled with [Server-Sent Events (SSE)](https://html.spec.whatwg.org/multipage/server-sent-events.html). The endpoint URL is the same as for regular queries with the addition of `/sse`, e.g. `http://localhost:5561/api/graphql/sse`.
+ 
++The `stanza.subscribeForMessages` subscription opens an XMPP session for the user, which lasts as long as the SSE connection.
++By default, the session has a random resource. Pass the `resource` argument to choose it, so that the session can be addressed with a known full JID.
++For example, after subscribing with `resource: "web"`, you can join a room with `muc.enterRoom(room: ..., nick: ..., resource: "web")`,
++and the room's messages are delivered to the subscription. Leave the room with `muc.exitRoom` before closing the subscription, because closing it doesn't send an unavailable presence. If the resource is already in use by another session, the subscription returns the `resource_conflict` error.
++
+ ## Authentication
+ 
+ MongooseIM uses *Basic Authentication* as the authentication method for the GraphQL API.
+diff --git a/priv/graphql/schemas/admin/stanza.gql b/priv/graphql/schemas/admin/stanza.gql
+index cfac571..371c70d 100644
+--- a/priv/graphql/schemas/admin/stanza.gql
++++ b/priv/graphql/schemas/admin/stanza.gql
+@@ -21,8 +21,12 @@ type StanzaAdminMutation @protected{
+ }
+ 
+ type StanzaAdminSubscription @protected{
+-  "Subscribe for the given user's incoming messages"
+-  subscribeForMessages(caller: JID!): StanzaMap
++  """
++  Subscribe for the given user's incoming messages.
++  The subscription opens a session with the given resource, or with a random one if it is not provided.
++  A resource that is already in use is not taken over.
++  """
++  subscribeForMessages(caller: JID!, resource: ResourceName): StanzaMap
+     @protected(type: DOMAIN, args: ["caller"])
+   "Subscribe for XMPP traffic"
+   subscribeForTraffic(limit: Int!): TraceMap
+diff --git a/priv/graphql/schemas/user/stanza.gql b/priv/graphql/schemas/user/stanza.gql
+index 9cfdb12..f260a6f 100644
+--- a/priv/graphql/schemas/user/stanza.gql
++++ b/priv/graphql/schemas/user/stanza.gql
+@@ -20,6 +20,10 @@ type StanzaUserMutation @protected{
+ }
+ 
+ type StanzaUserSubscription @protected{
+-  "Subscribe to incoming messages"
+-  subscribeForMessages: StanzaMap
++  """
++  Subscribe to incoming messages.
++  The subscription opens a session with the given resource, or with a random one if it is not provided.
++  A resource that is already in use is not taken over.
++  """
++  subscribeForMessages(resource: ResourceName): StanzaMap
+ }
+diff --git a/src/graphql/admin/mongoose_graphql_stanza_admin_subscription.erl b/src/graphql/admin/mongoose_graphql_stanza_admin_subscription.erl
+index 9daef3b..1d97bad 100644
+--- a/src/graphql/admin/mongoose_graphql_stanza_admin_subscription.erl
++++ b/src/graphql/admin/mongoose_graphql_stanza_admin_subscription.erl
+@@ -19,12 +19,13 @@ subscribe_for_messages(#{event := terminate, stream := Session}, _) ->
+     {ok, null, [{stream, closed}]};
+ subscribe_for_messages(#{event := Event}, _) ->
+     mongoose_graphql_stanza_helper:handle_event(Event);
+-subscribe_for_messages(_Ctx, #{<<"caller">> := Jid}) ->
+-    case mongoose_stanza_api:open_session(Jid, true) of
++subscribe_for_messages(_Ctx, #{<<"caller">> := Jid} = Args) ->
++    Resource = null_to_undefined(maps:get(<<"resource">>, Args, null)),
++    case mongoose_stanza_api:open_session(Jid, true, Resource) of
+         {ok, Stream} ->
+             {ok, null, [{stream, Stream}]};
+         Error ->
+-            format_result(Error, #{caller => Jid})
++            format_result(Error, #{caller => Jid, resource => Resource})
+     end.
+ 
+ subscribe_for_traffic(#{event := terminate}, _) ->
+@@ -36,3 +37,6 @@ subscribe_for_traffic(#{event := Event}, _) ->
+ subscribe_for_traffic(#{params := #{<<"limit">> := Limit}}, _) ->
+     service_traffic:register(Limit),
+     {ok, null, [{stream, make_ref()}]}.
++
++null_to_undefined(null) -> undefined;
++null_to_undefined(Value) -> Value.
+diff --git a/src/graphql/user/mongoose_graphql_stanza_user_subscription.erl b/src/graphql/user/mongoose_graphql_stanza_user_subscription.erl
+index 3c8eb90..e38d2a0 100644
+--- a/src/graphql/user/mongoose_graphql_stanza_user_subscription.erl
++++ b/src/graphql/user/mongoose_graphql_stanza_user_subscription.erl
+@@ -9,14 +9,22 @@
+ 
+ -include("../mongoose_graphql_types.hrl").
+ 
+-execute(Ctx, _Obj, <<"subscribeForMessages">>, #{}) ->
+-    subscribe_for_messages(Ctx).
++execute(Ctx, _Obj, <<"subscribeForMessages">>, Args) ->
++    subscribe_for_messages(Ctx, Args).
+ 
+-subscribe_for_messages(#{event := terminate, stream := Session}) ->
++subscribe_for_messages(#{event := terminate, stream := Session}, _) ->
+     mongoose_stanza_api:close_session(Session),
+     {ok, null, [{stream, closed}]};
+-subscribe_for_messages(#{event := Event}) ->
++subscribe_for_messages(#{event := Event}, _) ->
+     mongoose_graphql_stanza_helper:handle_event(Event);
+-subscribe_for_messages(#{user := Jid}) ->
+-    {ok, Stream} = mongoose_stanza_api:open_session(Jid, false),
+-    {ok, null, [{stream, Stream}]}.
++subscribe_for_messages(#{user := Jid}, Args) ->
++    Resource = null_to_undefined(maps:get(<<"resource">>, Args, null)),
++    case mongoose_stanza_api:open_session(Jid, false, Resource) of
++        {ok, Stream} ->
++            {ok, null, [{stream, Stream}]};
++        Error ->
++            format_result(Error, #{resource => Resource})
++    end.
++
++null_to_undefined(null) -> undefined;
++null_to_undefined(Value) -> Value.
+diff --git a/src/mongoose_stanza_api.erl b/src/mongoose_stanza_api.erl
+index f4dbebe..07c9a7b 100644
+--- a/src/mongoose_stanza_api.erl
++++ b/src/mongoose_stanza_api.erl
+@@ -4,7 +4,7 @@
+ -export([send_chat_message/5, send_headline_message/6, send_stanza/3, lookup_recent_messages/5]).
+ 
+ %% Event API
+--export([open_session/2, close_session/1]).
++-export([open_session/2, open_session/3, close_session/1]).
+ 
+ -include("jlib.hrl").
+ -include("mongoose_rsm.hrl").
+@@ -57,8 +57,16 @@ lookup_recent_messages(User, With, Before, Limit, CheckUser) ->
+ 
+ -spec open_session(jid:jid(), boolean()) -> {unknown_user, iodata()} | {ok, stream()}.
+ open_session(User, CheckUser) ->
+-    M = #{user => User, check_user => CheckUser},
+-    fold(M, [fun get_host_type/1, fun check_user/1, fun do_open_session/1]).
++    open_session(User, CheckUser, undefined).
++
++%% @doc Opens a session for the user, with the given resource or a random one.
++%% A resource that is already in use is not taken over.
++-spec open_session(jid:jid(), boolean(), jid:resource() | undefined) ->
++          {unknown_user | invalid_resource | resource_conflict, iodata()} | {ok, stream()}.
++open_session(User, CheckUser, Resource) ->
++    M = #{user => User, check_user => CheckUser, resource => Resource},
++    fold(M, [fun get_host_type/1, fun check_user/1, fun check_resource/1,
++             fun do_open_session/1]).
+ 
+ -spec close_session(stream()) -> {ok, closed}.
+ close_session(#{jid := Jid = #jid{lserver = S}, sid := Sid, host_type := HostType}) ->
+@@ -178,13 +186,24 @@ lookup_messages(#{user := UserJid, with := WithJid, before := Before, limit := L
+     {ok, {_, _, Rows}} = mod_mam_pm:lookup_messages(HostType, Params),
+     {ok, {Rows, Limit2}}.
+ 
+-do_open_session(#{host_type := HostType, user := Jid}) ->
+-    Sid = ejabberd_sm:make_new_sid(),
++check_resource(#{resource := undefined, user := Jid} = M) ->
+     UUID = uuid:uuid_to_string(uuid:get_v4(), binary_standard),
+-    Resource = <<"sse-", UUID/binary>>,
+-    NewJid = jid:replace_resource(Jid, Resource),
+-    ejabberd_sm:open_session(HostType, Sid, NewJid, 1, #{}),
+-    {ok, #{sid => Sid, jid => NewJid, host_type => HostType}}.
++    M#{session_jid => jid:replace_resource(Jid, <<"sse-", UUID/binary>>)};
++check_resource(#{resource := Resource, user := Jid} = M) ->
++    case jid:replace_resource(Jid, Resource) of
++        error ->
++            {invalid_resource, <<"Invalid resource">>};
++        SessionJid ->
++            case ejabberd_sm:get_session_pid(SessionJid) of
++                none -> M#{session_jid => SessionJid};
++                _ -> {resource_conflict, <<"Resource is already in use">>}
++            end
++    end.
++
++do_open_session(#{host_type := HostType, session_jid := Jid}) ->
++    Sid = ejabberd_sm:make_new_sid(),
++    ejabberd_sm:open_session(HostType, Sid, Jid, 1, #{}),
++    {ok, #{sid => Sid, jid => Jid, host_type => HostType}}.
+ 
+ %% Helpers
+ 
+-- 
+2.43.0
+

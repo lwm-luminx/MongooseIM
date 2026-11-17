@@ -1,0 +1,616 @@
+From 8f27e705143fb26dd9bf43a4784000f59c5a740d Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 16 Nov 2026 20:45:30 +0000
+Subject: [PATCH] Support several keys and claim checks in JWT authentication
+
+- New 'keys' option: a list of keys with an optional 'kid', tried in order,
+  so signing keys can be rotated without downtime. 'secret' and 'algorithm'
+  are now optional when 'keys' are given.
+- New optional 'issuer', 'audience' and 'domain_key' claim checks.
+- Malformed tokens and unset environment variables are rejected instead of
+  crashing the authentication process.
+- The token claims are no longer logged on successful authentication.
+- stop/1 now erases the stored key.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01ETaRHXo1LmPHqZB9SXMucM
+---
+ doc/authentication-methods/jwt.md |  68 +++++++++-
+ src/auth/ejabberd_auth_jwt.erl    | 199 +++++++++++++++++++++++-------
+ test/auth_jwt_SUITE.erl           | 129 ++++++++++++++++++-
+ test/config_parser_SUITE.erl      |  29 ++++-
+ 4 files changed, 374 insertions(+), 51 deletions(-)
+
+diff --git a/doc/authentication-methods/jwt.md b/doc/authentication-methods/jwt.md
+index bb34e94..f5e9953 100644
+--- a/doc/authentication-methods/jwt.md
++++ b/doc/authentication-methods/jwt.md
+@@ -11,6 +11,12 @@ The module checks the signature and validity of the following parameters:
+ * `iat` - a token must be issued in the past,
+ * `nbf` - a token might not be valid *yet*.
+ 
++These claims are checked only when they are present in the token.
++A token without `exp` never expires, so make sure that your token issuer always sets it.
++
++Optionally, the module can also check the issuer (`iss`), the audience (`aud`) and the domain of the user.
++Several keys can be configured at the same time, which makes it possible to rotate the signing keys without downtime.
++
+ It requires the `SASL PLAIN` mechanism listed in `sasl_mechanisms`.
+ 
+ ## Configuration options
+@@ -20,18 +26,32 @@ It requires the `SASL PLAIN` mechanism listed in `sasl_mechanisms`.
+     * `file` - string, path to the file with the JWT secret,
+     * `env`- string, environment variable name with the JWT secret,
+     * `value` - string, the JWT secret value.
+-* **Default:** no default, this option is mandatory
++* **Default:** no default, this option is mandatory unless `keys` are specified
+ * **Example:** `secret.env = "JWT_SECRET"`
+ 
+ This is the JWT secret used for the authentication. You can store it in a file, as an environment variable or specify it directly.
++For public key algorithms, it is the public key in the PEM format.
++A file is read when the module starts, while an environment variable is read for each authentication attempt.
+ 
+ ### `auth.jwt.algorithm`
+ * **Syntax:** string, one of: `"HS256"`, `"RS256"`, `"ES256"`, `"HS384"`, `"RS384"`, `"ES384"`, `"HS512"`, `"RS512"`, `"ES512"`
+-* **Default:** no default, this option is mandatory
++* **Default:** no default, this option is mandatory when `secret` is specified
+ * **Example:** `algorithm = "HS512"`
+ 
+ Name of the algorithm used to sign the JWT.
+ 
++### `auth.jwt.keys`
++* **Syntax:** array of TOML tables with the following items:
++    * `secret` - mandatory, the same as `auth.jwt.secret`,
++    * `algorithm` - mandatory, the same as `auth.jwt.algorithm`,
++    * `kid` - optional string, the key ID.
++* **Default:** `[]`
++* **Example:** `keys = [{kid = "2024-01", secret.env = "JWT_KEY_1", algorithm = "HS256"}]`
++
++Additional keys used to verify the tokens. They are tried in order, after the key specified with `secret` and `algorithm` (if any).
++When the token header contains a `kid`, only the keys with the same `kid` and the keys without a `kid` are tried.
++At least one key needs to be configured, either with `secret` or with `keys`.
++
+ ### `auth.jwt.username_key`
+ * **Syntax:** string
+ * **Default:** no default, this option is mandatory
+@@ -39,6 +59,28 @@ Name of the algorithm used to sign the JWT.
+ 
+ Name of the JWT key that contains the user name to verify.
+ 
++### `auth.jwt.domain_key`
++* **Syntax:** string
++* **Default:** not set
++* **Example:** `domain_key = "domain"`
++
++Name of the JWT key that contains the domain of the user. When set, the token is accepted only if this claim is equal to the domain the user is authenticating for.
++This prevents a token issued for a user in one domain from being used in another domain served by the same host type.
++
++### `auth.jwt.issuer`
++* **Syntax:** string
++* **Default:** not set
++* **Example:** `issuer = "https://auth.example.com"`
++
++When set, the token is accepted only if its `iss` claim is equal to this value.
++
++### `auth.jwt.audience`
++* **Syntax:** string
++* **Default:** not set
++* **Example:** `audience = "xmpp.example.com"`
++
++When set, the token is accepted only if its `aud` claim is equal to this value, or is a list containing it.
++
+ ### Example
+ 
+ ```toml
+@@ -47,3 +89,25 @@ Name of the JWT key that contains the user name to verify.
+   algorithm = "HS256"
+   username_key = "user"
+ ```
++
++Example with two keys, used to rotate the signing key, and additional claim checks:
++
++```toml
++[auth.jwt]
++  username_key = "sub"
++  domain_key = "domain"
++  issuer = "https://auth.example.com"
++  audience = "xmpp.example.com"
++
++  [[auth.jwt.keys]]
++    kid = "2025-02"
++    secret.env = "JWT_KEY_NEW"
++    algorithm = "HS256"
++
++  [[auth.jwt.keys]]
++    kid = "2025-01"
++    secret.file = "/etc/mongooseim/jwt_old.key"
++    algorithm = "HS256"
++```
++
++The claims of the token are not logged, because they might contain personal data.
+diff --git a/src/auth/ejabberd_auth_jwt.erl b/src/auth/ejabberd_auth_jwt.erl
+index 3da6ef9..ba2d8cd 100644
+--- a/src/auth/ejabberd_auth_jwt.erl
++++ b/src/auth/ejabberd_auth_jwt.erl
+@@ -42,12 +42,14 @@
+         ]).
+ 
+ %% Config spec callbacks
+--export([process_jwt_secret/1, process_algorithm/1]).
++-export([process_jwt_secret/1, process_algorithm/1, process_jwt_opts/1]).
+ 
+ -include("mongoose.hrl").
+ -include("mongoose_config_spec.hrl").
+ 
+ -type algorithm() :: hs256 | rs256 | es256 | hs384 | rs384 | es384 | hs512 | rs512 | es512.
++-type secret() :: binary() | {env, string()}.
++-type key() :: #{kid := binary() | undefined, algorithm := algorithm(), secret := secret()}.
+ 
+ %%%----------------------------------------------------------------------
+ %%% API
+@@ -55,28 +57,48 @@
+ 
+ -spec start(HostType :: mongooseim:host_type()) -> ok.
+ start(HostType) ->
+-    JWTSecret = get_jwt_secret(HostType),
+-    persistent_term:put({?MODULE, HostType, jwt_secret}, JWTSecret),
++    persistent_term:put({?MODULE, HostType, keys}, read_keys(HostType)),
+     ok.
+ 
+ -spec stop(HostType :: mongooseim:host_type()) -> ok.
+-stop(_HostType) ->
+-    persistent_term:erase(jwt_secret),
++stop(HostType) ->
++    persistent_term:erase({?MODULE, HostType, keys}),
+     ok.
+ 
+ -spec config_spec() -> mongoose_config_spec:config_section().
+ config_spec() ->
+     #section{
+        items = #{<<"secret">> => jwt_secret_config_spec(),
+-                 <<"algorithm">> => #option{type = binary,
+-                                            validate = {enum, maps:keys(algorithms())},
+-                                            process = fun ?MODULE:process_algorithm/1},
++                 <<"algorithm">> => algorithm_config_spec(),
++                 <<"keys">> => #list{items = jwt_key_config_spec(),
++                                     validate = unique_non_empty},
+                  <<"username_key">> => #option{type = atom,
+-                                               validate = non_empty}
++                                               validate = non_empty},
++                 <<"domain_key">> => #option{type = atom,
++                                             validate = non_empty},
++                 <<"issuer">> => #option{type = binary,
++                                         validate = non_empty},
++                 <<"audience">> => #option{type = binary,
++                                           validate = non_empty}
+                 },
+-       required = all
++       required = [<<"username_key">>],
++       process = fun ?MODULE:process_jwt_opts/1
+       }.
+ 
++jwt_key_config_spec() ->
++    #section{
++       items = #{<<"kid">> => #option{type = binary,
++                                      validate = non_empty},
++                 <<"secret">> => jwt_secret_config_spec(),
++                 <<"algorithm">> => algorithm_config_spec()},
++       required = [<<"secret">>, <<"algorithm">>]
++      }.
++
++algorithm_config_spec() ->
++    #option{type = binary,
++            validate = {enum, maps:keys(algorithms())},
++            process = fun ?MODULE:process_algorithm/1}.
++
+ jwt_secret_config_spec() ->
+     #section{
+        items = #{<<"file">> => #option{type = string,
+@@ -92,6 +114,13 @@ process_jwt_secret([V]) -> V.
+ 
+ process_algorithm(Alg) -> maps:get(Alg, algorithms()).
+ 
++%% Either a single key ('secret' with 'algorithm'), or a list of 'keys', or both.
++process_jwt_opts(Opts = #{secret := _, algorithm := _}) -> Opts;
++process_jwt_opts(#{secret := _}) -> error(#{what => jwt_algorithm_missing});
++process_jwt_opts(#{algorithm := _}) -> error(#{what => jwt_secret_missing});
++process_jwt_opts(Opts = #{keys := [_ | _]}) -> Opts;
++process_jwt_opts(_) -> error(#{what => jwt_secret_missing}).
++
+ -spec supports_sasl_module(binary(), cyrsasl:sasl_module()) -> boolean().
+ supports_sasl_module(_, Module) -> Module =:= cyrsasl_plain.
+ 
+@@ -105,33 +134,20 @@ authorize(Creds) ->
+                      LServer :: jid:lserver(),
+                      Password :: binary()) -> boolean().
+ check_password(HostType, LUser, LServer, Password) ->
+-    Key = case persistent_term:get({?MODULE, HostType, jwt_secret}) of
+-              Key1 when is_binary(Key1) -> Key1;
+-              {env, Var} -> list_to_binary(os:getenv(Var))
+-          end,
+-    Alg = mongoose_config:get_opt([{auth, HostType}, jwt, algorithm]),
+-    case jwerl:verify(Password, Alg, Key) of
++    Opts = mongoose_config:get_opt([{auth, HostType}, jwt]),
++    case verify_token(HostType, Password) of
+         {ok, TokenData} ->
+-            UserKey = mongoose_config:get_opt([{auth,HostType}, jwt, username_key]),
+-            case maps:find(UserKey, TokenData) of
+-                {ok, LUser} ->
+-                    %% Login username matches $token_user_key in TokenData
++            case check_claims(TokenData, LUser, LServer, Opts) of
++                ok ->
+                     ?LOG_INFO(#{what => jwt_success_auth,
+                                 text => <<"Successfully authenticated with JWT">>,
+-                                user => LUser, server => LServer,
+-                                token => TokenData}),
++                                user => LUser, server => LServer}),
+                     true;
+-                {ok, ExpectedUser} ->
+-                    ?LOG_WARNING(#{what => wrong_jwt_user,
+-                                   text => <<"JWT contains wrond user">>,
+-                                   expected_user => ExpectedUser,
+-                                   user => LUser, server => LServer}),
+-                    false;
+-                error ->
+-                    ?LOG_WARNING(#{what => missing_jwt_key,
+-                                   text => <<"Missing key {user_key} in JWT data">>,
+-                                   user_key => UserKey, token => TokenData,
+-                                   user => LUser, server => LServer}),
++                {error, Reason} ->
++                    %% The claims are not logged, as they might contain personal data
++                    ?LOG_WARNING(#{what => jwt_claims_check_failed,
++                                   text => <<"JWT claims do not match the user">>,
++                                   reason => Reason, user => LUser, server => LServer}),
+                     false
+             end;
+         {error, Reason} ->
+@@ -142,7 +158,6 @@ check_password(HostType, LUser, LServer, Password) ->
+             false
+     end.
+ 
+-
+ -spec check_password(HostType :: mongooseim:host_type(),
+                      LUser :: jid:luser(),
+                      LServer :: jid:lserver(),
+@@ -171,20 +186,112 @@ supported_features() -> [dynamic_domains].
+ %%% Internal helpers
+ %%%----------------------------------------------------------------------
+ 
+-% A direct path to a file is read only once during startup,
+-% a path in environment variable is read on every auth request.
+--spec get_jwt_secret(mongooseim:host_type()) -> binary() | {env, string()}.
+-get_jwt_secret(HostType) ->
+-    case mongoose_config:get_opt([{auth, HostType}, jwt, secret]) of
+-        {value, JWTSecret} ->
+-            JWTSecret;
+-        {env, Env} ->
+-            {env, Env};
+-        {file, Path} ->
+-            {ok, JWTSecret} = file:read_file(Path),
+-            JWTSecret
++%% @doc Tries the configured keys in order. If the token header has a 'kid',
++%% only the keys with that 'kid' and the keys without one are tried.
++-spec verify_token(mongooseim:host_type(), binary()) -> {ok, map()} | {error, term()}.
++verify_token(HostType, Token) ->
++    try jwerl:header(Token) of
++        Header when is_map(Header) ->
++            Keys = matching_keys(maps:get(kid, Header, undefined),
++                                 persistent_term:get({?MODULE, HostType, keys})),
++            verify_with_keys(Token, Keys, {error, no_matching_key});
++        _ ->
++            {error, invalid_token}
++    catch _:_ ->
++            {error, invalid_token}
++    end.
++
++-spec matching_keys(binary() | undefined, [key()]) -> [key()].
++matching_keys(Kid, Keys) when is_binary(Kid) ->
++    [Key || Key = #{kid := KeyKid} <- Keys, KeyKid =:= Kid orelse KeyKid =:= undefined];
++matching_keys(_, Keys) ->
++    Keys.
++
++-spec verify_with_keys(binary(), [key()], {error, term()}) -> {ok, map()} | {error, term()}.
++verify_with_keys(_Token, [], LastError) ->
++    LastError;
++verify_with_keys(Token, [#{algorithm := Alg, secret := Secret} | Keys], _LastError) ->
++    Result = case secret_value(Secret) of
++                 {ok, Key} ->
++                     %% Errors are not logged, as they could contain the token
++                     try jwerl:verify(Token, Alg, Key)
++                     catch _:_ -> {error, invalid_token}
++                     end;
++                 {error, _} = SecretError ->
++                     SecretError
++             end,
++    case Result of
++        {ok, TokenData} when is_map(TokenData) -> {ok, TokenData};
++        {error, _} = Error -> verify_with_keys(Token, Keys, Error);
++        _ -> verify_with_keys(Token, Keys, {error, invalid_token})
+     end.
+ 
++-spec secret_value(secret()) -> {ok, binary()} | {error, {env_var_not_set, string()}}.
++secret_value({env, Var}) ->
++    case os:getenv(Var) of
++        false -> {error, {env_var_not_set, Var}};
++        Value -> {ok, list_to_binary(Value)}
++    end;
++secret_value(Key) when is_binary(Key) ->
++    {ok, Key}.
++
++-spec check_claims(map(), jid:luser(), jid:lserver(), map()) -> ok | {error, atom()}.
++check_claims(TokenData, LUser, LServer, Opts = #{username_key := UserKey}) ->
++    Checks = [{UserKey, {equal, LUser}, wrong_user}]
++        ++ [{DomainKey, {equal, LServer}, wrong_domain}
++            || DomainKey <- [maps:get(domain_key, Opts, undefined)], DomainKey =/= undefined]
++        ++ [{iss, {equal, Issuer}, wrong_issuer}
++            || Issuer <- [maps:get(issuer, Opts, undefined)], Issuer =/= undefined]
++        ++ [{aud, {contains, Audience}, wrong_audience}
++            || Audience <- [maps:get(audience, Opts, undefined)], Audience =/= undefined],
++    check_claims(TokenData, Checks).
++
++check_claims(_TokenData, []) ->
++    ok;
++check_claims(TokenData, [{Claim, Expected, Error} | Checks]) ->
++    case claim_matches(get_claim(Claim, TokenData), Expected) of
++        true -> check_claims(TokenData, Checks);
++        false -> {error, Error}
++    end.
++
++%% jwerl decodes claim names to existing atoms only
++get_claim(Claim, TokenData) ->
++    case maps:find(Claim, TokenData) of
++        {ok, Value} -> Value;
++        error -> maps:get(atom_to_binary(Claim), TokenData, undefined)
++    end.
++
++%% The 'aud' claim can be a string or a list of strings (RFC 7519)
++claim_matches(Value, {equal, Value}) -> true;
++claim_matches(Value, {contains, Value}) -> true;
++claim_matches(Values, {contains, Value}) when is_list(Values) -> lists:member(Value, Values);
++claim_matches(_, _) -> false.
++
++%% The keys from 'secret' and 'keys'. A file is read only once during startup,
++%% and an environment variable is read on every auth request.
++-spec read_keys(mongooseim:host_type()) -> [key()].
++read_keys(HostType) ->
++    Opts = mongoose_config:get_opt([{auth, HostType}, jwt]),
++    SingleKey = case Opts of
++                    #{secret := Secret, algorithm := Alg} ->
++                        [#{kid => undefined, algorithm => Alg, secret => read_secret(Secret)}];
++                    #{} ->
++                        []
++                end,
++    SingleKey ++ [#{kid => maps:get(kid, Key, undefined),
++                    algorithm => Alg,
++                    secret => read_secret(Secret)}
++                  || Key = #{algorithm := Alg, secret := Secret} <- maps:get(keys, Opts, [])].
++
++-spec read_secret({value, binary()} | {env, string()} | {file, string()}) -> secret().
++read_secret({value, Secret}) ->
++    Secret;
++read_secret({env, Env}) ->
++    {env, Env};
++read_secret({file, Path}) ->
++    {ok, Secret} = file:read_file(Path),
++    Secret.
++
+ %% Explicit mapping, because the atoms are owned by jwerl and might not exist yet
+ -spec algorithms() -> #{binary() => algorithm()}.
+ algorithms() ->
+diff --git a/test/auth_jwt_SUITE.erl b/test/auth_jwt_SUITE.erl
+index 505cc0f..859c3ad 100644
+--- a/test/auth_jwt_SUITE.erl
++++ b/test/auth_jwt_SUITE.erl
+@@ -8,17 +8,23 @@
+ -define(USERNAME, <<"10857839">>).
+ -define(WRONG_USERNAME, <<"alice">>).
+ -define(JWT_KEY, <<"testtesttest">>).
++-define(OLD_KEY, <<"old key">>).
++-define(NEW_KEY, <<"new key">>).
+ %%--------------------------------------------------------------------
+ %% Suite configuration
+ %%--------------------------------------------------------------------
+ 
+ all() ->
+-    [{group, generic}, {group, public_key}].
++    [{group, generic}, {group, public_key}, {group, multiple_keys}, {group, claims},
++     {group, env_secret}].
+ 
+ groups() ->
+     [
+      {generic, [parallel], generic_tests()},
+-     {public_key, [], public_key_tests()}
++     {public_key, [], public_key_tests()},
++     {multiple_keys, [parallel], multiple_keys_tests()},
++     {claims, [parallel], claims_tests()},
++     {env_secret, [], env_secret_tests()}
+     ].
+ 
+ generic_tests() ->
+@@ -37,6 +43,31 @@ public_key_tests() ->
+      check_password_succeeds_for_pubkey_signed_token
+     ].
+ 
++multiple_keys_tests() ->
++    [
++     check_password_succeeds_for_any_key_without_kid,
++     check_password_uses_key_with_matching_kid,
++     check_password_fails_for_unknown_kid,
++     check_password_fails_for_unknown_key,
++     check_password_fails_for_malformed_token
++    ].
++
++claims_tests() ->
++    [
++     check_password_succeeds_for_matching_claims,
++     check_password_succeeds_for_audience_list,
++     check_password_fails_for_wrong_issuer,
++     check_password_fails_for_wrong_audience,
++     check_password_fails_for_wrong_domain,
++     check_password_fails_for_missing_claims
++    ].
++
++env_secret_tests() ->
++    [
++     check_password_reads_secret_from_env,
++     check_password_fails_when_env_var_is_not_set
++    ].
++
+ suite() ->
+     [].
+ 
+@@ -64,6 +95,22 @@ init_per_group(public_key, Config) ->
+     set_auth_opts({file, PubkeyPath}, rs256, bookingNumber),
+     ok = ejabberd_auth_jwt:start(?HOST_TYPE),
+     [{priv_key, PrivKey} | Config];
++init_per_group(multiple_keys, Config) ->
++    set_jwt_opts(#{username_key => bookingNumber,
++                   keys => [#{kid => <<"old">>, algorithm => hs256, secret => {value, ?OLD_KEY}},
++                            #{kid => <<"new">>, algorithm => hs256, secret => {value, ?NEW_KEY}}]}),
++    ok = ejabberd_auth_jwt:start(?HOST_TYPE),
++    Config;
++init_per_group(claims, Config) ->
++    set_jwt_opts(#{secret => {value, ?JWT_KEY}, algorithm => hs256,
++                   username_key => bookingNumber, domain_key => domain,
++                   issuer => <<"https://issuer.example.com">>, audience => <<"chat">>}),
++    ok = ejabberd_auth_jwt:start(?HOST_TYPE),
++    Config;
++init_per_group(env_secret, Config) ->
++    set_auth_opts({env, "JWT_TEST_SECRET"}, hs256, bookingNumber),
++    ok = ejabberd_auth_jwt:start(?HOST_TYPE),
++    Config;
+ init_per_group(_, Config) ->
+     set_auth_opts({value, ?JWT_KEY}, hs256, bookingNumber),
+     ok = ejabberd_auth_jwt:start(?HOST_TYPE),
+@@ -123,10 +170,88 @@ check_password_succeeds_for_pubkey_signed_token(C) ->
+     true = ejabberd_auth_jwt:check_password(?HOST_TYPE, ?USERNAME, ?DOMAIN,
+                                             generate_token(rs256, 0, Key)).
+ 
++check_password_succeeds_for_any_key_without_kid(_C) ->
++    true = check_token(make_token(#{}, claims(), ?OLD_KEY)),
++    true = check_token(make_token(#{}, claims(), ?NEW_KEY)).
++
++check_password_uses_key_with_matching_kid(_C) ->
++    true = check_token(make_token(#{kid => <<"new">>}, claims(), ?NEW_KEY)),
++    true = check_token(make_token(#{kid => <<"old">>}, claims(), ?OLD_KEY)),
++    false = check_token(make_token(#{kid => <<"new">>}, claims(), ?OLD_KEY)).
++
++check_password_fails_for_unknown_kid(_C) ->
++    false = check_token(make_token(#{kid => <<"other">>}, claims(), ?NEW_KEY)).
++
++check_password_fails_for_unknown_key(_C) ->
++    false = check_token(make_token(#{}, claims(), <<"some other key">>)).
++
++check_password_fails_for_malformed_token(_C) ->
++    [false = check_token(Token) || Token <- [<<>>, <<"abc">>, <<"a.b">>, <<"a.b.c">>,
++                                             <<"!!!.???.***">>]].
++
++check_password_succeeds_for_matching_claims(_C) ->
++    true = check_token(make_token(#{}, full_claims(#{}), ?JWT_KEY)).
++
++check_password_succeeds_for_audience_list(_C) ->
++    true = check_token(make_token(#{}, full_claims(#{aud => [<<"web">>, <<"chat">>]}), ?JWT_KEY)).
++
++check_password_fails_for_wrong_issuer(_C) ->
++    false = check_token(make_token(#{}, full_claims(#{iss => <<"https://evil.example.com">>}),
++                                   ?JWT_KEY)).
++
++check_password_fails_for_wrong_audience(_C) ->
++    false = check_token(make_token(#{}, full_claims(#{aud => <<"web">>}), ?JWT_KEY)),
++    false = check_token(make_token(#{}, full_claims(#{aud => [<<"web">>]}), ?JWT_KEY)).
++
++check_password_fails_for_wrong_domain(_C) ->
++    false = check_token(make_token(#{}, full_claims(#{domain => <<"other.example.com">>}),
++                                   ?JWT_KEY)).
++
++check_password_fails_for_missing_claims(_C) ->
++    [false = check_token(make_token(#{}, maps:remove(Claim, full_claims(#{})), ?JWT_KEY))
++     || Claim <- [iss, aud, domain, bookingNumber]].
++
++check_password_reads_secret_from_env(_C) ->
++    os:putenv("JWT_TEST_SECRET", binary_to_list(?JWT_KEY)),
++    try
++        true = check_token(generate_token(hs256, 0, ?JWT_KEY))
++    after
++        os:unsetenv("JWT_TEST_SECRET")
++    end.
++
++check_password_fails_when_env_var_is_not_set(_C) ->
++    false = check_token(generate_token(hs256, 0, ?JWT_KEY)).
++
+ %%--------------------------------------------------------------------
+ %% Helpers
+ %%--------------------------------------------------------------------
+ 
++check_token(Token) ->
++    ejabberd_auth_jwt:check_password(?HOST_TYPE, ?USERNAME, ?DOMAIN, Token).
++
++claims() ->
++    Now = erlang:system_time(second),
++    #{bookingNumber => ?USERNAME, exp => Now + 60, iat => Now}.
++
++full_claims(Extra) ->
++    maps:merge(claims(), maps:merge(#{iss => <<"https://issuer.example.com">>,
++                                      aud => <<"chat">>,
++                                      domain => ?DOMAIN}, Extra)).
++
++%% jwerl:sign/3 can't set the 'kid' header, so HS256 tokens are built here
++make_token(ExtraHeader, Claims, Key) ->
++    Header = base64url(jsx:encode(maps:merge(#{alg => <<"HS256">>, typ => <<"JWT">>}, ExtraHeader))),
++    Payload = base64url(jsx:encode(Claims)),
++    Input = <<Header/binary, ".", Payload/binary>>,
++    Signature = base64url(crypto:mac(hmac, sha256, Key, Input)),
++    <<Input/binary, ".", Signature/binary>>.
++
++base64url(Bin) ->
++    base64:encode(Bin, #{mode => urlsafe, padding => false}).
++
++set_jwt_opts(Opts) ->
++    mongoose_config:set_opts(#{{auth, ?HOST_TYPE} => #{jwt => Opts}}).
++
+ set_auth_opts(Secret, Algorithm, Key) ->
+     mongoose_config:set_opts(#{{auth, ?HOST_TYPE} => #{jwt => #{secret => Secret,
+                                                                 algorithm => Algorithm,
+diff --git a/test/config_parser_SUITE.erl b/test/config_parser_SUITE.erl
+index 9a1ccce..e705c8a 100644
+--- a/test/config_parser_SUITE.erl
++++ b/test/config_parser_SUITE.erl
+@@ -860,7 +860,34 @@ auth_jwt(_Config) ->
+                                                       <<"env">> => <<"SECRET">>}})),
+     ?errh(auth_raw(<<"jwt">>, Opts#{<<"algorithm">> := <<"bruteforce">>})),
+     ?errh(auth_raw(<<"jwt">>, Opts#{<<"username_key">> := <<>>})),
+-    [?errh(auth_raw(<<"jwt">>, maps:without([K], Opts))) || K <- maps:keys(Opts)].
++    [?errh(auth_raw(<<"jwt">>, maps:without([K], Opts))) || K <- maps:keys(Opts)],
++    %% Several keys, selected by 'kid'
++    RawKeys = [#{<<"kid">> => <<"2026-11">>, <<"algorithm">> => <<"RS256">>,
++                 <<"secret">> => #{<<"file">> => <<"priv/jwt_secret">>}},
++               #{<<"algorithm">> => <<"HS256">>, <<"secret">> => #{<<"env">> => <<"SECRET">>}}],
++    Keys = [#{kid => <<"2026-11">>, algorithm => rs256, secret => {file, "priv/jwt_secret"}},
++            #{algorithm => hs256, secret => {env, "SECRET"}}],
++    KeysOpts = maps:without([<<"secret">>, <<"algorithm">>], Opts#{<<"keys">> => RawKeys}),
++    ?cfgh([auth, jwt], #{keys => Keys, username_key => user},
++          auth_raw(<<"jwt">>, KeysOpts)),
++    ?cfgh([auth, jwt], Config#{keys => Keys},
++          auth_raw(<<"jwt">>, Opts#{<<"keys">> => RawKeys})),
++    ?errh(auth_raw(<<"jwt">>, KeysOpts#{<<"keys">> => []})),
++    ?errh(auth_raw(<<"jwt">>, KeysOpts#{<<"keys">> => [#{<<"algorithm">> => <<"HS256">>}]})),
++    ?errh(auth_raw(<<"jwt">>, KeysOpts#{<<"keys">> => [#{<<"secret">> => #{<<"value">> => <<"s">>}}]})),
++    ?errh(auth_raw(<<"jwt">>, KeysOpts#{<<"keys">> => [#{<<"kid">> => <<>>,
++                                                       <<"algorithm">> => <<"HS256">>,
++                                                       <<"secret">> => #{<<"value">> => <<"s">>}}]})),
++    %% Claim checks
++    ?cfgh([auth, jwt, issuer], <<"https://example.com">>,
++          auth_raw(<<"jwt">>, Opts#{<<"issuer">> => <<"https://example.com">>})),
++    ?cfgh([auth, jwt, audience], <<"chat">>,
++          auth_raw(<<"jwt">>, Opts#{<<"audience">> => <<"chat">>})),
++    ?cfgh([auth, jwt, domain_key], domain,
++          auth_raw(<<"jwt">>, Opts#{<<"domain_key">> => <<"domain">>})),
++    ?errh(auth_raw(<<"jwt">>, Opts#{<<"issuer">> => <<>>})),
++    ?errh(auth_raw(<<"jwt">>, Opts#{<<"audience">> => 1})),
++    ?errh(auth_raw(<<"jwt">>, Opts#{<<"domain_key">> => <<>>})).
+ 
+ auth_rdbms_users_number_estimate(_Config) ->
+     ?cfgh([auth, rdbms, users_number_estimate], false, auth_raw(<<"rdbms">>, #{})), % default
+-- 
+2.43.0
+

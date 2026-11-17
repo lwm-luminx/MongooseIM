@@ -1,0 +1,889 @@
+From 97ff5386dddd42dab70e82382a9301096aa558bf Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 16 Nov 2026 20:32:22 +0000
+Subject: [PATCH] Implement XEP-0425 moderated message retraction in MUC rooms
+
+Room moderators can retract any message in a room by its stanza ID with
+`<moderate xmlns='urn:xmpp:message-moderate:1'>`. The room removes the
+message from its history, broadcasts the retraction from its bare JID,
+and runs the new `moderate_room_message` hook. mod_mam_muc_rdbms_arch
+handles the hook by replacing the archived message with a tombstone that
+keeps the moderator and the reason.
+
+Add the `muc.moderateMessage` admin GraphQL command, which retracts a
+message on behalf of the room, also in a persistent room that is not
+running.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01ETaRHXo1LmPHqZB9SXMucM
+---
+ big_tests/tests/graphql_muc_SUITE.erl         |  80 ++++++++-
+ big_tests/tests/mam_SUITE.erl                 | 152 +++++++++++++++++-
+ big_tests/tests/muc_SUITE.erl                 |   5 +-
+ doc/developers-guide/hooks_description.md     |   1 +
+ doc/modules/mod_mam.md                        |   3 +
+ doc/modules/mod_muc.md                        |  32 ++++
+ include/mongoose_ns.hrl                       |   2 +
+ priv/graphql/schemas/admin/muc.gql            |   3 +
+ .../mongoose_graphql_muc_admin_mutation.erl   |   7 +
+ src/hooks/mongoose_hooks.erl                  |  11 ++
+ src/mam/mod_mam_muc_rdbms_arch.erl            |  43 +++++
+ src/mam/mod_mam_utils.erl                     |  17 ++
+ src/muc/mod_muc_api.erl                       |  13 ++
+ src/muc/mod_muc_room.erl                      | 151 +++++++++++++++++
+ 14 files changed, 515 insertions(+), 5 deletions(-)
+
+diff --git a/big_tests/tests/graphql_muc_SUITE.erl b/big_tests/tests/graphql_muc_SUITE.erl
+index 510a104..5275eb9 100644
+--- a/big_tests/tests/graphql_muc_SUITE.erl
++++ b/big_tests/tests/graphql_muc_SUITE.erl
+@@ -153,7 +153,10 @@ admin_muc_tests() ->
+ 
+ admin_muc_with_mam_tests() ->
+     [admin_get_room_messages,
+-     admin_try_get_nonexistent_room_messages].
++     admin_try_get_nonexistent_room_messages,
++     admin_moderate_message,
++     admin_try_moderate_unknown_message,
++     admin_try_moderate_message_in_nonexistent_room].
+ 
+ admin_muc_not_configured_tests() ->
+     [admin_delete_room_muc_not_configured,
+@@ -162,6 +165,7 @@ admin_muc_not_configured_tests() ->
+      admin_get_room_config_muc_not_configured,
+      admin_invite_user_muc_not_configured,
+      admin_kick_user_muc_not_configured,
++     admin_moderate_message_muc_not_configured,
+      admin_send_message_to_room_muc_not_configured,
+      admin_send_private_message_muc_not_configured,
+      admin_get_room_messages_muc_or_mam_not_configured,
+@@ -192,6 +196,7 @@ domain_admin_muc_tests() ->
+      admin_kick_user,
+      admin_try_kick_user_from_room_without_moderators,
+      domain_admin_kick_user_no_permission,
++     domain_admin_moderate_message_no_permission,
+      admin_send_message_to_room,
+      domain_admin_send_message_to_room_no_permission,
+      admin_send_private_message,
+@@ -341,6 +346,7 @@ end_per_testcase(TC, Config) ->
+ -define(LIST_ROOMS_PATH, [data, muc, listRooms]).
+ -define(INVITE_USER_PATH, [data, muc, inviteUser]).
+ -define(KICK_USER_PATH, [data, muc, kickUser]).
++-define(MODERATE_MESSAGE_PATH, [data, muc, moderateMessage]).
+ -define(DELETE_ROOM_PATH, [data, muc, deleteRoom]).
+ -define(SEND_MESSAGE_PATH, [data, muc, sendMessageToRoom]).
+ -define(SEND_PRIV_MESG_PATH, [data, muc, sendPrivateMessage]).
+@@ -673,6 +679,66 @@ admin_get_room_messages_story(Config, Alice, Bob) ->
+         get_ok_value(?GET_MESSAGES_PATH, Res),
+     ?assertMatch({ok, #xmlel{name = <<"message">>}}, exml:parse(StanzaXML)).
+ 
++admin_moderate_message(Config) ->
++    muc_helper:story_with_room(Config, [], [{alice, 1}, {bob, 1}],
++                               fun admin_moderate_message_story/3).
++
++admin_moderate_message_story(Config, Alice, Bob) ->
++    RoomJID = #jid{luser = RoomName, lserver = MUCDomain} =
++        jid:from_binary(?config(room_jid, Config)),
++    RoomJIDBin = jid:to_binary(RoomJID),
++    enter_room(RoomJID, Bob, <<"Bobek">>),
++    enter_room(RoomJID, Alice, <<"Ali">>),
++    escalus:wait_for_stanzas(Bob, 2),
++    send_message_to_room(RoomJID, Bob, <<"Buy cheap watches!">>, Config),
++    Msg = escalus:wait_for_stanza(Bob),
++    StanzaId = exml_query:path(Msg, [{element, <<"stanza-id">>}, {attr, <<"id">>}]),
++    mam_helper:wait_for_room_archive_size(MUCDomain, RoomName, 1),
++    Reason = <<"Spam">>,
++    Res = moderate_message(RoomJID, StanzaId, Reason, Config),
++    ?assertNotEqual(nomatch, binary:match(get_ok_value(?MODERATE_MESSAGE_PATH, Res),
++                                          <<"successfully">>)),
++    %% Bob receives the retraction from the room itself
++    Retraction = escalus:wait_for_stanza(Bob),
++    ?assertEqual(RoomJIDBin, exml_query:attr(Retraction, <<"from">>)),
++    Retract = exml_query:subelement_with_ns(Retraction, <<"urn:xmpp:message-retract:1">>),
++    ?assertEqual(StanzaId, exml_query:attr(Retract, <<"id">>)),
++    ?assertEqual(RoomJIDBin, exml_query:path(Retract, [{element, <<"moderated">>},
++                                                       {attr, <<"by">>}])),
++    ?assertEqual(Reason, exml_query:path(Retract, [{element, <<"reason">>}, cdata])),
++    case mam_helper:backend() of
++        rdbms ->
++            %% The room archive has a tombstone in place of the message
++            Res2 = get_room_messages(RoomJID, 50, null, Config),
++            #{<<"stanzas">> := [#{<<"stanza">> := StanzaXML}]} =
++                get_ok_value(?GET_MESSAGES_PATH, Res2),
++            {ok, Tombstone} = exml:parse(StanzaXML),
++            ?assertEqual(undefined, exml_query:subelement(Tombstone, <<"body">>)),
++            ?assertMatch(#xmlel{name = <<"retracted">>},
++                         exml_query:subelement_with_ns(Tombstone,
++                                                       <<"urn:xmpp:message-retract:1">>));
++        _ ->
++            ok
++    end.
++
++admin_try_moderate_unknown_message(Config) ->
++    case mam_helper:backend() of
++        rdbms ->
++            muc_helper:story_with_room(Config, [], [{alice, 1}],
++                                       fun admin_try_moderate_unknown_message_story/2);
++        _ ->
++            {skip, "message moderation is supported only by the rdbms backend"}
++    end.
++
++admin_try_moderate_unknown_message_story(Config, _Alice) ->
++    RoomJID = jid:from_binary(?config(room_jid, Config)),
++    Res = moderate_message(RoomJID, <<"B2GIQ57T4T81">>, null, Config),
++    ?assertNotEqual(nomatch, binary:match(get_err_msg(Res), <<"not found">>)).
++
++admin_try_moderate_message_in_nonexistent_room(Config) ->
++    Res = moderate_message(?NONEXISTENT_ROOM2, <<"B2GIQ57T4T81">>, null, Config),
++    ?assertNotEqual(nomatch, binary:match(get_err_msg(Res), <<"not found">>)).
++
+ admin_try_get_nonexistent_room_messages(Config) ->
+     Res = get_room_messages(?NONEXISTENT_ROOM, null, null, Config),
+     ?assertNotEqual(nomatch, binary:match(get_err_msg(Res), <<"not found">>)).
+@@ -885,6 +951,10 @@ admin_kick_user_muc_not_configured(Config) ->
+     Res = kick_user(get_room_name(), <<"nick">>, <<"reason">>, Config),
+     get_not_loaded(Res).
+ 
++admin_moderate_message_muc_not_configured(Config) ->
++    Res = moderate_message(get_room_name(), <<"B2GIQ57T4T81">>, null, Config),
++    get_not_loaded(Res).
++
+ admin_send_message_to_room_muc_not_configured(Config) ->
+     escalus:fresh_story_with_config(Config, [{alice, 1}],
+         fun admin_send_message_to_room_muc_not_configured_story/2).
+@@ -1013,6 +1083,10 @@ domain_admin_kick_user_no_permission(Config) ->
+     get_unauthorized(kick_user(?NONEXISTENT_ROOM, <<"ali">>, null, Config)),
+     get_unauthorized(kick_user(?EXTERNAL_DOMAIN_ROOM, <<"ali">>, null, Config)).
+ 
++domain_admin_moderate_message_no_permission(Config) ->
++    get_unauthorized(moderate_message(?NONEXISTENT_ROOM, <<"id">>, null, Config)),
++    get_unauthorized(moderate_message(?EXTERNAL_DOMAIN_ROOM, <<"id">>, null, Config)).
++
+ domain_admin_send_message_to_room_no_permission(Config) ->
+     muc_helper:story_with_room(Config, [], [{alice_bis, 1}],
+                                 fun domain_admin_send_message_to_room_no_permission_story/2).
+@@ -2003,6 +2077,10 @@ kick_user(Room, Nick, Reason, Config) ->
+     Vars = #{room => jid:to_binary(Room), nick => Nick, reason => Reason},
+     execute_command(<<"muc">>, <<"kickUser">>, Vars, Config).
+ 
++moderate_message(Room, StanzaId, Reason, Config) ->
++    Vars = #{room => jid:to_binary(Room), stanzaId => StanzaId, reason => Reason},
++    execute_command(<<"muc">>, <<"moderateMessage">>, Vars, Config).
++
+ send_message_to_room(Room, From, Body, Config) ->
+     Vars = #{room => jid:to_binary(Room), from => user_to_full_bin(From), body => Body},
+     execute_command(<<"muc">>, <<"sendMessageToRoom">>, Vars, Config).
+diff --git a/big_tests/tests/mam_SUITE.erl b/big_tests/tests/mam_SUITE.erl
+index 1b4139a..abab74f 100644
+--- a/big_tests/tests/mam_SUITE.erl
++++ b/big_tests/tests/mam_SUITE.erl
+@@ -404,10 +404,15 @@ muc_stanzaid_cases() ->
+ muc_retract_cases() ->
+     [retract_muc_message,
+      retract_muc_message_on_stanza_id,
+-     retract_wrong_muc_message].
++     retract_wrong_muc_message,
++     moderate_muc_message,
++     moderate_muc_message_by_participant_is_forbidden,
++     moderate_unknown_muc_message,
++     moderate_muc_message_without_retract_element].
+ 
+ disabled_muc_retract_cases() ->
+-    [retract_muc_message].
++    [retract_muc_message,
++     moderate_muc_message].
+ 
+ muc_configurable_archiveid_cases() ->
+     [
+@@ -912,7 +917,11 @@ maybe_skip(C, Config) when C =:= retract_message;
+                            C =:= retract_message_on_stanza_id;
+                            C =:= retract_muc_message;
+                            C =:= retract_muc_message_on_stanza_id;
+-                           C =:= retract_wrong_muc_message ->
++                           C =:= retract_wrong_muc_message;
++                           C =:= moderate_muc_message;
++                           C =:= moderate_muc_message_by_participant_is_forbidden;
++                           C =:= moderate_unknown_muc_message;
++                           C =:= moderate_muc_message_without_retract_element ->
+     ConfList = rdbms_configs(true, ct_helper:get_internal_database()),
+     skip_if(not lists:member(?config(configuration, Config), ConfList),
+             "message retraction not supported");
+@@ -2497,6 +2506,111 @@ test_retract_muc_message(Config) ->
+     end,
+     escalus:story(Config, [{alice, 1}, {bob, 1}], F).
+ 
++moderate_muc_message(Config) ->
++    P = ?config(props, Config),
++    F = fun(Alice, Bob, Kate) ->
++        Room = ?config(room, Config),
++        RoomAddr = room_address(Room),
++        enter_room_with_alice_and_bob(Room, Alice, Bob),
++
++        %% GIVEN Bob sends a message to the room
++        Body = <<"Buy cheap watches!">>,
++        escalus:send(Bob, escalus_stanza:groupchat_to(RoomAddr, Body)),
++        BobCopyOfMessage = escalus:wait_for_stanza(Bob),
++        escalus:wait_for_stanza(Alice),
++        StanzaId = stanza_id_from_msg(BobCopyOfMessage),
++        maybe_wait_for_archive(Config),
++
++        %% WHEN Alice, the room owner, retracts it as a moderator
++        Reason = <<"Spam">>,
++        escalus:send(Alice, moderate_iq(RoomAddr, StanzaId, Reason)),
++
++        %% THEN Alice gets a result and everyone in the room gets the retraction from the room
++        AliceStanzas = escalus:wait_for_stanzas(Alice, 2),
++        escalus:assert_many([is_iq_result, is_message], AliceStanzas),
++        ModeratorJID = <<RoomAddr/binary, "/", (nick(Alice))/binary>>,
++        [assert_moderation_message(Msg, RoomAddr, StanzaId, ModeratorJID, Reason)
++         || Msg <- [escalus:wait_for_stanza(Bob) |
++                    [S || S <- AliceStanzas, escalus_pred:is_message(S)]]],
++
++        %% ... the message is gone from the room history
++        escalus:send(Kate, stanza_muc_enter_room(Room, nick(Kate))),
++        %% Kate receives three presences and the subject, without the retracted message
++        KateStanzas = escalus:wait_for_stanzas(Kate, 4),
++        Subject = lists:last(KateStanzas),
++        ?assertNotEqual(undefined, exml_query:subelement(Subject, <<"subject">>)),
++        escalus_assert:has_no_stanzas(Kate),
++
++        %% ... and the room archive has a tombstone in place of the message
++        escalus:send(Bob, stanza_to_room(stanza_archive_request(P, <<"q1">>), Room)),
++        [ArcMsg] = respond_messages(assert_respond_size(1, wait_archive_respond(Bob))),
++        Parsed = parse_forwarded_message(ArcMsg),
++        case message_retraction_is_enabled(Config) of
++            true ->
++                #forwarded_message{message_body = undefined,
++                                   message_children = [Retracted]} = Parsed,
++                ?assertEqual(<<"urn:xmpp:message-retract:1">>,
++                             exml_query:attr(Retracted, <<"xmlns">>)),
++                ?assertEqual(ModeratorJID,
++                             exml_query:path(Retracted, [{element_with_ns, <<"moderated">>,
++                                                          moderate_ns()},
++                                                         {attr, <<"by">>}])),
++                ?assertEqual(Reason, exml_query:path(Retracted, [{element, <<"reason">>}, cdata]));
++            false ->
++                #forwarded_message{message_body = Body} = Parsed
++        end
++    end,
++    escalus:story(Config, [{alice, 1}, {bob, 1}, {kate, 1}], F).
++
++moderate_muc_message_by_participant_is_forbidden(Config) ->
++    P = ?config(props, Config),
++    F = fun(Alice, Bob) ->
++        Room = ?config(room, Config),
++        RoomAddr = room_address(Room),
++        enter_room_with_alice_and_bob(Room, Alice, Bob),
++        Body = <<"Hi, Bob!">>,
++        escalus:send(Alice, escalus_stanza:groupchat_to(RoomAddr, Body)),
++        AliceCopyOfMessage = escalus:wait_for_stanza(Alice),
++        escalus:wait_for_stanza(Bob),
++        maybe_wait_for_archive(Config),
++
++        %% Bob is only a participant
++        escalus:send(Bob, moderate_iq(RoomAddr, stanza_id_from_msg(AliceCopyOfMessage), undefined)),
++        escalus:assert(is_error, [<<"auth">>, <<"forbidden">>], escalus:wait_for_stanza(Bob)),
++        escalus_assert:has_no_stanzas(Alice),
++
++        escalus:send(Bob, stanza_to_room(stanza_archive_request(P, <<"q1">>), Room)),
++        [ArcMsg] = respond_messages(assert_respond_size(1, wait_archive_respond(Bob))),
++        #forwarded_message{message_body = Body} = parse_forwarded_message(ArcMsg)
++    end,
++    escalus:story(Config, [{alice, 1}, {bob, 1}], F).
++
++moderate_unknown_muc_message(Config) ->
++    F = fun(Alice) ->
++        Room = ?config(room, Config),
++        RoomAddr = room_address(Room),
++        escalus:send(Alice, stanza_muc_enter_room(Room, nick(Alice))),
++        escalus:wait_for_stanzas(Alice, 2),
++        [escalus:send(Alice, moderate_iq(RoomAddr, Id, undefined))
++         || Id <- [<<"not-an-id">>, <<"B2GIQ57T4T81">>]],
++        [escalus:assert(is_error, [<<"cancel">>, <<"item-not-found">>], Stanza)
++         || Stanza <- escalus:wait_for_stanzas(Alice, 2)]
++    end,
++    escalus:story(Config, [{alice, 1}], F).
++
++moderate_muc_message_without_retract_element(Config) ->
++    F = fun(Alice) ->
++        Room = ?config(room, Config),
++        RoomAddr = room_address(Room),
++        escalus:send(Alice, stanza_muc_enter_room(Room, nick(Alice))),
++        escalus:wait_for_stanzas(Alice, 2),
++        Moderate = #xmlel{name = <<"moderate">>,
++                          attrs = #{<<"xmlns">> => moderate_ns(), <<"id">> => <<"B2GIQ57T4T81">>}},
++        escalus:send(Alice, escalus_stanza:to(escalus_stanza:iq(<<"set">>, [Moderate]), RoomAddr)),
++        escalus:assert(is_error, [<<"modify">>, <<"bad-request">>], escalus:wait_for_stanza(Alice))
++    end,
++    escalus:story(Config, [{alice, 1}], F).
++
+ muc_archive_is_instrumented(Config) ->
+     F = fun(Alice, Bob) ->
+         Room = ?config(room, Config),
+@@ -4195,6 +4309,38 @@ then_pm_message_is_received(Receiver, Body) ->
+ 
+ %% Message retraction helpers
+ 
++enter_room_with_alice_and_bob(Room, Alice, Bob) ->
++    escalus:send(Alice, stanza_muc_enter_room(Room, nick(Alice))),
++    escalus:send(Bob, stanza_muc_enter_room(Room, nick(Bob))),
++    %% Bob receives two presences and the room's subject
++    escalus:wait_for_stanzas(Bob, 3),
++    %% Alice receives all the stanzas Bob did as well
++    escalus:wait_for_stanzas(Alice, 3).
++
++moderate_ns() -> <<"urn:xmpp:message-moderate:1">>.
++
++moderate_iq(RoomAddr, StanzaId, Reason) ->
++    ReasonEls = [#xmlel{name = <<"reason">>, children = [#xmlcdata{content = Reason}]}
++                 || is_binary(Reason)],
++    Moderate = #xmlel{name = <<"moderate">>,
++                      attrs = #{<<"xmlns">> => moderate_ns(), <<"id">> => StanzaId},
++                      children = [#xmlel{name = <<"retract">>,
++                                         attrs = #{<<"xmlns">> => <<"urn:xmpp:message-retract:1">>}}
++                                  | ReasonEls]},
++    escalus_stanza:to(escalus_stanza:iq(<<"set">>, [Moderate]), RoomAddr).
++
++assert_moderation_message(Msg, RoomAddr, StanzaId, ModeratorJID, Reason) ->
++    escalus:assert(is_message, Msg),
++    ?assertEqual(<<"groupchat">>, exml_query:attr(Msg, <<"type">>)),
++    ?assertEqual(RoomAddr, exml_query:attr(Msg, <<"from">>)),
++    Retract = exml_query:subelement_with_ns(Msg, <<"urn:xmpp:message-retract:1">>),
++    ?assertEqual(<<"retract">>, Retract#xmlel.name),
++    ?assertEqual(StanzaId, exml_query:attr(Retract, <<"id">>)),
++    ?assertEqual(ModeratorJID, exml_query:path(Retract, [{element_with_ns, <<"moderated">>,
++                                                          moderate_ns()},
++                                                         {attr, <<"by">>}])),
++    ?assertEqual(Reason, exml_query:path(Retract, [{element, <<"reason">>}, cdata])).
++
+ check_archive_after_retraction(Config, Client, ApplyToElement, Body) ->
+     case message_should_be_retracted(Config) of
+         true -> expect_tombstone_and_retraction_message(Client, ApplyToElement);
+diff --git a/big_tests/tests/muc_SUITE.erl b/big_tests/tests/muc_SUITE.erl
+index dc4dab6..1713544 100644
+--- a/big_tests/tests/muc_SUITE.erl
++++ b/big_tests/tests/muc_SUITE.erl
+@@ -71,6 +71,7 @@
+ -define(NS_MUC_REQUEST, <<"http://jabber.org/protocol/muc#request">>).
+ -define(NS_MUC_ROOMCONFIG, <<"http://jabber.org/protocol/muc#roomconfig">>).
+ -define(NS_MUC_STABLE_ID, <<"http://jabber.org/protocol/muc#stable_id">>).
++-define(NS_MESSAGE_MODERATE, <<"urn:xmpp:message-moderate:1">>).
+ 
+ 
+ -define(assert_equal(E, V), (
+@@ -3501,6 +3502,7 @@ disco_info_with_mam(Config) ->
+ muc_namespaces() ->
+     [?NS_MUC,
+      ?NS_MUC_STABLE_ID,
++     ?NS_MESSAGE_MODERATE,
+      <<"muc_public">>,
+      <<"muc_persistent">>,
+      <<"muc_open">>,
+@@ -3725,7 +3727,8 @@ disco_info_locked_room(Config) ->
+                      Alice, stanza_to_room(escalus_stanza:iq_get(?NS_DISCO_INFO,[]), RoomName)),
+ 
+         %% THEN receives MUC features
+-        Namespaces = [?NS_MUC, ?NS_MUC_STABLE_ID, <<"muc_public">>, <<"muc_temporary">>,
++        Namespaces = [?NS_MUC, ?NS_MUC_STABLE_ID, ?NS_MESSAGE_MODERATE,
++                      <<"muc_public">>, <<"muc_temporary">>,
+                       <<"muc_open">>, <<"muc_semianonymous">>, <<"muc_moderated">>,
+                       <<"muc_unsecured">>],
+         has_features(Stanza, Namespaces)
+diff --git a/doc/developers-guide/hooks_description.md b/doc/developers-guide/hooks_description.md
+index d8ce925..76c80d8 100644
+--- a/doc/developers-guide/hooks_description.md
++++ b/doc/developers-guide/hooks_description.md
+@@ -306,6 +306,7 @@ This is the perfect place to plug in custom security control.
+ * message_routed
+ * mod_global_distrib_known_recipient
+ * mod_global_distrib_unknown_recipient
++* moderate_room_message
+ * node_cleanup
+ * offline_groupchat_message
+ * offline_message
+diff --git a/doc/modules/mod_mam.md b/doc/modules/mod_mam.md
+index 5b1203d..138be2c 100644
+--- a/doc/modules/mod_mam.md
++++ b/doc/modules/mod_mam.md
+@@ -28,6 +28,9 @@ The following criteria are used to find the original message:
+ 
+ If more than one message matches the criteria, only the most recent one is retracted. To avoid this case, it is recommended to use a unique identifier (UUID) as the origin ID.
+ 
++#### Moderated retraction
++Messages retracted by room moderators with [XEP-0425: Moderated Message Retraction](https://xmpp.org/extensions/xep-0425.html) are replaced in the room archive with a tombstone that keeps the moderator's occupant JID and the reason. See [`mod_muc`](mod_muc.md#message-moderation) for details. This also requires an RDBMS backend and the [`message_retraction`](#modulesmod_mammessage_retraction) option.
++
+ #### Retraction on the stanza-id
+ This module also implements an extension to the XEP, where it allows to specify the [`stanza-id`](https://xmpp.org/extensions/xep-0359.html#stanza-id) as [created by](https://xmpp.org/extensions/xep-0313.html#archives_id) the server's MAM, instead of the `origin-id` that the original [XEP-0424](https://xmpp.org/extensions/xep-0424.html) specifies. It announces this capability under the namespace `urn:esl:message-retract-by-stanza-id:0`. This is specially useful in groupchats where the `stanza-id` of a message is shared and known for all participants.
+ 
+diff --git a/doc/modules/mod_muc.md b/doc/modules/mod_muc.md
+index c5f95ff..81743d3 100644
+--- a/doc/modules/mod_muc.md
++++ b/doc/modules/mod_muc.md
+@@ -7,6 +7,38 @@ It's a common XMPP group chat solution.
+ This extension consists of two Erlang modules: `mod_muc` and `mod_muc_room`, the latter being the room code itself.
+ Note that only `mod_muc` needs to be enabled in the configuration file.
+ 
++### Message moderation
++
++Rooms support [XEP-0425: Moderated Message Retraction](https://xmpp.org/extensions/xep-0425.html) (`urn:xmpp:message-moderate:1`).
++An occupant with the `moderator` role can retract any message in the room by its [stanza ID](https://xmpp.org/extensions/xep-0359.html):
++
++```xml
++<iq type='set' to='room@muc.example.com' id='retract-1'>
++  <moderate id='stanza-id-1' xmlns='urn:xmpp:message-moderate:1'>
++    <retract xmlns='urn:xmpp:message-retract:1'/>
++    <reason>Spam</reason>
++  </moderate>
++</iq>
++```
++
++The room removes the message from its history and sends the retraction to all occupants from the room's bare JID:
++
++```xml
++<message type='groupchat' from='room@muc.example.com' id='...'>
++  <retract id='stanza-id-1' xmlns='urn:xmpp:message-retract:1'>
++    <moderated by='room@muc.example.com/moderator-nick' xmlns='urn:xmpp:message-moderate:1'/>
++    <reason>Spam</reason>
++  </retract>
++</message>
++```
++
++When [MUC archiving](mod_mam.md#enable-muc-message-archive) is enabled with the `rdbms` backend, the message is also replaced with a tombstone in the room archive.
++If the message is found neither in the archive nor in the room history, the request fails with `item-not-found`.
++Other occupants get a `forbidden` error.
++
++Administrators can do the same with the `muc.moderateMessage` command of the [GraphQL admin API](../graphql-api/Admin-GraphQL.md) (or `mongooseimctl muc moderateMessage`).
++In this case the moderator is the room itself.
++
+ ## Options
+ 
+ ### `modules.mod_muc.host`
+diff --git a/include/mongoose_ns.hrl b/include/mongoose_ns.hrl
+index 0d9f0a7..17c9ede 100644
+--- a/include/mongoose_ns.hrl
++++ b/include/mongoose_ns.hrl
+@@ -115,6 +115,8 @@
+ -define(NS_FASTEN,              <<"urn:xmpp:fasten:0">>).
+ -define(NS_RETRACT,             <<"urn:xmpp:message-retract:0">>).
+ -define(NS_RETRACT_TOMBSTONE,   <<"urn:xmpp:message-retract:0#tombstone">>).
++-define(NS_RETRACT_1,           <<"urn:xmpp:message-retract:1">>).
++-define(NS_MESSAGE_MODERATE,    <<"urn:xmpp:message-moderate:1">>).
+ 
+ -define(JINGLE_NS, <<"urn:xmpp:jingle:1">>).
+ -define(JINGLE_MSG_NS, <<"urn:xmpp:jingle-message:0">>).
+diff --git a/priv/graphql/schemas/admin/muc.gql b/priv/graphql/schemas/admin/muc.gql
+index d387db4..6158e22 100644
+--- a/priv/graphql/schemas/admin/muc.gql
++++ b/priv/graphql/schemas/admin/muc.gql
+@@ -17,6 +17,9 @@ type MUCAdminMutation @protected @use(modules: ["mod_muc"]){
+   "Send a private message to a MUC room user"
+   sendPrivateMessage(room: BareJID!, from: FullJID!, toNick: ResourceName!, body: String!): String
+     @protected(type: DOMAIN, args: ["from"]) @use(args: ["room"])
++  "Retract a message from a MUC room as a moderator (XEP-0425). The message is identified by its stanza ID"
++  moderateMessage(room: BareJID!, stanzaId: String!, reason: String): String
++    @protected(type: DOMAIN, args: ["room"]) @use(args: ["room"])
+   "Remove a MUC room"
+   deleteRoom(room: BareJID!, reason: String): String
+     @protected(type: DOMAIN, args: ["room"]) @use(args: ["room"])
+diff --git a/src/graphql/admin/mongoose_graphql_muc_admin_mutation.erl b/src/graphql/admin/mongoose_graphql_muc_admin_mutation.erl
+index 5ae8439..dd716a7 100644
+--- a/src/graphql/admin/mongoose_graphql_muc_admin_mutation.erl
++++ b/src/graphql/admin/mongoose_graphql_muc_admin_mutation.erl
+@@ -22,6 +22,8 @@ execute(_Ctx, _Obj, <<"sendPrivateMessage">>, Args) ->
+     send_private_message(Args);
+ execute(_Ctx, _Obj, <<"changeRoomConfiguration">>, Args) ->
+     change_room_config(Args);
++execute(_Ctx, _Obj, <<"moderateMessage">>, Args) ->
++    moderate_message(Args);
+ execute(_Ctx, _Obj, <<"deleteRoom">>, Args) ->
+     delete_room(Args);
+ execute(_Ctx, _Obj, <<"setUserRole">>, Args) ->
+@@ -56,6 +58,11 @@ kick_user(#{<<"room">> := RoomJID, <<"nick">> := Nick, <<"reason">> := Reason})
+     Res = mod_muc_api:kick_user_from_room(RoomJID, Nick, Reason2),
+     format_result(Res, #{room => jid:to_binary(RoomJID)}).
+ 
++-spec moderate_message(map()) -> {ok, binary()} | {error, resolver_error()}.
++moderate_message(#{<<"room">> := RoomJID, <<"stanzaId">> := StanzaID, <<"reason">> := Reason}) ->
++    Res = mod_muc_api:moderate_message(RoomJID, StanzaID, null_to_undefined(Reason)),
++    format_result(Res, #{room => jid:to_binary(RoomJID), stanza_id => StanzaID}).
++
+ -spec send_message_to_room(map()) -> {ok, binary()}.
+ send_message_to_room(#{<<"room">> := RoomJID, <<"from">> := SenderJID, <<"body">> := Message}) ->
+     mod_muc_api:send_message_to_room(RoomJID, SenderJID, Message).
+diff --git a/src/hooks/mongoose_hooks.erl b/src/hooks/mongoose_hooks.erl
+index 6198107..0f1bc8f 100644
+--- a/src/hooks/mongoose_hooks.erl
++++ b/src/hooks/mongoose_hooks.erl
+@@ -133,6 +133,7 @@
+          invitation_sent/6,
+          join_room/5,
+          leave_room/5,
++         moderate_room_message/2,
+          room_packet/5,
+          update_inbox_for_muc/2]).
+ 
+@@ -1350,6 +1351,16 @@ room_packet(Server, FromNick, FromJID, JID, Packet) ->
+     Params = #{from_nick => FromNick, from_jid => FromJID, jid => JID, packet => Packet},
+     run_hook_for_host_type(room_packet, Server, ok, Params).
+ 
++%%% @doc The `moderate_room_message' hook is called when a moderator retracts a message
++%%% from a MUC room (XEP-0425). Archive handlers replace the message with a tombstone.
++%%% They return `{error, item_not_found}' if the room archive has no such message.
++-spec moderate_room_message(HostType, Params) -> Result when
++    HostType :: mongooseim:host_type(),
++    Params :: mod_muc_room:moderate_message_params(),
++    Result :: ok | {error, item_not_found}.
++moderate_room_message(HostType, Params) ->
++    run_hook_for_host_type(moderate_room_message, HostType, ok, Params).
++
+ -spec update_inbox_for_muc(HostType, Info) -> Result when
+     HostType :: mongooseim:host_type(),
+     Info :: mod_muc_room:update_inbox_for_muc_payload(),
+diff --git a/src/mam/mod_mam_muc_rdbms_arch.erl b/src/mam/mod_mam_muc_rdbms_arch.erl
+index 5e4adf1..72911f3 100644
+--- a/src/mam/mod_mam_muc_rdbms_arch.erl
++++ b/src/mam/mod_mam_muc_rdbms_arch.erl
+@@ -25,6 +25,7 @@
+          lookup_messages/3,
+          remove_archive/3,
+          remove_domain/3,
++         moderate_room_message/3,
+          get_mam_muc_gdpr_data/3]).
+ 
+ %% Called from mod_mam_muc_rdbms_async_pool_writer
+@@ -92,6 +93,7 @@ hooks(HostType) ->
+         {mam_muc_archive_size, HostType, fun ?MODULE:archive_size/3, #{}, 50},
+         {mam_muc_lookup_messages, HostType, fun ?MODULE:lookup_messages/3, #{}, 50},
+         {mam_muc_remove_archive, HostType, fun ?MODULE:remove_archive/3, #{}, 50},
++        {moderate_room_message, HostType, fun ?MODULE:moderate_room_message/3, #{}, 50},
+         {get_mam_muc_gdpr_data, HostType, fun ?MODULE:get_mam_muc_gdpr_data/3, #{}, 50}
+     ].
+ 
+@@ -117,6 +119,10 @@ register_prepared_queries(Opts) ->
+                              " WHERE room_id = ? AND sender_id = ? "
+                              " AND origin_id = ?"
+                              " ORDER BY id DESC", LimitSQL/binary>>),
++    mongoose_rdbms:prepare(mam_muc_select_message_to_moderate, mam_muc_message,
++                           [room_id, id],
++                           <<"SELECT origin_id, message FROM mam_muc_message"
++                             " WHERE room_id = ? AND id = ?">>),
+     mongoose_rdbms:prepare(mam_muc_select_messages_to_retract_on_stanza_id, mam_muc_message,
+                            [room_id, sender_id, id],
+                            <<"SELECT origin_id, message FROM mam_muc_message"
+@@ -282,6 +288,43 @@ make_tombstone(HostType, ArcID, _RetractionId,
+     TombstoneData = mam_encoder:encode_packet(Tombstone, Env),
+     execute_make_tombstone(HostType, TombstoneData, ArcID, MessID).
+ 
++%% Moderation logic (XEP-0425)
++-spec moderate_room_message(Acc, Params, Extra) -> {ok, Acc} when
++    Acc :: ok | {error, item_not_found},
++    Params :: mod_muc_room:moderate_message_params(),
++    Extra :: gen_hook:extra().
++moderate_room_message(Acc, Params = #{room_jid := RoomJID}, #{host_type := HostType}) ->
++    case mod_mam_utils:is_mam_muc_enabled(RoomJID#jid.lserver, HostType)
++         andalso mod_mam_utils:has_message_retraction(mod_mam_muc, HostType) of
++        true ->
++            {ok, moderate_room_message(HostType, Params)};
++        false ->
++            {ok, Acc}
++    end.
++
++-spec moderate_room_message(host_type(), mod_muc_room:moderate_message_params()) ->
++    ok | {error, item_not_found}.
++moderate_room_message(HostType, Params = #{room_jid := RoomJID, stanza_id := BinStanzaID}) ->
++    try mod_mam_utils:external_binary_to_mess_id(BinStanzaID) of
++        MessID ->
++            ArcID = mod_mam_muc:archive_id_int(HostType, RoomJID),
++            Env = env_vars(HostType, RoomJID),
++            {selected, Rows} =
++                mongoose_rdbms:execute_successfully(HostType, mam_muc_select_message_to_moderate,
++                                                    [ArcID, MessID]),
++            case mam_decoder:decode_retraction_info(Env, Rows, {stanza_id, BinStanzaID}) of
++                skip ->
++                    {error, item_not_found};
++                #{packet := Packet} ->
++                    Tombstone = mod_mam_utils:moderated_tombstone(Packet, Params),
++                    TombstoneData = mam_encoder:encode_packet(Tombstone, Env),
++                    execute_make_tombstone(HostType, TombstoneData, ArcID, MessID),
++                    ok
++            end
++    catch throw:invalid_stanza_id ->
++            {error, item_not_found}
++    end.
++
+ execute_select_messages_to_retract(HostType, ArcID, SenderID, {origin_id, OriginID}) ->
+     mongoose_rdbms:execute_successfully(HostType, mam_muc_select_messages_to_retract_on_origin_id,
+                                       [ArcID, SenderID, OriginID]);
+diff --git a/src/mam/mod_mam_utils.erl b/src/mam/mod_mam_utils.erl
+index 129814f..c98625f 100644
+--- a/src/mam/mod_mam_utils.erl
++++ b/src/mam/mod_mam_utils.erl
+@@ -36,6 +36,7 @@
+          is_groupchat/1,
+          should_page_be_flipped/1,
+          tombstone/2,
++         moderated_tombstone/2,
+          wrap_message/6,
+          wrap_message/7,
+          result_set/4,
+@@ -483,6 +484,22 @@ retracted_element(#{retract_on := stanza_id,
+                        MaybeOriginId
+                       ]}.
+ 
++%% @doc Replaces the content of a message retracted by a room moderator (XEP-0425).
++-spec moderated_tombstone(exml:element(), mod_muc_room:moderate_message_params()) ->
++    exml:element().
++moderated_tombstone(Packet, #{by := ByJID, reason := Reason}) ->
++    Timestamp = calendar:system_time_to_rfc3339(erlang:system_time(second), [{offset, "Z"}]),
++    Moderated = #xmlel{name = <<"moderated">>,
++                       attrs = #{<<"xmlns">> => ?NS_MESSAGE_MODERATE,
++                                 <<"by">> => jid:to_binary(ByJID)}},
++    ReasonEls = [#xmlel{name = <<"reason">>, children = [#xmlcdata{content = Reason}]}
++                 || is_binary(Reason)],
++    Retracted = #xmlel{name = <<"retracted">>,
++                       attrs = #{<<"xmlns">> => ?NS_RETRACT_1,
++                                 <<"stamp">> => list_to_binary(Timestamp)},
++                       children = [Moderated | ReasonEls]},
++    Packet#xmlel{children = [Retracted]}.
++
+ -spec maybe_append_origin_id(retraction_info()) -> [exml:element()].
+ maybe_append_origin_id(#{origin_id := OriginID}) when is_binary(OriginID), <<>> =/= OriginID ->
+     [#xmlel{name = <<"origin-id">>, attrs = #{<<"xmlns">> => ?NS_STANZAID, <<"id">> => OriginID}}];
+diff --git a/src/muc/mod_muc_api.erl b/src/muc/mod_muc_api.erl
+index b91a023..6de1a81 100644
+--- a/src/muc/mod_muc_api.erl
++++ b/src/muc/mod_muc_api.erl
+@@ -18,6 +18,7 @@
+          send_private_message/4,
+          kick_user_from_room/3,
+          kick_user_from_room/4,
++         moderate_message/3,
+          set_affiliation/3,
+          set_affiliation/4,
+          enter_room/3,
+@@ -243,6 +244,18 @@ kick_user_from_room(RoomJID, UserJID, Nick, ReasonIn) ->
+             ?ROOM_NOT_FOUND_RESULT
+     end.
+ 
++-spec moderate_message(jid:jid(), binary(), binary() | undefined) ->
++    {ok | room_not_found | message_not_found, iolist()}.
++moderate_message(RoomJID, StanzaID, Reason) ->
++    case mod_muc_room:moderate_message(RoomJID, StanzaID, Reason) of
++        ok ->
++            {ok, "Message retracted successfully"};
++        {error, item_not_found} ->
++            {message_not_found, "Message not found in the room archive"};
++        {error, not_found} ->
++            ?ROOM_NOT_FOUND_RESULT
++    end.
++
+ -spec delete_room(jid:jid(), binary()) -> {ok | room_not_found, iolist()}.
+ delete_room(RoomJID, Reason) ->
+     case mod_muc_room:delete_room(RoomJID, Reason) of
+diff --git a/src/muc/mod_muc_room.erl b/src/muc/mod_muc_room.erl
+index c331ba8..369bbd4 100644
+--- a/src/muc/mod_muc_room.erl
++++ b/src/muc/mod_muc_room.erl
+@@ -42,6 +42,7 @@
+          change_room_config/2,
+          delete_room/2,
+          remove_user/3,
++         moderate_message/3,
+          is_room_owner/2,
+          can_access_room/2,
+          can_access_identity/2]).
+@@ -149,6 +150,14 @@
+        }.
+ -export_type([update_inbox_for_muc_payload/0]).
+ 
++-type moderate_message_params() :: #{
++        room_jid := jid:jid(),
++        stanza_id := binary(),
++        by := jid:jid(),
++        reason := binary() | undefined
++       }.
++-export_type([moderate_message_params/0]).
++
+ -define(MAX_USERS_DEFAULT_LIST,
+         [5, 10, 20, 30, 50, 100, 200, 500, 1000, 2000, 5000]).
+ 
+@@ -265,6 +274,36 @@ delete_room(RoomJID, ReasonIn) ->
+             {error, Reason}
+     end.
+ 
++%% @doc Retracts a message from a room on behalf of the room itself (XEP-0425).
++%% The message is replaced in the room archive with a tombstone, removed from the room
++%% history, and the retraction is broadcast to the occupants.
++%% A persistent room that is not running only has its archive updated.
++-spec moderate_message(jid:jid(), binary(), binary() | undefined) ->
++    ok | {error, not_found | item_not_found}.
++moderate_message(RoomJID, StanzaID, Reason) ->
++    case mod_muc:room_jid_to_pid(RoomJID) of
++        {ok, Pid} ->
++            gen_fsm_compat:sync_send_all_state_event(Pid, {moderate_message, StanzaID, Reason});
++        {error, not_found} ->
++            moderate_message_in_stopped_room(RoomJID, StanzaID, Reason)
++    end.
++
++moderate_message_in_stopped_room(RoomJID = #jid{luser = Room, lserver = MucHost},
++                                 StanzaID, Reason) ->
++    case mongoose_domain_api:get_subdomain_host_type(MucHost) of
++        {ok, HostType} ->
++            case mod_muc:restore_room(HostType, MucHost, Room) of
++                {ok, _} ->
++                    Params = #{room_jid => RoomJID, stanza_id => StanzaID,
++                               by => RoomJID, reason => Reason},
++                    mongoose_hooks:moderate_room_message(HostType, Params);
++                _ ->
++                    {error, not_found}
++            end;
++        _ ->
++            {error, not_found}
++    end.
++
+ -spec remove_user(jid:jid(), jid:luser(), jid:lserver()) -> ok | {error, not_found}.
+ remove_user(RoomJID, UserU, UserS) ->
+     case mod_muc:room_jid_to_pid(RoomJID) of
+@@ -664,6 +703,9 @@ handle_sync_event({can_access_identity, UserJID}, _From, StateName, StateData) -
+ handle_sync_event({change_config, Config}, _From, StateName, StateData) ->
+     {result, [], NSD} = change_config(Config, StateData),
+     reply_with_timeout({ok, NSD#state.config}, StateName, NSD);
++handle_sync_event({moderate_message, StanzaID, Reason}, _From, StateName, StateData) ->
++    {Reply, NSD} = moderate_message(StateData#state.jid, StanzaID, Reason, StateData),
++    reply_with_timeout(Reply, StateName, NSD);
+ handle_sync_event({change_state, NewStateData}, _From, StateName, _StateData) ->
+     reply_with_timeout({ok, NewStateData}, StateName, NewStateData);
+ handle_sync_event(_Event, _From, StateName, StateData) ->
+@@ -2507,6 +2549,104 @@ presence(<<"unavailable">> = Type, Children) ->
+            children = Children}.
+ 
+ 
++%%%----------------------------------------------------------------------
++%%% Message moderation (XEP-0425)
++
++-spec process_iq_moderate(jid:jid(), exml:element(), state()) ->
++    {ok | {error, exml:element()}, state()}.
++process_iq_moderate(From, SubEl, StateData) ->
++    case is_user_moderator(From, StateData) of
++        true ->
++            case parse_moderate_request(SubEl) of
++                {ok, StanzaID, Reason} ->
++                    {FromNick, _Role} = get_participant_data(From, StateData),
++                    ByJID = jid:replace_resource(StateData#state.jid, FromNick),
++                    case moderate_message(ByJID, StanzaID, Reason, StateData) of
++                        {ok, NewStateData} ->
++                            {ok, NewStateData};
++                        {{error, item_not_found}, NewStateData} ->
++                            ErrText = <<"Message not found in this room">>,
++                            {{error, mongoose_xmpp_errors:item_not_found(ErrText)}, NewStateData}
++                    end;
++                {error, ErrText} ->
++                    {{error, mongoose_xmpp_errors:bad_request(ErrText)}, StateData}
++            end;
++        false ->
++            ErrText = <<"Only moderators are allowed to retract messages of other occupants">>,
++            {{error, mongoose_xmpp_errors:forbidden(ErrText)}, StateData}
++    end.
++
++-spec parse_moderate_request(exml:element()) ->
++    {ok, StanzaID :: binary(), Reason :: binary() | undefined} | {error, binary()}.
++parse_moderate_request(SubEl) ->
++    StanzaID = exml_query:attr(SubEl, <<"id">>, <<>>),
++    Retract = exml_query:path(SubEl, [{element_with_ns, <<"retract">>, ?NS_RETRACT_1}]),
++    Reason = exml_query:path(SubEl, [{element, <<"reason">>}, cdata]),
++    case {StanzaID, Retract} of
++        {<<>>, _} -> {error, <<"Missing stanza ID of the message to retract">>};
++        {_, undefined} -> {error, <<"Missing retract element">>};
++        _ -> {ok, StanzaID, Reason}
++    end.
++
++-spec moderate_message(jid:jid(), binary(), binary() | undefined, state()) ->
++    {ok | {error, item_not_found}, state()}.
++moderate_message(ByJID, StanzaID, Reason, StateData = #state{host_type = HostType,
++                                                             jid = RoomJID}) ->
++    Params = #{room_jid => RoomJID, stanza_id => StanzaID, by => ByJID, reason => Reason},
++    InHistory = is_message_in_history(StanzaID, StateData),
++    %% A message that is still in the room history may not be in the archive yet,
++    %% e.g. when the archive is written asynchronously
++    case {mongoose_hooks:moderate_room_message(HostType, Params), InHistory} of
++        {{error, item_not_found}, false} ->
++            {{error, item_not_found}, StateData};
++        _ ->
++            ?LOG_INFO(ls(#{what => muc_message_moderated, stanza_id => StanzaID,
++                           moderator => jid:to_binary(ByJID)}, StateData)),
++            broadcast_moderation(Params, StateData),
++            {ok, remove_message_from_history(StanzaID, StateData)}
++    end.
++
++-spec broadcast_moderation(moderate_message_params(), state()) -> ok.
++broadcast_moderation(Params, StateData = #state{jid = RoomJID}) ->
++    Packet = moderation_packet(Params),
++    maps_foreach(fun(_LJID, #user{jid = JID}) ->
++                         mongoose_router:route(mongoose_acc:new(RoomJID, JID, Packet, ?LOCATION))
++                 end, StateData#state.users).
++
++-spec moderation_packet(moderate_message_params()) -> exml:element().
++moderation_packet(#{stanza_id := StanzaID, by := ByJID, reason := Reason}) ->
++    Moderated = #xmlel{name = <<"moderated">>,
++                       attrs = #{<<"xmlns">> => ?NS_MESSAGE_MODERATE,
++                                 <<"by">> => jid:to_binary(ByJID)}},
++    ReasonEls = [#xmlel{name = <<"reason">>, children = [#xmlcdata{content = Reason}]}
++                 || is_binary(Reason)],
++    Retract = #xmlel{name = <<"retract">>,
++                     attrs = #{<<"xmlns">> => ?NS_RETRACT_1, <<"id">> => StanzaID},
++                     children = [Moderated | ReasonEls]},
++    #xmlel{name = <<"message">>,
++           attrs = #{<<"type">> => <<"groupchat">>, <<"id">> => mongoose_bin:gen_from_crypto()},
++           children = [Retract]}.
++
++-spec is_message_in_history(binary(), state()) -> boolean().
++is_message_in_history(StanzaID, StateData) ->
++    lists:any(fun(Item) -> is_history_item_with_stanza_id(StanzaID, StateData, Item) end,
++              lqueue_to_list(StateData#state.history)).
++
++-spec remove_message_from_history(binary(), state()) -> state().
++remove_message_from_history(StanzaID, StateData = #state{history = LQ = #lqueue{queue = Q}}) ->
++    Q1 = queue:filter(fun(Item) -> not is_history_item_with_stanza_id(StanzaID, StateData, Item) end,
++                      Q),
++    StateData#state{history = LQ#lqueue{queue = Q1, len = queue:len(Q1)}}.
++
++is_history_item_with_stanza_id(StanzaID, #state{jid = RoomJID}, {_Nick, Packet, _, _, _}) ->
++    RoomBin = jid:to_bare_binary(RoomJID),
++    lists:any(fun(#xmlel{name = <<"stanza-id">>, attrs = Attrs}) ->
++                      maps:get(<<"id">>, Attrs, undefined) =:= StanzaID andalso
++                          maps:get(<<"by">>, Attrs, undefined) =:= RoomBin;
++                 (_) ->
++                      false
++              end, Packet#xmlel.children).
++
+ -spec lqueue_new(integer()) -> lqueue().
+ lqueue_new(Max) ->
+     #lqueue{queue = queue:new(),
+@@ -3741,6 +3881,7 @@ identity(Name) ->
+ room_features(Config) ->
+     [?NS_MUC,
+      ?NS_MUC_STABLE_ID,
++     ?NS_MESSAGE_MODERATE,
+      config_opt_to_feature((Config#config.public),
+                            <<"muc_public">>, <<"muc_hidden">>),
+      config_opt_to_feature((Config#config.persistent),
+@@ -4323,6 +4464,16 @@ route_iq(Acc, #routed_iq{iq = #iq{type = Type, xmlns = ?NS_MUC_OWNER, sub_el = S
+     from = From} = Routed, StateData) ->
+     Res = process_iq_owner(From, Type, SubEl, StateData, normal_state),
+     do_route_iq(Acc, Res, Routed, StateData);
++route_iq(Acc, #routed_iq{iq = #iq{type = set, xmlns = ?NS_MESSAGE_MODERATE, sub_el = SubEl} = IQ,
++                         from = From}, StateData) ->
++    {Result, NewStateData} = process_iq_moderate(From, SubEl, StateData),
++    IQRes = case Result of
++                ok -> IQ#iq{type = result, sub_el = []};
++                {error, Error} -> IQ#iq{type = error, sub_el = [SubEl, Error]}
++            end,
++    mongoose_router:route(
++        mongoose_acc:update(StateData#state.jid, From, jlib:iq_to_xml(IQRes), Acc)),
++    {ok, NewStateData};
+ route_iq(Acc, #routed_iq{iq = #iq{type = Type, xmlns = ?NS_DISCO_INFO, lang = Lang},
+     from = From} = Routed, StateData) ->
+     Res = process_iq_disco_info(From, Type, Lang, StateData),
+-- 
+2.43.0
+

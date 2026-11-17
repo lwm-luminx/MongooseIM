@@ -1,0 +1,766 @@
+From 9aff97712d49f6cdfabc2ff7d2f6c6deb5915b73 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 16 Nov 2026 20:54:34 +0000
+Subject: [PATCH] Accept JWT bearer tokens on the admin GraphQL endpoints
+
+The admin and domain admin GraphQL endpoints accept only static
+passwords. A new 'jwt' listener option makes them also accept
+'Authorization: Bearer <token>', verified with configured keys:
+
+- 'keys' is a list of keys with an optional 'kid', tried in order, so
+  the signing key can be rotated without redeploying the callers.
+  With RS/ES algorithms the server holds only the public key.
+- The 'exp' claim is required, 'iss' and 'aud' are checked when
+  'issuer' and 'audience' are configured.
+- On the domain admin endpoint, the 'domain' claim (configurable with
+  'domain_key') names the domain, which has to exist. The token holder
+  gets the same permissions as a domain admin with a password.
+- The passwords keep working. On the admin endpoint, configuring 'jwt'
+  enables authentication like 'username' and 'password' do.
+- The option is rejected on the user endpoint, which authenticates with
+  the auth methods of the user's host type (e.g. auth.jwt).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01ETaRHXo1LmPHqZB9SXMucM
+---
+ doc/graphql-api/Admin-GraphQL.md         |  15 ++
+ doc/listeners/listen-http.md             |  59 +++++++
+ src/graphql/mongoose_graphql_handler.erl |  52 +++++-
+ src/graphql/mongoose_graphql_jwt.erl     | 201 ++++++++++++++++++++++
+ test/config_parser_SUITE.erl             |  33 +++-
+ test/mongoose_graphql_SUITE.erl          | 206 ++++++++++++++++++++++-
+ 6 files changed, 560 insertions(+), 6 deletions(-)
+ create mode 100644 src/graphql/mongoose_graphql_jwt.erl
+
+diff --git a/doc/graphql-api/Admin-GraphQL.md b/doc/graphql-api/Admin-GraphQL.md
+index 07c5a86..ef4eec0 100644
+--- a/doc/graphql-api/Admin-GraphQL.md
++++ b/doc/graphql-api/Admin-GraphQL.md
+@@ -20,6 +20,7 @@ The admin per domain can be disabled by the global admin with the command <a hre
+ ## Authentication
+ 
+ MongooseIM uses *Basic Authentication* as an authentication method for the GraphQL API.
++The admin endpoints can also accept [JSON Web Tokens](#json-web-tokens).
+ 
+ *Basic authentication* is a simple authentication scheme built into the HTTP protocol.
+ Each HTTP request to the GraphQL API has to contain the Authorization header
+@@ -43,6 +44,20 @@ The authorization as a domain admin the base64-encoded string should have the fo
+ - `DOMAIN` is the domain to authorize,
+ - `PASSWORD` is the password for the given domain.
+ 
++### JSON Web Tokens
++
++When the `jwt` section is configured for the [GraphQL handler](../listeners/listen-http.md#listenhttphandlersmongoose_graphql_handlerjwt-only-for-admin-and-domain_admin),
++both admin endpoints also accept *Bearer authentication* with a [JSON Web Token](https://jwt.io):
++the `Authorization` header contains the word `Bearer` followed by a space and the token.
++This makes it possible to issue short-lived tokens to each caller, and to rotate the signing keys without redeploying the callers.
++
++The token needs a valid signature, an `exp` (expiration time) claim, and the `iss` and `aud` claims when the issuer and audience are configured.
++On the domain admin endpoint, the token also needs a claim with the domain name (`domain` by default).
++The domain has to exist, and the token holder gets the same permissions as the domain admin authenticated with a password.
++The domain admin password does not need to be set for the token to work.
++
++The password authentication remains available alongside the tokens.
++
+ ## GraphiQL
+ 
+ GraphiQL is the GraphQL integrated development environment (IDE). It allows to experiment with API and run queries with ease. The GraphiQL page is automatically served with each GraphQL endpoint. For example:
+diff --git a/doc/listeners/listen-http.md b/doc/listeners/listen-http.md
+index 8910260..c0c33b8 100644
+--- a/doc/listeners/listen-http.md
++++ b/doc/listeners/listen-http.md
+@@ -117,6 +117,51 @@ When set, enables authentication for the admin API, otherwise it is disabled. Re
+ * **Default:** not set
+ * **Example:** `password = "secret"`
+ 
++### `listen.http.handlers.mongoose_graphql_handler.jwt` - only for `admin` and `domain_admin`
++* **Syntax:** TOML table with the options listed below
++* **Default:** not set
++* **Example:** `jwt.keys = [{kid = "2025-01", secret.file = "jwt_public_key.pem", algorithm = "RS256"}]`
++
++When set, the endpoint also accepts JSON Web Tokens in the `Authorization: Bearer <token>` header.
++The tokens are accepted in addition to the passwords. See [Admin GraphQL API](../graphql-api/Admin-GraphQL.md#json-web-tokens) for details.
++On the `admin` endpoint, setting this option enables the authentication, just like setting `username` and `password`.
++
++#### `listen.http.handlers.mongoose_graphql_handler.jwt.keys`
++* **Syntax:** non-empty array of TOML tables with the following items:
++    * `secret` - mandatory TOML table with exactly one of the possible items listed below:
++        * `file` - string, path to the file with the secret,
++        * `env` - string, environment variable name with the secret,
++        * `value` - string, the secret value.
++    * `algorithm` - mandatory string, one of: `"HS256"`, `"RS256"`, `"ES256"`, `"HS384"`, `"RS384"`, `"ES384"`, `"HS512"`, `"RS512"`, `"ES512"`,
++    * `kid` - optional string, the key ID.
++* **Default:** no default, this option is mandatory
++
++The keys used to verify the token signatures. For the public key algorithms, the secret is the public key in the PEM format,
++so the server cannot issue tokens itself. The keys are tried in order.
++When the token header contains a `kid`, only the keys with the same `kid` and the keys without a `kid` are tried.
++A file is read when the listener starts, while an environment variable is read for each request.
++
++#### `listen.http.handlers.mongoose_graphql_handler.jwt.issuer`
++* **Syntax:** string
++* **Default:** not set
++* **Example:** `jwt.issuer = "https://auth.example.com"`
++
++When set, the token is accepted only if its `iss` claim is equal to this value.
++
++#### `listen.http.handlers.mongoose_graphql_handler.jwt.audience`
++* **Syntax:** string
++* **Default:** not set
++* **Example:** `jwt.audience = "mongooseim-admin"`
++
++When set, the token is accepted only if its `aud` claim is equal to this value, or is a list containing it.
++
++#### `listen.http.handlers.mongoose_graphql_handler.jwt.domain_key` - only for `domain_admin`
++* **Syntax:** string
++* **Default:** `"domain"`
++* **Example:** `jwt.domain_key = "tenant"`
++
++Name of the claim containing the domain that the token holder administers.
++
+ ### `listen.http.handlers.mongoose_graphql_handler.allowed_categories`
+ * **Syntax:** non-empty array of strings. Allowed values: `"checkAuth", "account", "domain", "last", "muc", "muc_light", "session", "stanza", "roster", "vcard", "private", "metric", "stat", "gdpr", "mnesia", "server", "inbox", "http_upload", "offline", "token", "cets"`
+ * **Default:** all GraphQL categories enabled
+@@ -239,6 +284,20 @@ GraphQL API for the domain admin.
+     schema_endpoint = "domain_admin"
+ ```
+ 
++Domain admins can also authenticate with short-lived JSON Web Tokens signed by your identity provider.
++The tokens are verified with its public key, and the `tenant` claim names the domain:
++
++```toml
++  [[listen.http.handlers.mongoose_graphql_handler]]
++    host = "_"
++    path = "/api/graphql"
++    schema_endpoint = "domain_admin"
++    jwt.issuer = "https://auth.example.com"
++    jwt.audience = "mongooseim-domain-admin"
++    jwt.domain_key = "tenant"
++    jwt.keys = [{kid = "2025-01", secret.file = "/etc/mongooseim/jwt_public_key.pem", algorithm = "RS256"}]
++```
++
+ ### Example 4. User GraphQL API
+ 
+ GraphQL API for the user.
+diff --git a/src/graphql/mongoose_graphql_handler.erl b/src/graphql/mongoose_graphql_handler.erl
+index 451741a..026248f 100644
+--- a/src/graphql/mongoose_graphql_handler.erl
++++ b/src/graphql/mongoose_graphql_handler.erl
+@@ -57,13 +57,15 @@ config_spec() ->
+                                                                     validate = {enum, allowed_categories()}},
+                                                     validate = unique_non_empty},
+                   <<"sse_idle_timeout">> => #option{type = int_or_infinity,
+-                                                    validate = positive}},
++                                                    validate = positive},
++                  <<"jwt">> => mongoose_graphql_jwt:config_spec()},
+         defaults = #{<<"sse_idle_timeout">> => 3600000}, % 1h
+         format_items = map,
+         required = [<<"schema_endpoint">>],
+         process = fun ?MODULE:process_config/1}.
+ 
+ process_config(Opts) ->
++    ok = mongoose_graphql_jwt:process_config(Opts),
+     case maps:is_key(username, Opts) =:= maps:is_key(password, Opts) of
+         true ->
+             Opts;
+@@ -72,7 +74,8 @@ process_config(Opts) ->
+     end.
+ 
+ -spec routes(mongoose_http_handler:options()) -> mongoose_http_handler:routes().
+-routes(Opts = #{path := Path}) ->
++routes(Opts0 = #{path := Path}) ->
++    Opts = read_jwt_keys(Opts0),
+     [{Path, ?MODULE, Opts},
+      {Path ++ "/sse", lasse_handler, #{module => mongoose_graphql_sse_handler,
+                                        init_args => Opts}}].
+@@ -180,6 +183,14 @@ auth_user({basic, User, Password}, State) ->
+ auth_user(_, State) ->
+     {ok, State#{authorized => false}}.
+ 
++auth_admin({bearer, Token}, #{jwt := _} = State) ->
++    case mongoose_graphql_jwt:verify(Token, State) of
++        {ok, _Claims} ->
++            {ok, State#{authorized => true,
++                        schema_ctx => #{authorized_as => admin}}};
++        {error, _} ->
++            error
++    end;
+ auth_admin({basic, Username, Password}, #{username := Username, password := Password} = State) ->
+     {ok, State#{authorized => true,
+                 schema_ctx => #{authorized_as => admin}
+@@ -188,6 +199,8 @@ auth_admin({basic, _, _}, _) ->
+     error;
+ auth_admin(_, #{username := _, password := _} = State) ->
+     {ok, State#{authorized => false}};
++auth_admin(_, #{jwt := _} = State) ->
++    {ok, State#{authorized => false}};
+ auth_admin(_, State) ->
+     % auth credentials not provided in config
+     {ok, State#{authorized => true,
+@@ -207,9 +220,44 @@ auth_domain_admin({basic, Username, Password}, State) ->
+         _ ->
+             error
+     end;
++auth_domain_admin({bearer, Token}, #{jwt := #{domain_key := DomainKey}} = State) ->
++    case mongoose_graphql_jwt:verify(Token, State) of
++        {ok, Claims} ->
++            case token_domain(mongoose_graphql_jwt:get_claim(DomainKey, Claims)) of
++                {ok, Domain} ->
++                    Admin = jid:make_noprep(<<"admin">>, Domain, <<>>),
++                    {ok, State#{authorized => true,
++                                schema_ctx => #{authorized_as => domain_admin,
++                                                admin => Admin}}};
++                error ->
++                    error
++            end;
++        {error, _} ->
++            error
++    end;
+ auth_domain_admin(_, State) ->
+     {ok, State#{authorized => false}}.
+ 
++%% The token is accepted only for an existing domain, like the domain admin password
++-spec token_domain(term()) -> {ok, jid:lserver()} | error.
++token_domain(Domain) when is_binary(Domain) ->
++    case jid:nameprep(Domain) of
++        error ->
++            error;
++        LDomain ->
++            case mongoose_domain_api:get_domain_host_type(LDomain) of
++                {ok, _HostType} -> {ok, LDomain};
++                {error, not_found} -> error
++            end
++    end;
++token_domain(_) ->
++    error.
++
++read_jwt_keys(#{jwt := JwtOpts} = Opts) ->
++    Opts#{jwt_keys => mongoose_graphql_jwt:read_keys(JwtOpts)};
++read_jwt_keys(Opts) ->
++    Opts.
++
+ run_request(#{document := undefined}, Req, State) ->
+     reply_error(make_error(decode, no_query_supplied), Req, State);
+ run_request(#{} = ReqCtx, Req, #{schema_endpoint := EpName,
+diff --git a/src/graphql/mongoose_graphql_jwt.erl b/src/graphql/mongoose_graphql_jwt.erl
+new file mode 100644
+index 0000000..aa29f8d
+--- /dev/null
++++ b/src/graphql/mongoose_graphql_jwt.erl
+@@ -0,0 +1,201 @@
++%% @doc Verification of JSON Web Tokens presented as `Authorization: Bearer <token>'
++%% to the admin and domain admin GraphQL endpoints.
++%%
++%% The tokens are verified with the keys configured for the listener. The keys
++%% are tried in order. If the token header has a `kid', only the keys with
++%% the same `kid' and the keys without one are tried.
++%% The `exp' claim is required, and `iss' and `aud' are checked when configured.
++%% @end
++-module(mongoose_graphql_jwt).
++
++-export([config_spec/0,
++         process_config/1,
++         process_secret/1,
++         process_algorithm/1,
++         read_keys/1,
++         verify/2,
++         get_claim/2]).
++
++-include("mongoose_config_spec.hrl").
++
++-type algorithm() :: hs256 | rs256 | es256 | hs384 | rs384 | es384 | hs512 | rs512 | es512.
++-type secret() :: binary() | {env, string()}.
++-type key() :: #{kid := binary() | undefined,
++                 algorithm := algorithm(),
++                 secret := secret()}.
++-type opts() :: #{keys := [map()],
++                  issuer => binary(),
++                  audience => binary(),
++                  domain_key => binary()}.
++-type claims() :: #{atom() | binary() => term()}.
++
++-export_type([opts/0, claims/0]).
++
++%% Config
++
++-spec config_spec() -> mongoose_config_spec:config_section().
++config_spec() ->
++    #section{
++       items = #{<<"keys">> => #list{items = key_config_spec(),
++                                     validate = non_empty},
++                 <<"issuer">> => #option{type = binary,
++                                         validate = non_empty},
++                 <<"audience">> => #option{type = binary,
++                                           validate = non_empty},
++                 <<"domain_key">> => #option{type = binary,
++                                             validate = non_empty}},
++       defaults = #{<<"domain_key">> => <<"domain">>},
++       required = [<<"keys">>]
++      }.
++
++key_config_spec() ->
++    #section{
++       items = #{<<"kid">> => #option{type = binary,
++                                      validate = non_empty},
++                 <<"secret">> => secret_config_spec(),
++                 <<"algorithm">> => #option{type = binary,
++                                            validate = {enum, maps:keys(algorithms())},
++                                            process = fun ?MODULE:process_algorithm/1}},
++       required = [<<"secret">>, <<"algorithm">>]
++      }.
++
++secret_config_spec() ->
++    #section{
++       items = #{<<"file">> => #option{type = string,
++                                       validate = filename},
++                 <<"env">> => #option{type = string,
++                                      validate = non_empty},
++                 <<"value">> => #option{type = binary}},
++       format_items = list,
++       process = fun ?MODULE:process_secret/1
++      }.
++
++-spec process_secret([{file | env | value, string() | binary()}]) ->
++          {file | env | value, string() | binary()}.
++process_secret([Item]) -> Item;
++process_secret(_Items) ->
++    %% The values are not included, as they are secret
++    error(#{what => one_secret_source_required}).
++
++-spec process_algorithm(binary()) -> algorithm().
++process_algorithm(Alg) -> maps:get(Alg, algorithms()).
++
++%% @doc Validates the JWT options of a GraphQL listener.
++-spec process_config(map()) -> ok.
++process_config(#{jwt := _, schema_endpoint := user}) ->
++    error(#{what => jwt_not_supported_for_user_endpoint,
++            text => <<"Use an auth method of the user's host type, e.g. auth.jwt">>});
++process_config(_) ->
++    ok.
++
++%% @doc Reads the configured secrets. Files are read once,
++%% environment variables are read for each request.
++-spec read_keys(opts()) -> [key()].
++read_keys(#{keys := Keys}) ->
++    [#{kid => maps:get(kid, Key, undefined),
++       algorithm => Alg,
++       secret => read_secret(Secret)} || Key = #{algorithm := Alg, secret := Secret} <- Keys].
++
++read_secret({value, Secret}) -> Secret;
++read_secret({env, Var}) -> {env, Var};
++read_secret({file, Path}) ->
++    {ok, Secret} = file:read_file(Path),
++    Secret.
++
++%% Verification
++
++%% @doc Verifies the token signature and the claims.
++%% The token itself is never logged, because it is a credential.
++-spec verify(binary(), #{jwt := opts(), jwt_keys := [key()], atom() => term()}) ->
++          {ok, claims()} | {error, atom()}.
++verify(Token, #{jwt := Opts, jwt_keys := Keys}) ->
++    case verify_signature(Token, Keys) of
++        {ok, Claims} ->
++            case check_claims(Claims, Opts) of
++                ok -> {ok, Claims};
++                {error, _} = Error -> Error
++            end;
++        {error, _} = Error ->
++            Error
++    end.
++
++verify_signature(Token, Keys) ->
++    try jwerl:header(Token) of
++        Header when is_map(Header) ->
++            Kid = maps:get(kid, Header, undefined),
++            verify_with_keys(Token, matching_keys(Kid, Keys));
++        _ ->
++            {error, invalid_token}
++    catch _:_ ->
++            {error, invalid_token}
++    end.
++
++matching_keys(Kid, Keys) when is_binary(Kid) ->
++    [Key || Key = #{kid := KeyKid} <- Keys, KeyKid =:= Kid orelse KeyKid =:= undefined];
++matching_keys(_, Keys) ->
++    Keys.
++
++verify_with_keys(_Token, []) ->
++    {error, invalid_token};
++verify_with_keys(Token, [#{algorithm := Alg, secret := Secret} | Keys]) ->
++    case secret_value(Secret) of
++        {ok, Key} ->
++            try jwerl:verify(Token, Alg, Key) of
++                {ok, Claims} when is_map(Claims) -> {ok, Claims};
++                _ -> verify_with_keys(Token, Keys)
++            catch _:_ ->
++                    verify_with_keys(Token, Keys)
++            end;
++        error ->
++            verify_with_keys(Token, Keys)
++    end.
++
++secret_value({env, Var}) ->
++    case os:getenv(Var) of
++        false -> error;
++        Value -> {ok, list_to_binary(Value)}
++    end;
++secret_value(Secret) when is_binary(Secret) ->
++    {ok, Secret}.
++
++%% jwerl checks 'exp' only when it is present, but admin tokens must expire
++check_claims(Claims, Opts) ->
++    Checks = [{<<"exp">>, fun is_integer/1, missing_expiration}]
++        ++ [{<<"iss">>, fun(Iss) -> Iss =:= Issuer end, wrong_issuer}
++            || Issuer <- [maps:get(issuer, Opts, undefined)], Issuer =/= undefined]
++        ++ [{<<"aud">>, fun(Aud) -> has_audience(Aud, Audience) end, wrong_audience}
++            || Audience <- [maps:get(audience, Opts, undefined)], Audience =/= undefined],
++    check_claims_loop(Claims, Checks).
++
++check_claims_loop(_Claims, []) ->
++    ok;
++check_claims_loop(Claims, [{Name, Pred, Error} | Checks]) ->
++    case Pred(get_claim(Name, Claims)) of
++        true -> check_claims_loop(Claims, Checks);
++        false -> {error, Error}
++    end.
++
++%% The 'aud' claim can be a string or a list of strings (RFC 7519)
++has_audience(Audience, Audience) -> true;
++has_audience(Auds, Audience) when is_list(Auds) -> lists:member(Audience, Auds);
++has_audience(_, _) -> false.
++
++%% @doc Returns a claim value, or `undefined'.
++%% jwerl decodes the claim names to atoms when such atoms exist.
++-spec get_claim(binary(), claims()) -> term().
++get_claim(Name, Claims) ->
++    case maps:find(Name, Claims) of
++        {ok, Value} ->
++            Value;
++        error ->
++            try maps:get(binary_to_existing_atom(Name), Claims, undefined)
++            catch error:badarg -> undefined
++            end
++    end.
++
++%% Explicit mapping, because the atoms are owned by jwerl and might not exist yet
++-spec algorithms() -> #{binary() => algorithm()}.
++algorithms() ->
++    #{<<"HS256">> => hs256, <<"RS256">> => rs256, <<"ES256">> => es256,
++      <<"HS384">> => hs384, <<"RS384">> => rs384, <<"ES384">> => es384,
++      <<"HS512">> => hs512, <<"RS512">> => rs512, <<"ES512">> => es512}.
+diff --git a/test/config_parser_SUITE.erl b/test/config_parser_SUITE.erl
+index 9a1ccce..5599ca0 100644
+--- a/test/config_parser_SUITE.erl
++++ b/test/config_parser_SUITE.erl
+@@ -605,7 +605,38 @@ listen_http_handlers_graphql(_Config) ->
+     ?err(T(#{<<"allowed_categories">> => [<<"invalid">>]})),
+     ?err(T(#{<<"schema_endpoint">> => <<"wrong_endpoint">>})),
+     ?err(T(#{<<"sse_idle_timeout">> => 0})),
+-    ?err(http_handler_raw(mongoose_graphql_handler, #{})).
++    ?err(http_handler_raw(mongoose_graphql_handler, #{})),
++    test_listen_http_handler_graphql_jwt(P, T).
++
++test_listen_http_handler_graphql_jwt(P, T) ->
++    Key = #{<<"secret">> => #{<<"value">> => <<"secret">>}, <<"algorithm">> => <<"HS256">>},
++    J = fun(Opts) -> T(#{<<"jwt">> => Opts}) end,
++    ?cfg(P ++ [jwt], #{keys => [#{secret => {value, <<"secret">>}, algorithm => hs256}],
++                       domain_key => <<"domain">>},
++         J(#{<<"keys">> => [Key]})),
++    ?cfg(P ++ [jwt, keys], [#{kid => <<"k1">>, secret => {env, "JWT_KEY"}, algorithm => rs256}],
++         J(#{<<"keys">> => [#{<<"kid">> => <<"k1">>,
++                              <<"secret">> => #{<<"env">> => <<"JWT_KEY">>},
++                              <<"algorithm">> => <<"RS256">>}]})),
++    ?cfg(P ++ [jwt, issuer], <<"iss">>, J(#{<<"keys">> => [Key], <<"issuer">> => <<"iss">>})),
++    ?cfg(P ++ [jwt, audience], <<"aud">>, J(#{<<"keys">> => [Key], <<"audience">> => <<"aud">>})),
++    ?cfg(P ++ [jwt, domain_key], <<"dom">>,
++         J(#{<<"keys">> => [Key], <<"domain_key">> => <<"dom">>})),
++    ?cfg(P ++ [schema_endpoint], domain_admin,
++         T(#{<<"schema_endpoint">> => <<"domain_admin">>, <<"jwt">> => #{<<"keys">> => [Key]}})),
++    ?err(J(#{})),
++    ?err(J(#{<<"keys">> => []})),
++    ?err(J(#{<<"keys">> => [maps:remove(<<"algorithm">>, Key)]})),
++    ?err(J(#{<<"keys">> => [maps:remove(<<"secret">>, Key)]})),
++    ?err(J(#{<<"keys">> => [Key#{<<"algorithm">> => <<"none">>}]})),
++    ?err(J(#{<<"keys">> => [Key#{<<"kid">> => <<>>}]})),
++    ?err(J(#{<<"keys">> => [Key#{<<"secret">> => #{<<"value">> => <<"s">>,
++                                                   <<"env">> => <<"JWT_KEY">>}}]})),
++    ?err(J(#{<<"keys">> => [Key], <<"issuer">> => <<>>})),
++    ?err(J(#{<<"keys">> => [Key], <<"audience">> => <<>>})),
++    ?err(J(#{<<"keys">> => [Key], <<"unknown">> => <<"x">>})),
++    %% The user endpoint authenticates with the auth methods of the user's host type
++    ?err(T(#{<<"schema_endpoint">> => <<"user">>, <<"jwt">> => #{<<"keys">> => [Key]}})).
+ 
+ test_listen_http_handler_creds(P, T) ->
+     CredsRaw = #{<<"username">> => <<"user">>, <<"password">> => <<"pass">>},
+diff --git a/test/mongoose_graphql_SUITE.erl b/test/mongoose_graphql_SUITE.erl
+index c133f41..9e0d8ab 100644
+--- a/test/mongoose_graphql_SUITE.erl
++++ b/test/mongoose_graphql_SUITE.erl
+@@ -45,7 +45,9 @@ all() ->
+      {group, enum_output},
+      {group, user_listener},
+      {group, admin_listener},
+-     {group, domain_admin_listener}].
++     {group, domain_admin_listener},
++     {group, admin_jwt_listener},
++     {group, domain_admin_jwt_listener}].
+ 
+ groups() ->
+     [{operations, [parallel], operations()},
+@@ -59,6 +61,8 @@ groups() ->
+      {enum_output, [parallel], [contact_enums_cover_roster_values]},
+      {admin_listener, [parallel], admin_listener()},
+      {domain_admin_listener, [parallel], domain_admin_listener()},
++     {admin_jwt_listener, [parallel], admin_jwt_listener()},
++     {domain_admin_jwt_listener, [parallel], domain_admin_jwt_listener()},
+      {user_listener, [parallel], user_listener()}].
+ 
+ operations() ->
+@@ -173,6 +177,32 @@ domain_admin_listener() ->
+      use_directive_can_use_auth_domain_admin_domain
+      | common_tests()].
+ 
++admin_jwt_listener() ->
++    [jwt_admin_can_access_protected_types,
++     jwt_admin_with_kid_can_access_protected_types,
++     jwt_admin_with_second_key_can_access_protected_types,
++     jwt_admin_password_still_accepted,
++     jwt_admin_no_creds_cannot_access_protected_types,
++     jwt_admin_wrong_signature_error,
++     jwt_admin_wrong_kid_error,
++     jwt_admin_wrong_algorithm_error,
++     jwt_admin_malformed_token_error,
++     jwt_admin_expired_token_error,
++     jwt_admin_token_without_expiration_error,
++     jwt_admin_wrong_issuer_error,
++     jwt_admin_wrong_audience_error,
++     jwt_admin_audience_list_accepted].
++
++domain_admin_jwt_listener() ->
++    [jwt_domain_admin_can_access_owned_domain,
++     jwt_domain_admin_cannot_access_other_domain,
++     jwt_domain_admin_cannot_access_global,
++     jwt_domain_admin_domain_is_nameprepped,
++     jwt_domain_admin_nonexistent_domain_error,
++     jwt_domain_admin_missing_domain_error,
++     jwt_domain_admin_wrong_signature_error,
++     jwt_domain_admin_password_still_accepted].
++
+ common_tests() ->
+     [malformed_auth_header_error,
+      auth_wrong_creds_error,
+@@ -223,6 +253,24 @@ init_per_group(domain_admin_listener, Config) ->
+                 end),
+     ListenerOpts = #{schema_endpoint => domain_admin},
+     init_ep_listener(5560, domain_admin_schema_ep, ListenerOpts, Config2);
++init_per_group(admin_jwt_listener, Config) ->
++    ListenerOpts = jwt_listener_opts(#{username => <<"admin">>,
++                                       password => <<"secret">>,
++                                       schema_endpoint => admin}),
++    init_ep_listener(5561, admin_schema_ep, ListenerOpts, Config);
++init_per_group(domain_admin_jwt_listener, Config) ->
++    Config1 = meck_module_and_service_checking(Config),
++    Config2 = meck_domain_api(Config1),
++    meck:expect(mongoose_domain_api, check_domain_password,
++                fun
++                    (<<"localhost">>, <<"makota">>) -> ok;
++                    (<<"localhost">>, _) -> {error, wrong_password};
++                    (_, _) -> {error, not_found}
++                end),
++    meck:expect(mongoose_domain_api, get_domain_host_type,
++                fun(Domain) -> mongoose_domain_api:get_host_type(Domain) end),
++    ListenerOpts = jwt_listener_opts(#{schema_endpoint => domain_admin}),
++    init_ep_listener(5562, domain_admin_schema_ep, ListenerOpts, Config2);
+ init_per_group(domain_permissions, Config) ->
+     meck:new(mongoose_domain_api, [no_link]),
+     meck:expect(mongoose_domain_api, get_subdomain_info,
+@@ -259,6 +307,14 @@ end_per_group(domain_admin_listener, Config) ->
+     unmeck_domain_api(Config),
+     ?config(test_process, Config) ! stop,
+     Config;
++end_per_group(admin_jwt_listener, Config) ->
++    ?config(test_process, Config) ! stop,
++    Config;
++end_per_group(domain_admin_jwt_listener, Config) ->
++    unmeck_module_and_service_checking(Config),
++    unmeck_domain_api(Config),
++    ?config(test_process, Config) ! stop,
++    Config;
+ end_per_group(domain_permissions, _Config) ->
+     meck:unload(mongoose_domain_api);
+ end_per_group(Group, Config) when Group == operations;
+@@ -957,6 +1013,100 @@ auth_domain_admin_cannot_access_global(Config) ->
+     {Status, Data} = execute(Ep, Body, {<<"admin@localhost">>, <<"makota">>}),
+     assert_no_permissions(no_permissions, Status, Data).
+ 
++jwt_admin_can_access_protected_types(Config) ->
++    assert_jwt_access_granted(Config, valid_claims(), <<"key-a">>).
++
++jwt_admin_with_kid_can_access_protected_types(Config) ->
++    assert_jwt_access_granted(Config, valid_claims(), {<<"key-a">>, <<"a">>}).
++
++jwt_admin_with_second_key_can_access_protected_types(Config) ->
++    assert_jwt_access_granted(Config, valid_claims(), {<<"key-b">>, <<"b">>}),
++    %% The key with kid 'b' is also found when the token has no kid
++    assert_jwt_access_granted(Config, valid_claims(), <<"key-b">>).
++
++jwt_admin_password_still_accepted(Config) ->
++    Ep = ?config(endpoint_addr, Config),
++    {Status, Data} = execute(Ep, #{query => "{ field }"}, {<<"admin">>, <<"secret">>}),
++    assert_access_granted(Status, Data).
++
++jwt_admin_no_creds_cannot_access_protected_types(Config) ->
++    Ep = ?config(endpoint_addr, Config),
++    {Status, Data} = execute(Ep, #{query => "{ field }"}, undefined),
++    assert_no_permissions(no_permissions, Status, Data).
++
++jwt_admin_wrong_signature_error(Config) ->
++    assert_jwt_rejected(Config, valid_claims(), <<"key-c">>).
++
++jwt_admin_wrong_kid_error(Config) ->
++    %% Key 'a' is tried only for tokens with kid 'a' or without a kid
++    assert_jwt_rejected(Config, valid_claims(), {<<"key-a">>, <<"b">>}).
++
++jwt_admin_wrong_algorithm_error(Config) ->
++    Token = make_token(<<"HS512">>, sha512, undefined, valid_claims(), <<"key-a">>),
++    assert_bearer_rejected(Config, Token).
++
++jwt_admin_malformed_token_error(Config) ->
++    assert_bearer_rejected(Config, <<"not-a-token">>),
++    assert_bearer_rejected(Config, <<"a.b.c">>).
++
++jwt_admin_expired_token_error(Config) ->
++    assert_jwt_rejected(Config, (valid_claims())#{exp => now_s() - 10}, <<"key-a">>).
++
++jwt_admin_token_without_expiration_error(Config) ->
++    assert_jwt_rejected(Config, maps:remove(exp, valid_claims()), <<"key-a">>).
++
++jwt_admin_wrong_issuer_error(Config) ->
++    assert_jwt_rejected(Config, (valid_claims())#{iss => <<"other">>}, <<"key-a">>),
++    assert_jwt_rejected(Config, maps:remove(iss, valid_claims()), <<"key-a">>).
++
++jwt_admin_wrong_audience_error(Config) ->
++    assert_jwt_rejected(Config, (valid_claims())#{aud => <<"other">>}, <<"key-a">>),
++    assert_jwt_rejected(Config, (valid_claims())#{aud => [<<"other">>]}, <<"key-a">>),
++    assert_jwt_rejected(Config, maps:remove(aud, valid_claims()), <<"key-a">>).
++
++jwt_admin_audience_list_accepted(Config) ->
++    assert_jwt_access_granted(Config, (valid_claims())#{aud => [<<"other">>, <<"mim">>]},
++                              <<"key-a">>).
++
++jwt_domain_admin_can_access_owned_domain(Config) ->
++    Token = make_token((valid_claims())#{domain => <<"localhost">>}, <<"key-a">>),
++    Body = #{query => "{ fieldDP(argA: \"localhost\") }"},
++    {Status, Data} = execute_bearer(?config(endpoint_addr, Config), Body, Token),
++    assert_access_granted(Status, Data).
++
++jwt_domain_admin_cannot_access_other_domain(Config) ->
++    Token = make_token((valid_claims())#{domain => <<"localhost">>}, <<"key-a">>),
++    Body = #{query => "{ field fieldDP(argA: \"domain.com\") }"},
++    {Status, Data} = execute_bearer(?config(endpoint_addr, Config), Body, Token),
++    assert_no_permissions(no_permissions, Status, Data).
++
++jwt_domain_admin_cannot_access_global(Config) ->
++    Token = make_token((valid_claims())#{domain => <<"localhost">>}, <<"key-a">>),
++    Body = #{query => "{ fieldGlobal(argA: \"localhost\") }"},
++    {Status, Data} = execute_bearer(?config(endpoint_addr, Config), Body, Token),
++    assert_no_permissions(no_permissions, Status, Data).
++
++jwt_domain_admin_domain_is_nameprepped(Config) ->
++    Token = make_token((valid_claims())#{domain => <<"LocalHost">>}, <<"key-a">>),
++    Body = #{query => "{ fieldDP(argA: \"localhost\") }"},
++    {Status, Data} = execute_bearer(?config(endpoint_addr, Config), Body, Token),
++    assert_access_granted(Status, Data).
++
++jwt_domain_admin_nonexistent_domain_error(Config) ->
++    assert_jwt_rejected(Config, (valid_claims())#{domain => <<"localhost2">>}, <<"key-a">>).
++
++jwt_domain_admin_missing_domain_error(Config) ->
++    assert_jwt_rejected(Config, valid_claims(), <<"key-a">>),
++    assert_jwt_rejected(Config, (valid_claims())#{domain => 42}, <<"key-a">>).
++
++jwt_domain_admin_wrong_signature_error(Config) ->
++    assert_jwt_rejected(Config, (valid_claims())#{domain => <<"localhost">>}, <<"key-c">>).
++
++jwt_domain_admin_password_still_accepted(Config) ->
++    Ep = ?config(endpoint_addr, Config),
++    {Status, Data} = execute(Ep, #{query => "{ field }"}, {<<"admin@localhost">>, <<"makota">>}),
++    assert_access_granted(Status, Data).
++
+ malformed_auth_header_error(Config) ->
+     Ep = ?config(endpoint_addr, Config),
+     % The encoded credentials value is malformed and cannot be decoded.
+@@ -1400,10 +1550,16 @@ example_listener_schema_data(Config) ->
+     [{atom(), term()}].
+ init_ep_listener(Port, EpName, ListenerOpts, Config) ->
+     Pid = spawn(fun() ->
+-                    Name = list_to_atom("gql_listener_" ++ atom_to_list(EpName)),
++                    Name = list_to_atom("gql_listener_" ++ integer_to_list(Port)),
+                     ok = start_listener(Name, Port, ListenerOpts),
+                     {Mapping, Pattern} = example_listener_schema_data(Config),
+-                    {ok, _} = mongoose_graphql:create_endpoint(EpName, Mapping, [Pattern]),
++                    %% The admin endpoints share the schema, which might be already loaded
++                    case whereis(EpName) of
++                        undefined ->
++                            {ok, _} = mongoose_graphql:create_endpoint(EpName, Mapping, [Pattern]);
++                        _ ->
++                            ok
++                    end,
+                     receive
+                         stop ->
+                             ok
+@@ -1444,6 +1600,50 @@ post_request(Ep, HeadersIn, Body) ->
+ random_request_id() ->
+     binary:encode_hex(crypto:strong_rand_bytes(8), lowercase).
+ 
++jwt_listener_opts(Opts) ->
++    JwtOpts = #{keys => [#{kid => <<"a">>, algorithm => hs256, secret => {value, <<"key-a">>}},
++                         #{kid => <<"b">>, algorithm => hs256, secret => {value, <<"key-b">>}}],
++                issuer => <<"issuer">>,
++                audience => <<"mim">>,
++                domain_key => <<"domain">>},
++    Opts#{jwt => JwtOpts, jwt_keys => mongoose_graphql_jwt:read_keys(JwtOpts)}.
++
++valid_claims() ->
++    #{iss => <<"issuer">>, aud => <<"mim">>, sub => <<"tester">>, exp => now_s() + 60}.
++
++now_s() ->
++    erlang:system_time(second).
++
++assert_jwt_access_granted(Config, Claims, Key) ->
++    Body = #{query => "{ field }"},
++    {Status, Data} = execute_bearer(?config(endpoint_addr, Config), Body, make_token(Claims, Key)),
++    assert_access_granted(Status, Data).
++
++assert_jwt_rejected(Config, Claims, Key) ->
++    assert_bearer_rejected(Config, make_token(Claims, Key)).
++
++assert_bearer_rejected(Config, Token) ->
++    Body = #{query => "{ field }"},
++    {Status, Data} = execute_bearer(?config(endpoint_addr, Config), Body, Token),
++    assert_no_permissions(wrong_credentials, Status, Data).
++
++make_token(Claims, {Key, Kid}) ->
++    make_token(<<"HS256">>, sha256, Kid, Claims, Key);
++make_token(Claims, Key) ->
++    make_token(<<"HS256">>, sha256, undefined, Claims, Key).
++
++make_token(Alg, Sha, Kid, Claims, Key) ->
++    Header = maps:merge(#{alg => Alg, typ => <<"JWT">>},
++                        case Kid of undefined -> #{}; _ -> #{kid => Kid} end),
++    Input = <<(b64(jiffy:encode(Header)))/binary, ".", (b64(jiffy:encode(Claims)))/binary>>,
++    <<Input/binary, ".", (b64(crypto:mac(hmac, Sha, Key, Input)))/binary>>.
++
++b64(Bin) ->
++    base64:encode(Bin, #{mode => urlsafe, padding => false}).
++
++execute_bearer(EpAddr, Body, Token) ->
++    post_request(EpAddr, [{<<"Authorization">>, <<"Bearer ", Token/binary>>}], Body).
++
+ meck_domain_api(Config) ->
+     Hosts = [<<"test-domain.com">>, <<"localhost">>],
+     % mongoose_domain_api
+-- 
+2.43.0
+

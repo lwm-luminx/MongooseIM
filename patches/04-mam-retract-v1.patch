@@ -1,0 +1,461 @@
+From af2a1525db6f36975f6b20fb9b4a782429568684 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 16 Nov 2026 20:35:39 +0000
+Subject: [PATCH] Support the current version of XEP-0424 message retraction in
+ MAM
+
+Retraction messages with a top-level <retract xmlns='urn:xmpp:message-retract:1'/>
+element now retract archived messages, next to the older fasten form.
+Group chat messages are referred to by the stanza ID assigned by the room,
+other messages by their 'id' attribute, which is stored as the origin ID
+when the message has no origin-id element. Tombstones follow the version
+of the retraction, and mod_mam advertises urn:xmpp:message-retract:1 and
+its #tombstone feature.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01ETaRHXo1LmPHqZB9SXMucM
+---
+ big_tests/tests/mam_SUITE.erl      | 162 +++++++++++++++++++++++++++--
+ big_tests/tests/mam_helper.erl     |   6 +-
+ doc/modules/mod_mam.md             |  16 ++-
+ include/mongoose_ns.hrl            |   2 +
+ src/mam/mod_mam_muc_rdbms_arch.erl |   2 +-
+ src/mam/mod_mam_rdbms_arch.erl     |   2 +-
+ src/mam/mod_mam_utils.erl          |  65 +++++++++++-
+ 7 files changed, 238 insertions(+), 17 deletions(-)
+
+diff --git a/big_tests/tests/mam_SUITE.erl b/big_tests/tests/mam_SUITE.erl
+index 1b4139a..a5c8244 100644
+--- a/big_tests/tests/mam_SUITE.erl
++++ b/big_tests/tests/mam_SUITE.erl
+@@ -95,6 +95,8 @@
+          mam_ns_binary_extended/0,
+          retract_ns/0,
+          retract_tombstone_ns/0,
++         retract_1_ns/0,
++         retract_1_tombstone_ns/0,
+          groupchat_field_ns/0,
+          groupchat_available_ns/0,
+          data_validate_ns/0,
+@@ -372,10 +374,14 @@ stanzaid_cases() ->
+ retract_cases() ->
+     [retract_message,
+      retract_wrong_message,
+-     ignore_bad_retraction].
++     ignore_bad_retraction,
++     retract_message_v1,
++     retract_message_v1_on_origin_id,
++     retract_wrong_message_v1].
+ 
+ disabled_retract_cases() ->
+-    [retract_message].
++    [retract_message,
++     retract_message_v1].
+ 
+ nostore_cases() ->
+     [offline_message,
+@@ -404,10 +410,13 @@ muc_stanzaid_cases() ->
+ muc_retract_cases() ->
+     [retract_muc_message,
+      retract_muc_message_on_stanza_id,
+-     retract_wrong_muc_message].
++     retract_wrong_muc_message,
++     retract_muc_message_v1,
++     retract_muc_message_v1_on_origin_id].
+ 
+ disabled_muc_retract_cases() ->
+-    [retract_muc_message].
++    [retract_muc_message,
++     retract_muc_message_v1].
+ 
+ muc_configurable_archiveid_cases() ->
+     [
+@@ -912,7 +921,12 @@ maybe_skip(C, Config) when C =:= retract_message;
+                            C =:= retract_message_on_stanza_id;
+                            C =:= retract_muc_message;
+                            C =:= retract_muc_message_on_stanza_id;
+-                           C =:= retract_wrong_muc_message ->
++                           C =:= retract_wrong_muc_message;
++                           C =:= retract_message_v1;
++                           C =:= retract_message_v1_on_origin_id;
++                           C =:= retract_wrong_message_v1;
++                           C =:= retract_muc_message_v1;
++                           C =:= retract_muc_message_v1_on_origin_id ->
+     ConfList = rdbms_configs(true, ct_helper:get_internal_database()),
+     skip_if(not lists:member(?config(configuration, Config), ConfList),
+             "message retraction not supported");
+@@ -2341,6 +2355,56 @@ test_retract_message(Config) ->
+     end,
+     escalus_fresh:story(Config, [{alice, 1}, {bob, 1}], F).
+ 
++%% XEP-0424 version 1 refers to a chat message by its 'id' attribute
++retract_message_v1(Config) ->
++    test_retract_message_v1(Config, message_id, fun(Msg) -> Msg end).
++
++%% Clients may also send an origin-id equal to the message 'id'
++retract_message_v1_on_origin_id(Config) ->
++    test_retract_message_v1(Config, message_id, fun add_origin_id_equal_to_id/1).
++
++retract_wrong_message_v1(Config) ->
++    test_retract_message_v1(Config, <<"wrong-id">>, fun(Msg) -> Msg end).
++
++test_retract_message_v1(Config, RetractOn, PrepareMsg) ->
++    P = ?config(props, Config),
++    F = fun(Alice, Bob) ->
++        %% GIVEN Alice sends a message to Bob
++        Body = <<"OH, HAI!">>,
++        MsgId = escalus_stanza:id(),
++        Msg = PrepareMsg(escalus_stanza:set_id(escalus_stanza:chat_to(Bob, Body), MsgId)),
++        escalus:send(Alice, Msg),
++        escalus:assert(is_chat_message, [Body], escalus:wait_for_stanza(Bob)),
++        mam_helper:wait_for_archive_size(Alice, 1),
++
++        %% WHEN Alice retracts the message
++        RetractId = case RetractOn of
++                        message_id -> MsgId;
++                        WrongId -> WrongId
++                    end,
++        RetractMsg = retraction_message_v1(<<"chat">>, escalus_utils:get_jid(Bob), RetractId),
++        escalus:send(Alice, RetractMsg),
++
++        %% THEN Bob receives the retraction ...
++        RecvRetract = escalus:wait_for_stanza(Bob),
++        ?assertEqual(RetractId, exml_query:path(RecvRetract, [{element_with_ns, <<"retract">>,
++                                                               retract_1_ns()},
++                                                              {attr, <<"id">>}])),
++        maybe_wait_for_archive(Config),
++
++        %% ... and Alice and Bob have both messages in their archives
++        ShouldRetract = message_retraction_is_enabled(Config) andalso RetractOn =:= message_id,
++        escalus:send(Alice, stanza_archive_request(P, <<"q1">>)),
++        check_archive_after_retraction_v1(ShouldRetract, Alice, RetractMsg, Body),
++        escalus:send(Bob, stanza_archive_request(P, <<"q2">>)),
++        check_archive_after_retraction_v1(ShouldRetract, Bob, RetractMsg, Body)
++    end,
++    escalus_fresh:story(Config, [{alice, 1}, {bob, 1}], F).
++
++add_origin_id_equal_to_id(Msg = #xmlel{children = Children}) ->
++    MsgId = exml_query:attr(Msg, <<"id">>),
++    Msg#xmlel{children = Children ++ [origin_id_element(MsgId)]}.
++
+ filter_forwarded(Config) ->
+     P = ?config(props, Config),
+     F = fun(Alice, Bob) ->
+@@ -2497,6 +2561,55 @@ test_retract_muc_message(Config) ->
+     end,
+     escalus:story(Config, [{alice, 1}, {bob, 1}], F).
+ 
++%% XEP-0424 version 1 refers to a group chat message by the stanza ID assigned by the room
++retract_muc_message_v1(Config) ->
++    test_retract_muc_message_v1(Config, stanza_id).
++
++%% When the room didn't assign a stanza ID, the client uses the origin ID
++retract_muc_message_v1_on_origin_id(Config) ->
++    test_retract_muc_message_v1(Config, origin_id).
++
++test_retract_muc_message_v1(Config, RetractOn) ->
++    P = ?config(props, Config),
++    F = fun(Alice, Bob) ->
++        Room = ?config(room, Config),
++        RoomAddr = room_address(Room),
++        escalus:send(Alice, stanza_muc_enter_room(Room, nick(Alice))),
++        escalus:send(Bob, stanza_muc_enter_room(Room, nick(Bob))),
++        %% Bob receives two presences and the room's subject, and Alice does as well
++        escalus:wait_for_stanzas(Bob, 3),
++        escalus:wait_for_stanzas(Alice, 3),
++
++        %% GIVEN Alice sends a message with 'origin-id' to the room
++        Body = <<"Hi, Bob!">>,
++        OriginId = origin_id(),
++        Msg = #xmlel{children = Children} = escalus_stanza:groupchat_to(RoomAddr, Body),
++        escalus:send(Alice, Msg#xmlel{children = Children ++ [origin_id_element(OriginId)]}),
++        AliceCopyOfMessage = escalus:wait_for_stanza(Alice),
++        escalus:wait_for_stanza(Bob),
++
++        %% WHEN Alice retracts the message
++        RetractId = case RetractOn of
++                        stanza_id -> stanza_id_from_msg(AliceCopyOfMessage);
++                        origin_id -> OriginId
++                    end,
++        RetractMsg = retraction_message_v1(<<"groupchat">>, RoomAddr, RetractId),
++        escalus:send(Alice, RetractMsg),
++
++        %% THEN Bob receives the retraction ...
++        RecvRetract = escalus:wait_for_stanza(Bob),
++        ?assertEqual(RetractId, exml_query:path(RecvRetract, [{element_with_ns, <<"retract">>,
++                                                               retract_1_ns()},
++                                                              {attr, <<"id">>}])),
++        maybe_wait_for_archive(Config),
++
++        %% ... and finds both messages in the room archive
++        escalus:send(Bob, stanza_to_room(stanza_archive_request(P, <<"q1">>), Room)),
++        check_archive_after_retraction_v1(message_retraction_is_enabled(Config),
++                                          Bob, RetractMsg, Body)
++    end,
++    escalus:story(Config, [{alice, 1}, {bob, 1}], F).
++
+ muc_archive_is_instrumented(Config) ->
+     F = fun(Alice, Bob) ->
+         Room = ?config(room, Config),
+@@ -3887,11 +4000,14 @@ discover_features(Config, Client, Service) ->
+     escalus:assert(has_feature, [mam_ns_binary_v06()], Stanza),
+     escalus:assert(has_feature, [mam_ns_binary_extended()], Stanza),
+     escalus:assert(has_feature, [retract_ns()], Stanza),
++    escalus:assert(has_feature, [retract_1_ns()], Stanza),
+     check_include_groupchat_features(Stanza,
+                                      ?config(configuration, Config),
+                                      ?config(basic_group, Config)),
+     ?assert_equal(message_retraction_is_enabled(Config),
+-                  escalus_pred:has_feature(retract_tombstone_ns(), Stanza)).
++                  escalus_pred:has_feature(retract_tombstone_ns(), Stanza)),
++    ?assert_equal(message_retraction_is_enabled(Config),
++                  escalus_pred:has_feature(retract_1_tombstone_ns(), Stanza)).
+ 
+ messages_filtered_when_prefs_default_policy_is_always(Config) ->
+     run_prefs_cases(always, Config).
+@@ -4195,6 +4311,40 @@ then_pm_message_is_received(Receiver, Body) ->
+ 
+ %% Message retraction helpers
+ 
++retraction_message_v1(Type, To, RetractId) ->
++    #xmlel{name = <<"message">>,
++           attrs = #{<<"type">> => Type,
++                     <<"to">> => To,
++                     <<"id">> => escalus_stanza:id()},
++           children = [#xmlel{name = <<"retract">>,
++                              attrs = #{<<"xmlns">> => retract_1_ns(), <<"id">> => RetractId}},
++                       #xmlel{name = <<"fallback">>,
++                              attrs = #{<<"xmlns">> => <<"urn:xmpp:fallback:0">>,
++                                        <<"for">> => retract_1_ns()}},
++                       #xmlel{name = <<"body">>,
++                              children = [#xmlcdata{content = <<"/me retracted a message">>}]},
++                       #xmlel{name = <<"store">>,
++                              attrs = #{<<"xmlns">> => <<"urn:xmpp:hints">>}}]}.
++
++check_archive_after_retraction_v1(ShouldRetract, Client, RetractMsg, Body) ->
++    [ArcMsg1, ArcMsg2] = respond_messages(assert_respond_size(2, wait_archive_respond(Client))),
++    #forwarded_message{message_body = Body1, message_children = Children1} =
++        parse_forwarded_message(ArcMsg1),
++    case ShouldRetract of
++        true ->
++            ?assertEqual(undefined, Body1),
++            [Retracted] = Children1,
++            ?assertEqual(<<"retracted">>, Retracted#xmlel.name),
++            ?assertEqual(retract_1_ns(), exml_query:attr(Retracted, <<"xmlns">>)),
++            ?assertEqual(exml_query:attr(RetractMsg, <<"id">>),
++                         exml_query:attr(Retracted, <<"id">>));
++        false ->
++            ?assertEqual(Body, Body1)
++    end,
++    %% The retraction itself is archived as well
++    #forwarded_message{message_children = Children2} = parse_forwarded_message(ArcMsg2),
++    ?assertMatch([_], [El || El = #xmlel{name = <<"retract">>} <- Children2]).
++
+ check_archive_after_retraction(Config, Client, ApplyToElement, Body) ->
+     case message_should_be_retracted(Config) of
+         true -> expect_tombstone_and_retraction_message(Client, ApplyToElement);
+diff --git a/big_tests/tests/mam_helper.erl b/big_tests/tests/mam_helper.erl
+index 1e941dc..2c8f575 100644
+--- a/big_tests/tests/mam_helper.erl
++++ b/big_tests/tests/mam_helper.erl
+@@ -164,7 +164,9 @@ namespaces() ->
+      mam_ns_binary_extended(),
+      retract_ns(),
+      retract_esl_ns(),
+-     retract_tombstone_ns()].
++     retract_tombstone_ns(),
++     retract_1_ns(),
++     retract_1_tombstone_ns()].
+ 
+ mam_ns_binary() -> mam_ns_binary_v04().
+ mam_ns_binary_v04() -> <<"urn:xmpp:mam:1">>.
+@@ -173,6 +175,8 @@ mam_ns_binary_extended() -> <<"urn:xmpp:mam:2#extended">>.
+ retract_ns() -> <<"urn:xmpp:message-retract:0">>.
+ retract_esl_ns() -> <<"urn:esl:message-retract-by-stanza-id:0">>.
+ retract_tombstone_ns() -> <<"urn:xmpp:message-retract:0#tombstone">>.
++retract_1_ns() -> <<"urn:xmpp:message-retract:1">>.
++retract_1_tombstone_ns() -> <<"urn:xmpp:message-retract:1#tombstone">>.
+ groupchat_field_ns() -> <<"urn:xmpp:mam:2#groupchat-field">>.
+ groupchat_available_ns() -> <<"urn:xmpp:mam:2#groupchat-available">>.
+ data_validate_ns() -> <<"http://jabber.org/protocol/xdata-validate">>.
+diff --git a/doc/modules/mod_mam.md b/doc/modules/mod_mam.md
+index 5b1203d..c04076d 100644
+--- a/doc/modules/mod_mam.md
++++ b/doc/modules/mod_mam.md
+@@ -18,15 +18,23 @@ Configure MAM with different storage backends:
+ `mod_mam` is a meta-module that ensures all relevant `mod_mam_*` modules are loaded and properly configured.
+ 
+ ### Message retraction
+-This module supports [XEP-0424: Message Retraction](http://xmpp.org/extensions/xep-0424.html) with RDBMS storage backends. When a [retraction message](https://xmpp.org/extensions/xep-0424.html#example-4) is received, the MAM module finds the message to retract and replaces it with a tombstone.
++This module supports [XEP-0424: Message Retraction](http://xmpp.org/extensions/xep-0424.html) with RDBMS storage backends. When a [retraction message](https://xmpp.org/extensions/xep-0424.html#usecase) is received, the MAM module finds the message to retract and replaces it with a tombstone. The retraction message itself is archived as well.
+ 
+-The following criteria are used to find the original message:
++Both versions of the XEP are supported:
++
++* The current version (`urn:xmpp:message-retract:1`) uses a top-level `retract` element. Its `id` attribute refers to:
++    * the `stanza-id` assigned by the room, for messages of type `groupchat` (if the `id` is not a valid stanza ID, it is treated as an origin ID),
++    * the `id` attribute of the original message, for other messages. The archive stores it as the origin ID when the message has no `origin-id` element.
++
++    The tombstone is a `<retracted xmlns='urn:xmpp:message-retract:1'/>` element whose `id` attribute is the `id` of the retraction message.
++* The older version (`urn:xmpp:message-retract:0`) wraps the `retract` element in an `apply-to` element (XEP-0422). Its `id` attribute has to be the same as the `id` attribute of the `origin-id` (or `stanza-id` when configured, see [below](#retraction-on-the-stanza-id)) element of the original message.
++
++In both cases:
+ 
+-* The `id` attribute specified in the `apply-to` element of the retraction message has to be the same as the `id` attribute of the `origin-id` (or `stanza-id` when configured, see [below](#retraction-on-the-stanza-id)) element of the original message.
+ * Both messages need to originate from the same user.
+ * Both messages need to be addressed to the same user.
+ 
+-If more than one message matches the criteria, only the most recent one is retracted. To avoid this case, it is recommended to use a unique identifier (UUID) as the origin ID.
++If more than one message matches the criteria, only the most recent one is retracted. To avoid this case, it is recommended to use a unique identifier (UUID) as the message ID or origin ID.
+ 
+ #### Retraction on the stanza-id
+ This module also implements an extension to the XEP, where it allows to specify the [`stanza-id`](https://xmpp.org/extensions/xep-0359.html#stanza-id) as [created by](https://xmpp.org/extensions/xep-0313.html#archives_id) the server's MAM, instead of the `origin-id` that the original [XEP-0424](https://xmpp.org/extensions/xep-0424.html) specifies. It announces this capability under the namespace `urn:esl:message-retract-by-stanza-id:0`. This is specially useful in groupchats where the `stanza-id` of a message is shared and known for all participants.
+diff --git a/include/mongoose_ns.hrl b/include/mongoose_ns.hrl
+index 0d9f0a7..9ed85c9 100644
+--- a/include/mongoose_ns.hrl
++++ b/include/mongoose_ns.hrl
+@@ -115,6 +115,8 @@
+ -define(NS_FASTEN,              <<"urn:xmpp:fasten:0">>).
+ -define(NS_RETRACT,             <<"urn:xmpp:message-retract:0">>).
+ -define(NS_RETRACT_TOMBSTONE,   <<"urn:xmpp:message-retract:0#tombstone">>).
++-define(NS_RETRACT_1,           <<"urn:xmpp:message-retract:1">>).
++-define(NS_RETRACT_1_TOMBSTONE, <<"urn:xmpp:message-retract:1#tombstone">>).
+ 
+ -define(JINGLE_NS, <<"urn:xmpp:jingle:1">>).
+ -define(JINGLE_MSG_NS, <<"urn:xmpp:jingle-message:0">>).
+diff --git a/src/mam/mod_mam_muc_rdbms_arch.erl b/src/mam/mod_mam_muc_rdbms_arch.erl
+index 5e4adf1..b5c8a7f 100644
+--- a/src/mam/mod_mam_muc_rdbms_arch.erl
++++ b/src/mam/mod_mam_muc_rdbms_arch.erl
+@@ -278,7 +278,7 @@ make_tombstone(HostType, ArcID, _RetractionId,
+                RetractionInfo = #{message_id := MessID}, Params,
+                #{archive_jid := ArcJID} = Env) ->
+     RetractionInfo1 = mongoose_hooks:mam_muc_retraction(HostType, RetractionInfo, Params),
+-    Tombstone = mod_mam_utils:tombstone(RetractionInfo1, ArcJID),
++    Tombstone = mod_mam_utils:tombstone(RetractionInfo1, maps:get(packet, Params), ArcJID),
+     TombstoneData = mam_encoder:encode_packet(Tombstone, Env),
+     execute_make_tombstone(HostType, TombstoneData, ArcID, MessID).
+ 
+diff --git a/src/mam/mod_mam_rdbms_arch.erl b/src/mam/mod_mam_rdbms_arch.erl
+index 42272f0..a7ceee2 100644
+--- a/src/mam/mod_mam_rdbms_arch.erl
++++ b/src/mam/mod_mam_rdbms_arch.erl
+@@ -320,7 +320,7 @@ make_tombstone(HostType, ArcID, _RetractionId,
+                RetractionInfo = #{message_id := MessID}, Params,
+                #{archive_jid := ArcJID} = Env) ->
+     RetractionInfo1 = mongoose_hooks:mam_retraction(HostType, RetractionInfo, Params),
+-    Tombstone = mod_mam_utils:tombstone(RetractionInfo1, ArcJID),
++    Tombstone = mod_mam_utils:tombstone(RetractionInfo1, maps:get(packet, Params), ArcJID),
+     TombstoneData = mam_encoder:encode_packet(Tombstone, Env),
+     execute_make_tombstone(HostType, TombstoneData, ArcID, MessID).
+ 
+diff --git a/src/mam/mod_mam_utils.erl b/src/mam/mod_mam_utils.erl
+index 129814f..30bd4e9 100644
+--- a/src/mam/mod_mam_utils.erl
++++ b/src/mam/mod_mam_utils.erl
+@@ -36,6 +36,7 @@
+          is_groupchat/1,
+          should_page_be_flipped/1,
+          tombstone/2,
++         tombstone/3,
+          wrap_message/6,
+          wrap_message/7,
+          result_set/4,
+@@ -389,8 +390,36 @@ get_retract_id(true = _Enabled, Packet) ->
+ get_retract_id(false, _Packet) ->
+     none.
+ 
++%% @doc Returns the ID of the message to retract (XEP-0424).
++%% The current version of the XEP (`urn:xmpp:message-retract:1') refers to group chat messages
++%% by the stanza ID assigned by the room, and to other messages by their 'id' attribute,
++%% which is stored as the origin ID when the message has no origin-id element.
++%% The older version (`urn:xmpp:message-retract:0') wraps the request in a fasten element.
+ -spec get_retract_id(exml:element()) -> none | retraction_id().
+ get_retract_id(Packet) ->
++    case exml_query:subelement_with_name_and_ns(Packet, <<"retract">>, ?NS_RETRACT_1) of
++        undefined ->
++            get_fasten_retract_id(Packet);
++        Retract ->
++            get_retract_1_id(exml_query:attr(Packet, <<"type">>),
++                             exml_query:attr(Retract, <<"id">>, <<>>))
++    end.
++
++-spec get_retract_1_id(binary() | undefined, binary()) -> none | retraction_id().
++get_retract_1_id(_Type, <<>>) ->
++    none;
++get_retract_1_id(<<"groupchat">>, Id) ->
++    try external_binary_to_mess_id(Id) of
++        _ -> {stanza_id, Id}
++    catch throw:invalid_stanza_id ->
++            %% The room did not assign stanza IDs, so the client used the origin ID
++            {origin_id, Id}
++    end;
++get_retract_1_id(_Type, Id) ->
++    {origin_id, Id}.
++
++-spec get_fasten_retract_id(exml:element()) -> none | retraction_id().
++get_fasten_retract_id(Packet) ->
+     case exml_query:path(Packet, [{element_with_ns, <<"apply-to">>, ?NS_FASTEN}], none) of
+         none -> none;
+         Fasten ->
+@@ -403,9 +432,14 @@ get_retract_id(Packet) ->
+             end
+     end.
+ 
++%% @doc Returns the origin ID of a message (XEP-0359), or its 'id' attribute if it has none.
++%% The current version of XEP-0424 refers to retracted messages by their 'id' attribute.
+ get_origin_id(Packet) ->
+-    exml_query:path(Packet, [{element_with_ns, <<"origin-id">>, ?NS_STANZAID},
+-                             {attr, <<"id">>}], none).
++    case exml_query:path(Packet, [{element_with_ns, <<"origin-id">>, ?NS_STANZAID},
++                                  {attr, <<"id">>}], none) of
++        none -> exml_query:attr(Packet, <<"id">>, none);
++        OriginID -> OriginID
++    end.
+ 
+ is_groupchat(<<"groupchat">>) ->
+     true;
+@@ -457,6 +491,28 @@ determine_result(#{}, Offset, Messages) ->
+ tombstone(RetractionInfo = #{packet := Packet}, LocJid) ->
+     Packet#xmlel{children = [retracted_element(RetractionInfo, LocJid)]}.
+ 
++%% @doc Like `tombstone/2', but the tombstone follows the version of XEP-0424 used
++%% by the retraction message.
++-spec tombstone(retraction_info(), exml:element(), jid:jid()) -> exml:element().
++tombstone(RetractionInfo = #{packet := Packet}, RetractionPacket, LocJid) ->
++    case exml_query:subelement_with_name_and_ns(RetractionPacket, <<"retract">>, ?NS_RETRACT_1) of
++        undefined ->
++            tombstone(RetractionInfo, LocJid);
++        _ ->
++            Packet#xmlel{children = [retracted_1_element(RetractionPacket)]}
++    end.
++
++%% The 'id' attribute refers to the retraction message, which is kept in the archive
++-spec retracted_1_element(exml:element()) -> exml:element().
++retracted_1_element(RetractionPacket) ->
++    Timestamp = calendar:system_time_to_rfc3339(erlang:system_time(second), [{offset, "Z"}]),
++    Attrs = #{<<"xmlns">> => ?NS_RETRACT_1, <<"stamp">> => list_to_binary(Timestamp)},
++    IdAttrs = case exml_query:attr(RetractionPacket, <<"id">>) of
++                  undefined -> #{};
++                  Id -> #{<<"id">> => Id}
++              end,
++    #xmlel{name = <<"retracted">>, attrs = maps:merge(Attrs, IdAttrs)}.
++
+ -spec retracted_element(retraction_info(), jid:jid()) -> exml:element().
+ retracted_element(#{retract_on := origin_id,
+                     origin_id := OriginID}, _LocJid) ->
+@@ -761,8 +817,9 @@ mam_features() ->
+ 
+ retraction_features(Module, HostType) ->
+     case has_message_retraction(Module, HostType) of
+-        true -> [?NS_RETRACT, ?NS_RETRACT_TOMBSTONE, ?NS_ESL_RETRACT];
+-        false -> [?NS_RETRACT]
++        true -> [?NS_RETRACT, ?NS_RETRACT_TOMBSTONE, ?NS_ESL_RETRACT,
++                 ?NS_RETRACT_1, ?NS_RETRACT_1_TOMBSTONE];
++        false -> [?NS_RETRACT, ?NS_RETRACT_1]
+     end.
+ 
+ groupchat_features(mod_mam_pm = Module, HostType) ->
+-- 
+2.43.0
+

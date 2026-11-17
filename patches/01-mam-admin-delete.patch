@@ -1,0 +1,886 @@
+From 2a5186e64f36085bd1e88bacce64608d30abe9cc Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 16 Nov 2026 20:19:19 +0000
+Subject: [PATCH] Add admin API for deleting archived messages older than a
+ date
+
+Add a `mam` category to the admin GraphQL API (and mongooseimctl) with
+four commands that delete messages archived before a given date:
+deleteRoomMessages (one room), deleteOldRoomMessages (all rooms of a MUC
+service), deleteUserMessages (one user's one-to-one archive) and
+deleteOldMessages (all one-to-one archives of a domain). Each returns
+the number of deleted messages.
+
+Unlike message retraction, which keeps a tombstone row, these remove
+the rows, so they can be used to enforce a retention period.
+
+The deletion is done by the archive backend through the new
+mam_delete_messages and mam_muc_delete_messages hooks. The RDBMS
+backends delete by the primary key (archive id, message id < cut-off),
+and honour delete_domain_limit to delete in batches. Other backends
+return a not_supported error.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01ETaRHXo1LmPHqZB9SXMucM
+---
+ big_tests/default.spec                        |   1 +
+ big_tests/dynamic_domains.spec                |   1 +
+ big_tests/tests/graphql_mam_SUITE.erl         | 280 ++++++++++++++++++
+ doc/developers-guide/hooks_description.md     |   2 +
+ doc/modules/mod_mam.md                        |  16 +
+ priv/graphql/schemas/admin/admin_schema.gql   |   2 +
+ priv/graphql/schemas/admin/mam.gql            |  17 ++
+ .../admin/mongoose_graphql_admin_mutation.erl |   2 +
+ .../mongoose_graphql_mam_admin_mutation.erl   |  31 ++
+ src/graphql/mongoose_graphql.erl              |   1 +
+ src/graphql/mongoose_graphql_handler.erl      |   2 +-
+ src/hooks/mongoose_hooks.erl                  |  23 ++
+ src/mam/mod_mam.erl                           |   9 +
+ src/mam/mod_mam_api.erl                       |  84 ++++++
+ src/mam/mod_mam_muc_rdbms_arch.erl            |  20 ++
+ src/mam/mod_mam_rdbms_arch.erl                |  20 ++
+ src/mam/mod_mam_utils.erl                     |  66 +++++
+ 17 files changed, 576 insertions(+), 1 deletion(-)
+ create mode 100644 big_tests/tests/graphql_mam_SUITE.erl
+ create mode 100644 priv/graphql/schemas/admin/mam.gql
+ create mode 100644 src/graphql/admin/mongoose_graphql_mam_admin_mutation.erl
+ create mode 100644 src/mam/mod_mam_api.erl
+
+diff --git a/big_tests/default.spec b/big_tests/default.spec
+index 154ae5e..ff80174 100644
+--- a/big_tests/default.spec
++++ b/big_tests/default.spec
+@@ -33,6 +33,7 @@
+ {suites, "tests", graphql_domain_SUITE}.
+ {suites, "tests", graphql_inbox_SUITE}.
+ {suites, "tests", graphql_last_SUITE}.
++{suites, "tests", graphql_mam_SUITE}.
+ {suites, "tests", graphql_muc_SUITE}.
+ {suites, "tests", graphql_muc_light_SUITE}.
+ {suites, "tests", graphql_offline_SUITE}.
+diff --git a/big_tests/dynamic_domains.spec b/big_tests/dynamic_domains.spec
+index b91097b..ebbd608 100644
+--- a/big_tests/dynamic_domains.spec
++++ b/big_tests/dynamic_domains.spec
+@@ -40,6 +40,7 @@
+ {suites, "tests", graphql_inbox_SUITE}.
+ {suites, "tests", graphql_last_SUITE}.
+ 
++{suites, "tests", graphql_mam_SUITE}.
+ {suites, "tests", graphql_muc_SUITE}.
+ 
+ {suites, "tests", graphql_muc_light_SUITE}.
+diff --git a/big_tests/tests/graphql_mam_SUITE.erl b/big_tests/tests/graphql_mam_SUITE.erl
+new file mode 100644
+index 0000000..e18e76f
+--- /dev/null
++++ b/big_tests/tests/graphql_mam_SUITE.erl
+@@ -0,0 +1,280 @@
++-module(graphql_mam_SUITE).
++
++-compile([export_all, nowarn_export_all]).
++
++-import(distributed_helper, [mim/0, require_rpc_nodes/1, subhost_pattern/1]).
++-import(domain_helper, [host_type/0, domain/0, secondary_domain/0]).
++-import(graphql_helper, [execute_command/4, get_ok_value/2, get_err_code/1,
++                         get_unauthorized/1, get_not_loaded/1]).
++-import(mam_helper, [rpc_apply/3]).
++
++-include_lib("eunit/include/eunit.hrl").
++
++-define(ROOM_DELETE_PATH, [data, mam, deleteRoomMessages]).
++-define(OLD_ROOM_DELETE_PATH, [data, mam, deleteOldRoomMessages]).
++-define(USER_DELETE_PATH, [data, mam, deleteUserMessages]).
++-define(OLD_DELETE_PATH, [data, mam, deleteOldMessages]).
++
++%% Messages are archived at these dates, and deleted before the cut-off date
++-define(DATES, [{{2020, 1, 1}, {10, 0, 0}}, {{2020, 1, 3}, {10, 0, 0}}, {{2020, 1, 5}, {10, 0, 0}}]).
++-define(BEFORE, <<"2020-01-04T00:00:00Z">>).
++
++suite() ->
++    require_rpc_nodes([mim]) ++ escalus:suite().
++
++all() ->
++    [{group, admin_http},
++     {group, admin_cli},
++     {group, domain_admin}].
++
++groups() ->
++    [{admin_http, [], admin_groups()},
++     {admin_cli, [], admin_groups()},
++     {domain_admin, [], domain_admin_groups()},
++     {admin_mam, [], admin_mam_tests()},
++     {admin_mam_not_configured, [], mam_not_configured_tests()},
++     {domain_admin_mam, [], domain_admin_mam_tests()},
++     {domain_admin_mam_not_configured, [], mam_not_configured_tests()}].
++
++admin_groups() ->
++    [{group, admin_mam},
++     {group, admin_mam_not_configured}].
++
++domain_admin_groups() ->
++    [{group, domain_admin_mam},
++     {group, domain_admin_mam_not_configured}].
++
++admin_mam_tests() ->
++    [delete_room_messages,
++     delete_room_messages_from_empty_archive,
++     delete_old_room_messages,
++     delete_user_messages,
++     delete_old_messages,
++     delete_room_messages_unknown_muc_server,
++     delete_old_room_messages_unknown_muc_server,
++     delete_user_messages_unknown_domain,
++     delete_old_messages_unknown_domain].
++
++domain_admin_mam_tests() ->
++    [delete_room_messages,
++     delete_room_messages_from_empty_archive,
++     delete_old_room_messages,
++     delete_user_messages,
++     delete_old_messages,
++     domain_admin_delete_room_messages_no_permission,
++     domain_admin_delete_old_room_messages_no_permission,
++     domain_admin_delete_user_messages_no_permission,
++     domain_admin_delete_old_messages_no_permission].
++
++mam_not_configured_tests() ->
++    [delete_room_messages_mam_not_configured,
++     delete_user_messages_mam_not_configured].
++
++init_per_suite(Config) ->
++    case mam_helper:backend() of
++        rdbms ->
++            Config1 = dynamic_modules:save_modules(host_type(), Config),
++            Config2 = ejabberd_node_utils:init(mim(), Config1),
++            escalus:init_per_suite(Config2);
++        _ ->
++            {skip, "Deleting archived messages needs the rdbms MAM backend"}
++    end.
++
++end_per_suite(Config) ->
++    dynamic_modules:restore_modules(Config),
++    escalus:end_per_suite(Config).
++
++init_per_group(admin_http, Config) ->
++    graphql_helper:init_admin_handler(Config);
++init_per_group(admin_cli, Config) ->
++    graphql_helper:init_admin_cli(Config);
++init_per_group(domain_admin, Config) ->
++    graphql_helper:init_domain_admin_handler(Config);
++init_per_group(GroupName, Config) when GroupName =:= admin_mam;
++                                       GroupName =:= domain_admin_mam ->
++    muc_helper:load_muc(),
++    MAMOpts = mam_helper:config_opts(
++                #{pm => #{},
++                  muc => #{host => subhost_pattern(muc_helper:muc_host_pattern())},
++                  async_writer => #{enabled => false}}),
++    dynamic_modules:ensure_modules(host_type(), [{mod_mam, MAMOpts}]),
++    Config;
++init_per_group(GroupName, Config) when GroupName =:= admin_mam_not_configured;
++                                       GroupName =:= domain_admin_mam_not_configured ->
++    muc_helper:load_muc(),
++    dynamic_modules:ensure_modules(host_type(), [{mod_mam, stopped}]),
++    Config.
++
++end_per_group(GroupName, _Config) when GroupName =:= admin_http;
++                                       GroupName =:= admin_cli;
++                                       GroupName =:= domain_admin ->
++    graphql_helper:clean();
++end_per_group(_GroupName, _Config) ->
++    muc_helper:unload_muc().
++
++init_per_testcase(CaseName, Config) ->
++    escalus:init_per_testcase(CaseName, Config).
++
++end_per_testcase(CaseName, Config) ->
++    escalus:end_per_testcase(CaseName, Config),
++    escalus_fresh:clean().
++
++%% Test cases
++
++delete_room_messages(Config) ->
++    Room = fresh_room_name(),
++    OtherRoom = fresh_room_name(),
++    put_room_msgs(Room),
++    put_room_msgs(OtherRoom),
++    Res = delete_room_messages(room_jid(Room), ?BEFORE, Config),
++    ?assertEqual(2, get_ok_value(?ROOM_DELETE_PATH, Res)),
++    ?assertEqual(1, room_archive_size(Room)),
++    ?assertEqual(3, room_archive_size(OtherRoom)),
++    %% Nothing left to delete
++    Res2 = delete_room_messages(room_jid(Room), ?BEFORE, Config),
++    ?assertEqual(0, get_ok_value(?ROOM_DELETE_PATH, Res2)).
++
++delete_room_messages_from_empty_archive(Config) ->
++    Res = delete_room_messages(room_jid(fresh_room_name()), ?BEFORE, Config),
++    ?assertEqual(0, get_ok_value(?ROOM_DELETE_PATH, Res)).
++
++delete_old_room_messages(Config) ->
++    Room1 = fresh_room_name(),
++    Room2 = fresh_room_name(),
++    put_room_msgs(Room1),
++    put_room_msgs(Room2),
++    Res = delete_old_room_messages(muc_helper:muc_host(), ?BEFORE, Config),
++    %% Other test cases may leave old messages in other rooms of the MUC service
++    ?assert(get_ok_value(?OLD_ROOM_DELETE_PATH, Res) >= 4),
++    ?assertEqual(1, room_archive_size(Room1)),
++    ?assertEqual(1, room_archive_size(Room2)).
++
++delete_user_messages(Config) ->
++    escalus:fresh_story_with_config(Config, [{alice, 1}, {bob, 1}], fun delete_user_messages_story/3).
++
++delete_user_messages_story(Config, Alice, Bob) ->
++    put_msgs(Alice, Bob),
++    Res = delete_user_messages(escalus_client:short_jid(Alice), ?BEFORE, Config),
++    ?assertEqual(2, get_ok_value(?USER_DELETE_PATH, Res)),
++    ?assertEqual(1, archive_size(Alice)),
++    %% The other side of the conversation keeps its own copies
++    ?assertEqual(3, archive_size(Bob)).
++
++delete_old_messages(Config) ->
++    escalus:fresh_story_with_config(Config, [{alice, 1}, {bob, 1}], fun delete_old_messages_story/3).
++
++delete_old_messages_story(Config, Alice, Bob) ->
++    put_msgs(Alice, Bob),
++    Res = delete_old_messages(domain(), ?BEFORE, Config),
++    ?assert(get_ok_value(?OLD_DELETE_PATH, Res) >= 4),
++    ?assertEqual(1, archive_size(Alice)),
++    ?assertEqual(1, archive_size(Bob)).
++
++delete_room_messages_unknown_muc_server(Config) ->
++    Res = delete_room_messages(<<"room@unknown.muc.server">>, ?BEFORE, Config),
++    ?assertEqual(<<"muc_server_not_found">>, get_err_code(Res)).
++
++delete_old_room_messages_unknown_muc_server(Config) ->
++    Res = delete_old_room_messages(<<"unknown.muc.server">>, ?BEFORE, Config),
++    ?assertEqual(<<"muc_server_not_found">>, get_err_code(Res)).
++
++delete_user_messages_unknown_domain(Config) ->
++    Res = delete_user_messages(<<"user@unknown-domain">>, ?BEFORE, Config),
++    ?assertEqual(<<"domain_not_found">>, get_err_code(Res)).
++
++delete_old_messages_unknown_domain(Config) ->
++    Res = delete_old_messages(<<"unknown-domain">>, ?BEFORE, Config),
++    ?assertEqual(<<"domain_not_found">>, get_err_code(Res)).
++
++domain_admin_delete_room_messages_no_permission(Config) ->
++    get_unauthorized(delete_room_messages(<<"room@muc.", (secondary_domain())/binary>>,
++                                          ?BEFORE, Config)).
++
++domain_admin_delete_old_room_messages_no_permission(Config) ->
++    get_unauthorized(delete_old_room_messages(<<"muc.", (secondary_domain())/binary>>,
++                                              ?BEFORE, Config)).
++
++domain_admin_delete_user_messages_no_permission(Config) ->
++    get_unauthorized(delete_user_messages(<<"user@", (secondary_domain())/binary>>,
++                                          ?BEFORE, Config)).
++
++domain_admin_delete_old_messages_no_permission(Config) ->
++    get_unauthorized(delete_old_messages(secondary_domain(), ?BEFORE, Config)).
++
++delete_room_messages_mam_not_configured(Config) ->
++    get_not_loaded(delete_room_messages(room_jid(fresh_room_name()), ?BEFORE, Config)).
++
++delete_user_messages_mam_not_configured(Config) ->
++    get_not_loaded(delete_user_messages(<<"user@", (domain())/binary>>, ?BEFORE, Config)).
++
++%% Helpers
++
++fresh_room_name() ->
++    <<"mam-delete-", (binary:encode_hex(crypto:strong_rand_bytes(5), lowercase))/binary>>.
++
++room_jid(Room) ->
++    <<Room/binary, "@", (muc_helper:muc_host())/binary>>.
++
++%% Archive one message from Alice to Bob on each of ?DATES, in both archives
++put_msgs(Alice, Bob) ->
++    AliceArc = make_arc_id(Alice),
++    BobArc = make_arc_id(Bob),
++    [mam_helper:put_msg(mam_helper:generate_msg_for_date_user(AliceArc, BobArc, DateTime))
++     || DateTime <- ?DATES],
++    mam_helper:wait_for_archive_size(Alice, 3),
++    mam_helper:wait_for_archive_size(Bob, 3).
++
++make_arc_id(Client) ->
++    User = escalus_client:username(Client),
++    Server = escalus_client:server(Client),
++    Jid = mongoose_helper:make_jid(User, Server, <<>>),
++    {escalus_client:short_jid(Client), Jid, rpc_apply(mod_mam_pm, archive_id, [Server, User])}.
++
++archive_size(Client) ->
++    rpc_apply(mod_mam_pm, archive_size,
++              [escalus_client:server(Client), escalus_client:username(Client)]).
++
++%% Archive one room message on each of ?DATES
++put_room_msgs(Room) ->
++    MUCHost = muc_helper:muc_host(),
++    RoomJID = mongoose_helper:make_jid(Room, MUCHost, <<>>),
++    RoomArcID = rpc_apply(mod_mam_muc, archive_id, [MUCHost, Room]),
++    SenderJID = mongoose_helper:make_jid(<<"sender">>, domain(), <<"res">>),
++    SrcJID = mongoose_helper:make_jid(Room, MUCHost, <<"nick">>),
++    [ok = rpc_apply(mod_mam_muc, archive_message_for_ct,
++                    [#{message_id => message_id(DateTime),
++                       archive_id => RoomArcID,
++                       local_jid => RoomJID,
++                       remote_jid => SenderJID,
++                       source_jid => SrcJID,
++                       origin_id => none,
++                       direction => incoming,
++                       packet => escalus_stanza:groupchat_to(room_jid(Room), <<"Hi">>)}])
++     || DateTime <- ?DATES],
++    mam_helper:wait_for_room_archive_size(MUCHost, Room, 3).
++
++room_archive_size(Room) ->
++    rpc_apply(mod_mam_muc, archive_size, [muc_helper:muc_host(), Room]).
++
++message_id(DateTime) ->
++    Seconds = calendar:datetime_to_gregorian_seconds(DateTime)
++        - calendar:datetime_to_gregorian_seconds({{1970, 1, 1}, {0, 0, 0}}),
++    rpc_apply(mod_mam_utils, encode_compact_uuid, [Seconds * 1000000, 1]).
++
++%% Commands
++
++delete_room_messages(Room, Before, Config) ->
++    Vars = #{<<"room">> => Room, <<"before">> => Before},
++    execute_command(<<"mam">>, <<"deleteRoomMessages">>, Vars, Config).
++
++delete_old_room_messages(MUCDomain, Before, Config) ->
++    Vars = #{<<"mucDomain">> => MUCDomain, <<"before">> => Before},
++    execute_command(<<"mam">>, <<"deleteOldRoomMessages">>, Vars, Config).
++
++delete_user_messages(User, Before, Config) ->
++    Vars = #{<<"user">> => User, <<"before">> => Before},
++    execute_command(<<"mam">>, <<"deleteUserMessages">>, Vars, Config).
++
++delete_old_messages(Domain, Before, Config) ->
++    Vars = #{<<"domain">> => Domain, <<"before">> => Before},
++    execute_command(<<"mam">>, <<"deleteOldMessages">>, Vars, Config).
+diff --git a/doc/developers-guide/hooks_description.md b/doc/developers-guide/hooks_description.md
+index d8ce925..a33bb53 100644
+--- a/doc/developers-guide/hooks_description.md
++++ b/doc/developers-guide/hooks_description.md
+@@ -285,6 +285,7 @@ This is the perfect place to plug in custom security control.
+ * mam_archive_message
+ * mam_archive_size
+ * mam_archive_sync
++* mam_delete_messages
+ * mam_flush_messages
+ * mam_get_behaviour
+ * mam_get_prefs
+@@ -293,6 +294,7 @@ This is the perfect place to plug in custom security control.
+ * mam_muc_archive_message
+ * mam_muc_archive_size
+ * mam_muc_archive_sync
++* mam_muc_delete_messages
+ * mam_muc_flush_messages
+ * mam_muc_get_behaviour
+ * mam_muc_get_prefs
+diff --git a/doc/modules/mod_mam.md b/doc/modules/mod_mam.md
+index 5b1203d..465f828 100644
+--- a/doc/modules/mod_mam.md
++++ b/doc/modules/mod_mam.md
+@@ -63,6 +63,21 @@ When using ElasticSearch MAM backend, the value provided in `full-text-search` f
+ If you're using our official ElasticSearch mappings from `priv/elasticsearch` then the query analyzer is set to `english`.
+ Also note that the default separator for the search query is `AND` (which roughly means that ElasticSearch will search for messages containing all the terms provided in the query string).
+ 
++### Deleting old messages
++
++The [GraphQL admin API](../graphql-api/Admin-GraphQL.md) can delete messages archived before a given date, for example to enforce a retention period:
++
++* `mam.deleteRoomMessages(room, before)` deletes them from the archive of one MUC room,
++* `mam.deleteOldRoomMessages(mucDomain, before)` from the archives of all rooms of a MUC service,
++* `mam.deleteUserMessages(user, before)` from the one-to-one archive of one user,
++* `mam.deleteOldMessages(domain, before)` from the one-to-one archives of all users of a domain.
++
++Each command returns the number of deleted messages.
++The same commands are available in `mongooseimctl` as `mam deleteRoomMessages` and so on.
++Unlike [message retraction](#message-retraction), which keeps a tombstone in place of the retracted message, these commands remove the messages from the database.
++Only the `rdbms` backend supports them; with other backends they return a `not_supported` error.
++Large deletions can be split into batches with [`delete_domain_limit`](#modulesmod_mamdelete_domain_limit).
++
+ ## Options
+ 
+ ### `modules.mod_mam.backend`
+@@ -351,6 +366,7 @@ See [Message Archive Management extensions](../open-extensions/mam.md).
+ * **Example:** `modules.mod_mam.delete_domain_limit = 10000`
+ 
+ Domain deletion can be an expensive operation, as it requires to delete potentially many thousands of records from the DB. By default, the delete operation deletes everything in a transaction, but it might be desired, to handle timeouts and table locks more gracefully, to delete the records in batches. This limit establishes the size of the batch.
++It also applies to [deleting old messages](#deleting-old-messages) with the admin API.
+ 
+ #### `modules.mod_mam.db_jid_format`
+ 
+diff --git a/priv/graphql/schemas/admin/admin_schema.gql b/priv/graphql/schemas/admin/admin_schema.gql
+index e79cc85..8dc95b9 100644
+--- a/priv/graphql/schemas/admin/admin_schema.gql
++++ b/priv/graphql/schemas/admin/admin_schema.gql
+@@ -82,6 +82,8 @@ type AdminMutation @protected{
+   externalServices: ExternalServicesAdminMutation
+   "Deleting old Offline messages"
+   offline: OfflineAdminMutation
++  "Message archive management"
++  mam: MAMAdminMutation
+   "OAUTH user token management"
+   token: TokenAdminMutation
+   "Mnesia internal database management"
+diff --git a/priv/graphql/schemas/admin/mam.gql b/priv/graphql/schemas/admin/mam.gql
+new file mode 100644
+index 0000000..bb6b0a8
+--- /dev/null
++++ b/priv/graphql/schemas/admin/mam.gql
+@@ -0,0 +1,17 @@
++"""
++Allow admin to manage message archives (XEP-0313).
++"""
++type MAMAdminMutation @protected{
++  "Delete messages archived before the given date from a MUC room's archive. Returns the number of deleted messages"
++  deleteRoomMessages(room: BareJID!, before: DateTime!): Int
++    @protected(type: DOMAIN, args: ["room"]) @use(modules: ["mod_mam_muc"], args: ["room"])
++  "Delete messages archived before the given date from the archives of all rooms of a MUC service. Returns the number of deleted messages"
++  deleteOldRoomMessages(mucDomain: DomainName!, before: DateTime!): Int
++    @protected(type: DOMAIN, args: ["mucDomain"]) @use(modules: ["mod_mam_muc"], args: ["mucDomain"])
++  "Delete messages archived before the given date from a user's one-to-one archive. Returns the number of deleted messages"
++  deleteUserMessages(user: JID!, before: DateTime!): Int
++    @protected(type: DOMAIN, args: ["user"]) @use(modules: ["mod_mam_pm"], args: ["user"])
++  "Delete messages archived before the given date from the one-to-one archives of all users of a domain. Returns the number of deleted messages"
++  deleteOldMessages(domain: DomainName!, before: DateTime!): Int
++    @protected(type: DOMAIN, args: ["domain"]) @use(modules: ["mod_mam_pm"], args: ["domain"])
++}
+diff --git a/src/graphql/admin/mongoose_graphql_admin_mutation.erl b/src/graphql/admin/mongoose_graphql_admin_mutation.erl
+index 43e3c2d..4795f42 100644
+--- a/src/graphql/admin/mongoose_graphql_admin_mutation.erl
++++ b/src/graphql/admin/mongoose_graphql_admin_mutation.erl
+@@ -19,6 +19,8 @@ execute(_Ctx, _Obj, <<"inbox">>, _Args) ->
+     {ok, inbox};
+ execute(_Ctx, _Obj, <<"last">>, _Args) ->
+     {ok, last};
++execute(_Ctx, _Obj, <<"mam">>, _Args) ->
++    {ok, mam};
+ execute(_Ctx, _Obj, <<"muc">>, _Args) ->
+     {ok, muc};
+ execute(_Ctx, _Obj, <<"muc_light">>, _Args) ->
+diff --git a/src/graphql/admin/mongoose_graphql_mam_admin_mutation.erl b/src/graphql/admin/mongoose_graphql_mam_admin_mutation.erl
+new file mode 100644
+index 0000000..2801d37
+--- /dev/null
++++ b/src/graphql/admin/mongoose_graphql_mam_admin_mutation.erl
+@@ -0,0 +1,31 @@
++-module(mongoose_graphql_mam_admin_mutation).
++-behaviour(mongoose_graphql).
++
++-export([execute/4]).
++
++-ignore_xref([execute/4]).
++
++-include("../mongoose_graphql_types.hrl").
++
++-import(mongoose_graphql_helper, [make_error/2]).
++
++execute(_Ctx, mam, <<"deleteRoomMessages">>, #{<<"room">> := RoomJID, <<"before">> := Before}) ->
++    format_result(mod_mam_api:delete_room_messages(RoomJID, Before),
++                  #{room => jid:to_binary(RoomJID)});
++execute(_Ctx, mam, <<"deleteOldRoomMessages">>,
++        #{<<"mucDomain">> := MUCDomain, <<"before">> := Before}) ->
++    format_result(mod_mam_api:delete_old_room_messages(MUCDomain, Before),
++                  #{mucDomain => MUCDomain});
++execute(_Ctx, mam, <<"deleteUserMessages">>, #{<<"user">> := UserJID, <<"before">> := Before}) ->
++    format_result(mod_mam_api:delete_user_messages(UserJID, Before),
++                  #{user => jid:to_binary(UserJID)});
++execute(_Ctx, mam, <<"deleteOldMessages">>, #{<<"domain">> := Domain, <<"before">> := Before}) ->
++    format_result(mod_mam_api:delete_old_messages(Domain, Before),
++                  #{domain => Domain}).
++
++-spec format_result(mod_mam_api:delete_result(), map()) ->
++          {ok, non_neg_integer()} | {error, resolver_error()}.
++format_result({ok, Count}, _Context) ->
++    {ok, Count};
++format_result(Error, Context) ->
++    make_error(Error, Context).
+diff --git a/src/graphql/mongoose_graphql.erl b/src/graphql/mongoose_graphql.erl
+index d092095..ea2e1db 100644
+--- a/src/graphql/mongoose_graphql.erl
++++ b/src/graphql/mongoose_graphql.erl
+@@ -188,6 +188,7 @@ admin_mapping_rules() ->
+         'ServerAdminMutation' => mongoose_graphql_server_admin_mutation,
+         'LastAdminMutation' => mongoose_graphql_last_admin_mutation,
+         'LastAdminQuery' => mongoose_graphql_last_admin_query,
++        'MAMAdminMutation' => mongoose_graphql_mam_admin_mutation,
+         'AccountAdminQuery' => mongoose_graphql_account_admin_query,
+         'AccountAdminMutation' => mongoose_graphql_account_admin_mutation,
+         'MUCAdminMutation' => mongoose_graphql_muc_admin_mutation,
+diff --git a/src/graphql/mongoose_graphql_handler.erl b/src/graphql/mongoose_graphql_handler.erl
+index 451741a..1bb280c 100644
+--- a/src/graphql/mongoose_graphql_handler.erl
++++ b/src/graphql/mongoose_graphql_handler.erl
+@@ -284,7 +284,7 @@ reply_error(Msg, Req, State) ->
+     {stop, Reply, State}.
+ 
+ allowed_categories() ->
+-    [<<"checkAuth">>, <<"account">>, <<"domain">>, <<"last">>, <<"muc">>, <<"muc_light">>,
++    [<<"checkAuth">>, <<"account">>, <<"domain">>, <<"last">>, <<"mam">>, <<"muc">>, <<"muc_light">>,
+      <<"session">>, <<"stanza">>, <<"roster">>, <<"vcard">>, <<"private">>, <<"metric">>,
+      <<"stat">>, <<"gdpr">>, <<"mnesia">>, <<"server">>, <<"inbox">>, <<"http_upload">>,
+      <<"offline">>, <<"token">>, <<"cets">>, <<"broadcast">>, <<"blocklist">>].
+diff --git a/src/hooks/mongoose_hooks.erl b/src/hooks/mongoose_hooks.erl
+index 6198107..51865e7 100644
+--- a/src/hooks/mongoose_hooks.erl
++++ b/src/hooks/mongoose_hooks.erl
+@@ -90,6 +90,7 @@
+          mam_set_prefs/6,
+          mam_get_prefs/4,
+          mam_remove_archive/3,
++         mam_delete_messages/2,
+          mam_lookup_messages/2,
+          mam_archive_message/2,
+          mam_archive_sync/1,
+@@ -101,6 +102,7 @@
+          mam_muc_set_prefs/6,
+          mam_muc_get_prefs/4,
+          mam_muc_remove_archive/3,
++         mam_muc_delete_messages/2,
+          mam_muc_lookup_messages/2,
+          mam_muc_archive_message/2,
+          mam_muc_archive_sync/1,
+@@ -963,6 +965,16 @@ mam_remove_archive(HostType, ArchiveID, Owner) ->
+     Params = #{archive_id => ArchiveID, owner => Owner},
+     run_hook_for_host_type(mam_remove_archive, HostType, ok, Params).
+ 
++%%% @doc The `mam_delete_messages' hook is called in order to delete one-to-one messages
++%%% archived before a given message ID, either from one user's archive or from all archives
++%%% of a domain. The result is `{error, not_supported}' if no archive backend handles it.
++-spec mam_delete_messages(HostType, Params) -> Result when
++      HostType :: mongooseim:host_type(),
++      Params :: mod_mam:delete_messages_params(),
++      Result :: {ok, non_neg_integer()} | {error, not_supported}.
++mam_delete_messages(HostType, Params) ->
++    run_hook_for_host_type(mam_delete_messages, HostType, {error, not_supported}, Params).
++
+ %%% @doc The `mam_lookup_messages' hook is to retrieve
+ %%% archived messages for given search parameters.
+ -spec mam_lookup_messages(HostType, Params) -> Result when
+@@ -1084,6 +1096,17 @@ mam_muc_remove_archive(HostType, ArchiveID, Room) ->
+     Params = #{archive_id => ArchiveID, room => Room},
+     run_hook_for_host_type(mam_muc_remove_archive, HostType, ok, Params).
+ 
++%%% @doc The `mam_muc_delete_messages' hook is called in order to delete room messages
++%%% archived before a given message ID, either from one room's archive or from the archives
++%%% of all rooms of a MUC service. The result is `{error, not_supported}' if no archive
++%%% backend handles it.
++-spec mam_muc_delete_messages(HostType, Params) -> Result when
++      HostType :: mongooseim:host_type(),
++      Params :: mod_mam:delete_messages_params(),
++      Result :: {ok, non_neg_integer()} | {error, not_supported}.
++mam_muc_delete_messages(HostType, Params) ->
++    run_hook_for_host_type(mam_muc_delete_messages, HostType, {error, not_supported}, Params).
++
+ %%% @doc The `mam_muc_lookup_messages' hook is to retrieve archived
+ %%% MUC messages for any given search parameters.
+ -spec mam_muc_lookup_messages(HostType, Params) -> Result when
+diff --git a/src/mam/mod_mam.erl b/src/mam/mod_mam.erl
+index 67d9898..3a5aa44 100644
+--- a/src/mam/mod_mam.erl
++++ b/src/mam/mod_mam.erl
+@@ -76,6 +76,13 @@
+                                     %% Only in mod_mam_muc_rdbms_arch:retract_message/2
+                                     sender_id => archive_id()}.
+ 
++%% Which archives to delete messages from: one archive (of a user or a room),
++%% or all archives of a domain (users) or of a MUC service (rooms).
++-type delete_messages_scope() :: {archive, jid:lserver(), jid:luser()} | {server, jid:lserver()}.
++-type delete_messages_params() :: #{scope := delete_messages_scope(),
++                                    %% Delete messages with IDs lower than this one
++                                    before_id := message_id()}.
++
+ -export_type([rewriter_fun/0,
+               borders/0,
+               preference/0,
+@@ -84,6 +91,8 @@
+               unix_timestamp/0,
+               archive_id/0,
+               lookup_result/0,
++              delete_messages_scope/0,
++              delete_messages_params/0,
+               lookup_result_map/0,
+               message_row/0,
+               message_id/0,
+diff --git a/src/mam/mod_mam_api.erl b/src/mam/mod_mam_api.erl
+new file mode 100644
+index 0000000..9f84c9b
+--- /dev/null
++++ b/src/mam/mod_mam_api.erl
+@@ -0,0 +1,84 @@
++%% @doc API for deleting archived messages (XEP-0313) older than a given date.
++%%
++%% The deletion itself is done by the archive backend, which handles the
++%% `mam_delete_messages' (one-to-one archives) and `mam_muc_delete_messages'
++%% (room archives) hooks. A backend that does not handle them leaves the
++%% initial `{error, not_supported}' result.
++-module(mod_mam_api).
++
++-export([delete_room_messages/2,
++         delete_old_room_messages/2,
++         delete_user_messages/2,
++         delete_old_messages/2]).
++
++-include("jlib.hrl").
++
++-type delete_result() :: {ok, non_neg_integer()}
++                       | {muc_server_not_found | domain_not_found | not_supported, iolist()}.
++-export_type([delete_result/0]).
++
++-define(MUC_SERVER_NOT_FOUND_RESULT, {muc_server_not_found, "MUC server not found"}).
++-define(DOMAIN_NOT_FOUND_RESULT, {domain_not_found, "Domain not found"}).
++-define(NOT_SUPPORTED_RESULT,
++        {not_supported, "Deleting archived messages is not supported by the configured backend"}).
++
++%% @doc Delete messages archived before `Before' from the archive of one room.
++-spec delete_room_messages(jid:jid(), mod_mam:unix_timestamp()) -> delete_result().
++delete_room_messages(#jid{luser = LRoom, lserver = MUCDomain}, Before) ->
++    case mongoose_domain_api:get_subdomain_host_type(MUCDomain) of
++        {ok, HostType} ->
++            Params = #{scope => {archive, MUCDomain, LRoom}, before_id => before_id(Before)},
++            format_result(mongoose_hooks:mam_muc_delete_messages(HostType, Params));
++        {error, not_found} ->
++            ?MUC_SERVER_NOT_FOUND_RESULT
++    end.
++
++%% @doc Delete messages archived before `Before' from the archives of all rooms
++%% of the MUC service `MUCDomain'.
++-spec delete_old_room_messages(jid:lserver(), mod_mam:unix_timestamp()) -> delete_result().
++delete_old_room_messages(MUCDomain, Before) ->
++    case mongoose_domain_api:get_subdomain_host_type(MUCDomain) of
++        {ok, HostType} ->
++            Params = #{scope => {server, MUCDomain}, before_id => before_id(Before)},
++            format_result(mongoose_hooks:mam_muc_delete_messages(HostType, Params));
++        {error, not_found} ->
++            ?MUC_SERVER_NOT_FOUND_RESULT
++    end.
++
++%% @doc Delete messages archived before `Before' from the one-to-one archive of a user.
++-spec delete_user_messages(jid:jid(), mod_mam:unix_timestamp()) -> delete_result().
++delete_user_messages(#jid{luser = LUser, lserver = LServer}, Before) ->
++    case mongoose_domain_api:get_domain_host_type(LServer) of
++        {ok, HostType} ->
++            Params = #{scope => {archive, LServer, LUser}, before_id => before_id(Before)},
++            format_result(mongoose_hooks:mam_delete_messages(HostType, Params));
++        {error, not_found} ->
++            ?DOMAIN_NOT_FOUND_RESULT
++    end.
++
++%% @doc Delete messages archived before `Before' from the one-to-one archives
++%% of all users of `Domain'.
++-spec delete_old_messages(jid:lserver(), mod_mam:unix_timestamp()) -> delete_result().
++delete_old_messages(Domain, Before) ->
++    case mongoose_domain_api:get_domain_host_type(Domain) of
++        {ok, HostType} ->
++            Params = #{scope => {server, Domain}, before_id => before_id(Before)},
++            format_result(mongoose_hooks:mam_delete_messages(HostType, Params));
++        {error, not_found} ->
++            ?DOMAIN_NOT_FOUND_RESULT
++    end.
++
++%% Internal functions
++
++%% Message IDs are timestamps in microseconds shifted left by 8 bits, with the node number
++%% in the lowest byte. The lowest ID for the given microsecond has node number 0,
++%% so `id < before_id(Before)' selects exactly the messages archived before `Before'.
++-spec before_id(mod_mam:unix_timestamp()) -> non_neg_integer().
++before_id(Before) ->
++    mod_mam_utils:encode_compact_uuid(Before, 0).
++
++-spec format_result({ok, non_neg_integer()} | {error, not_supported}) -> delete_result().
++format_result({ok, Count}) ->
++    {ok, Count};
++format_result({error, not_supported}) ->
++    ?NOT_SUPPORTED_RESULT.
+diff --git a/src/mam/mod_mam_muc_rdbms_arch.erl b/src/mam/mod_mam_muc_rdbms_arch.erl
+index 5e4adf1..c090f97 100644
+--- a/src/mam/mod_mam_muc_rdbms_arch.erl
++++ b/src/mam/mod_mam_muc_rdbms_arch.erl
+@@ -24,6 +24,7 @@
+          archive_message/3,
+          lookup_messages/3,
+          remove_archive/3,
++         delete_messages/3,
+          remove_domain/3,
+          get_mam_muc_gdpr_data/3]).
+ 
+@@ -92,6 +93,7 @@ hooks(HostType) ->
+         {mam_muc_archive_size, HostType, fun ?MODULE:archive_size/3, #{}, 50},
+         {mam_muc_lookup_messages, HostType, fun ?MODULE:lookup_messages/3, #{}, 50},
+         {mam_muc_remove_archive, HostType, fun ?MODULE:remove_archive/3, #{}, 50},
++        {mam_muc_delete_messages, HostType, fun ?MODULE:delete_messages/3, #{}, 50},
+         {get_mam_muc_gdpr_data, HostType, fun ?MODULE:get_mam_muc_gdpr_data/3, #{}, 50}
+     ].
+ 
+@@ -107,6 +109,11 @@ register_prepared_queries(Opts) ->
+     %% Domain Removal
+     prepare_remove_domain(Opts),
+ 
++    %% Deleting old messages
++    mod_mam_utils:prepare_delete_messages(Opts, mam_muc_message, room_id,
++                                          mam_muc_delete_archive_messages,
++                                          mam_muc_delete_server_messages),
++
+     mongoose_rdbms:prepare(mam_muc_make_tombstone, mam_muc_message, [message, room_id, id],
+                            <<"UPDATE mam_muc_message SET message = ?, search_body = '' "
+                              "WHERE room_id = ? AND id = ?">>),
+@@ -317,6 +324,19 @@ remove_archive(Acc, #{archive_id := ArcID}, #{host_type := HostType}) ->
+     mongoose_rdbms:execute_successfully(HostType, mam_muc_archive_remove, [ArcID]),
+     {ok, Acc}.
+ 
++-spec delete_messages(Acc, Params, Extra) -> {ok, Acc} when
++    Acc :: {ok, non_neg_integer()} | {error, not_supported},
++    Params :: mod_mam:delete_messages_params(),
++    Extra :: gen_hook:extra().
++delete_messages(_Acc, #{scope := Scope, before_id := BeforeID}, #{host_type := HostType}) ->
++    Query = case Scope of
++                {archive, _, _} -> mam_muc_delete_archive_messages;
++                {server, _} -> mam_muc_delete_server_messages
++            end,
++    Args = mod_mam_utils:delete_messages_args(Scope, BeforeID),
++    Limit = gen_mod:get_module_opt(HostType, ?MODULE, delete_domain_limit),
++    {ok, {ok, mod_mam_utils:delete_in_batches(HostType, Query, Args, Limit)}}.
++
+ -spec remove_domain(Acc, Params, Extra) -> {ok | stop, Acc} when
+     Acc :: mongoose_domain_api:remove_domain_acc(),
+     Params :: map(),
+diff --git a/src/mam/mod_mam_rdbms_arch.erl b/src/mam/mod_mam_rdbms_arch.erl
+index 42272f0..23f19df 100644
+--- a/src/mam/mod_mam_rdbms_arch.erl
++++ b/src/mam/mod_mam_rdbms_arch.erl
+@@ -24,6 +24,7 @@
+          archive_message/3,
+          lookup_messages/3,
+          remove_archive/3,
++         delete_messages/3,
+          remove_domain/3,
+          get_mam_pm_gdpr_data/3]).
+ 
+@@ -110,6 +111,7 @@ hooks(HostType) ->
+     [{mam_archive_size, HostType, fun ?MODULE:archive_size/3, #{}, 50},
+      {mam_lookup_messages, HostType, fun ?MODULE:lookup_messages/3, #{}, 50},
+      {mam_remove_archive, HostType, fun ?MODULE:remove_archive/3, #{}, 50},
++     {mam_delete_messages, HostType, fun ?MODULE:delete_messages/3, #{}, 50},
+      {get_mam_pm_gdpr_data, HostType, fun ?MODULE:get_mam_pm_gdpr_data/3, #{}, 50},
+      {remove_domain, HostType, fun ?MODULE:remove_domain/3, #{}, 50}].
+ 
+@@ -125,6 +127,11 @@ register_prepared_queries(Opts) ->
+     %% Domain Removal
+     prepare_remove_domain(Opts),
+ 
++    %% Deleting old messages
++    mod_mam_utils:prepare_delete_messages(Opts, mam_message, user_id,
++                                          mam_delete_archive_messages,
++                                          mam_delete_server_messages),
++
+     mongoose_rdbms:prepare(mam_make_tombstone, mam_message, [message, user_id, id],
+                            <<"UPDATE mam_message SET message = ?, search_body = '' "
+                              "WHERE user_id = ? AND id = ?">>),
+@@ -359,6 +366,19 @@ remove_archive(Acc, #{archive_id := ArcID}, #{host_type := HostType}) ->
+     mongoose_rdbms:execute_successfully(HostType, mam_archive_remove, [ArcID]),
+     {ok, Acc}.
+ 
++-spec delete_messages(Acc, Params, Extra) -> {ok, Acc} when
++    Acc :: {ok, non_neg_integer()} | {error, not_supported},
++    Params :: mod_mam:delete_messages_params(),
++    Extra :: gen_hook:extra().
++delete_messages(_Acc, #{scope := Scope, before_id := BeforeID}, #{host_type := HostType}) ->
++    Query = case Scope of
++                {archive, _, _} -> mam_delete_archive_messages;
++                {server, _} -> mam_delete_server_messages
++            end,
++    Args = mod_mam_utils:delete_messages_args(Scope, BeforeID),
++    Limit = gen_mod:get_module_opt(HostType, ?MODULE, delete_domain_limit),
++    {ok, {ok, mod_mam_utils:delete_in_batches(HostType, Query, Args, Limit)}}.
++
+ -spec remove_domain(Acc, Params, Extra) -> {ok | stop, Acc} when
+     Acc :: mongoose_domain_api:remove_domain_acc(),
+     Params :: map(),
+diff --git a/src/mam/mod_mam_utils.erl b/src/mam/mod_mam_utils.erl
+index 129814f..b64f9ea 100644
+--- a/src/mam/mod_mam_utils.erl
++++ b/src/mam/mod_mam_utils.erl
+@@ -98,6 +98,9 @@
+          lookup_first_and_last_messages/4,
+          lookup_first_and_last_messages/5,
+          incremental_delete_domain/5,
++         delete_in_batches/4,
++         prepare_delete_messages/5,
++         delete_messages_args/2,
+          db_message_codec/2, db_jid_codec/2]).
+ 
+ -callback extra_fin_element(mongooseim:host_type(),
+@@ -1355,6 +1358,69 @@ incremental_delete_domain(HostType, Domain, Limit, [Query | MoreQueries] = AllQu
+             incremental_delete_domain(HostType, Domain, Limit, AllQueries, N + TotalDeleted)
+     end.
+ 
++%% @doc Prepare the queries deleting messages archived before a given message ID,
++%% from one archive or from all archives of a server. Both archive tables have the
++%% primary key `(ArchiveColumn, id)', and their archives are listed in `mam_server_user'.
++-spec prepare_delete_messages(#{delete_domain_limit := pos_integer() | infinity},
++                              Table :: atom(), ArchiveColumn :: atom(),
++                              ArchiveQuery :: atom(), ServerQuery :: atom()) -> ok.
++prepare_delete_messages(#{delete_domain_limit := Limit}, Table, ArchiveColumn,
++                        ArchiveQuery, ServerQuery) ->
++    ArchiveFields = ['mam_server_user.server', 'mam_server_user.user_name', id],
++    ServerFields = ['mam_server_user.server', id],
++    mongoose_rdbms:prepare(ArchiveQuery, Table, ArchiveFields,
++                           delete_messages_sql(Table, ArchiveColumn, Limit, [server, user_name])),
++    mongoose_rdbms:prepare(ServerQuery, Table, ServerFields,
++                           delete_messages_sql(Table, ArchiveColumn, Limit, [server])),
++    ok.
++
++-spec delete_messages_sql(atom(), atom(), pos_integer() | infinity, [atom()]) -> binary().
++delete_messages_sql(Table, ArchiveColumn, infinity, FilterColumns) ->
++    T = atom_to_binary(Table),
++    A = atom_to_binary(ArchiveColumn),
++    Filter = archive_filter_sql(<<>>, FilterColumns),
++    <<"DELETE FROM ", T/binary, " WHERE ", A/binary, " IN "
++      "(SELECT id FROM mam_server_user WHERE ", Filter/binary, ") AND id < ?">>;
++delete_messages_sql(Table, ArchiveColumn, Limit, FilterColumns) ->
++    %% The extra derived table lets MySQL use LIMIT in a subquery of DELETE.
++    T = atom_to_binary(Table),
++    A = atom_to_binary(ArchiveColumn),
++    Filter = archive_filter_sql(<<"msu.">>, FilterColumns),
++    LimitSQL = rdbms_queries:limit(Limit),
++    <<"DELETE FROM ", T/binary, " WHERE (", A/binary, ", id) IN "
++      "(SELECT * FROM (SELECT msg.", A/binary, ", msg.id FROM ", T/binary, " msg"
++      " INNER JOIN mam_server_user msu ON msu.id = msg.", A/binary,
++      " WHERE ", Filter/binary, " AND msg.id < ?", LimitSQL/binary, ") AS T)">>.
++
++-spec archive_filter_sql(binary(), [atom()]) -> binary().
++archive_filter_sql(Prefix, Columns) ->
++    Conditions = [<<Prefix/binary, (atom_to_binary(Column))/binary, " = ?">> || Column <- Columns],
++    iolist_to_binary(lists:join(<<" AND ">>, Conditions)).
++
++-spec delete_messages_args(mod_mam:delete_messages_scope(), mod_mam:message_id()) -> [term()].
++delete_messages_args({archive, LServer, LUser}, BeforeID) ->
++    [LServer, LUser, BeforeID];
++delete_messages_args({server, LServer}, BeforeID) ->
++    [LServer, BeforeID].
++
++%% @doc Run a prepared DELETE query that removes at most `Limit' rows per run,
++%% until it removes fewer than that. With `infinity', the query has no limit and runs once.
++%% Returns the number of deleted rows.
++-spec delete_in_batches(mongooseim:host_type(), mongoose_rdbms:query_name(), [term()],
++                        pos_integer() | infinity) -> non_neg_integer().
++delete_in_batches(HostType, Query, Args, infinity) ->
++    {updated, N} = mongoose_rdbms:execute_successfully(HostType, Query, Args),
++    N;
++delete_in_batches(HostType, Query, Args, Limit) ->
++    delete_in_batches(HostType, Query, Args, Limit, 0).
++
++delete_in_batches(HostType, Query, Args, Limit, TotalDeleted) ->
++    Result = mongoose_rdbms:execute_successfully(HostType, Query, Args),
++    case is_removing_done(Result, Limit) of
++        {done, N} -> TotalDeleted + N;
++        {remove_more, N} -> delete_in_batches(HostType, Query, Args, Limit, TotalDeleted + N)
++    end.
++
+ -spec is_removing_done(LastResult :: {updated, non_neg_integer()}, Limit :: non_neg_integer()) ->
+     {done | remove_more, non_neg_integer()}.
+ is_removing_done({updated, N}, Limit) when N < Limit ->
+-- 
+2.43.0
+

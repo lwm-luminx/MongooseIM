@@ -1,0 +1,683 @@
+From f3cb785ef279ccd2744622588bdb8cf6a40875e4 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 16 Nov 2026 21:05:53 +0000
+Subject: [PATCH] Add an admin API for the users' blocking lists (XEP-0191)
+
+The blocking lists of mod_blocking can be changed only by the user's
+own session, with the blocking command. Services that manage blocks on
+behalf of their users have to keep a session open for each user.
+
+Add a 'blocking' admin GraphQL category (and the matching mongooseimctl
+commands) with getBlockingList, block and unblock. The changes have the
+same effect as the blocking command: the list is stored as the default
+privacy list, the user's online resources get the blocking push, and
+the presences of the affected contacts are updated. Domain admins can
+manage the lists of the users in their domain.
+
+mod_blocking gets get_blocking_list/3 and set_blocking_list/5 for that,
+reused by the IQ handlers. A failed write of the privacy list now
+returns an internal-server-error instead of crashing the IQ handler.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01ETaRHXo1LmPHqZB9SXMucM
+---
+ big_tests/default.spec                        |   1 +
+ big_tests/dynamic_domains.spec                |   1 +
+ big_tests/tests/graphql_blocking_SUITE.erl    | 209 ++++++++++++++++++
+ doc/listeners/listen-http.md                  |   2 +-
+ doc/modules/mod_blocking.md                   |  13 ++
+ priv/graphql/schemas/admin/admin_schema.gql   |   4 +
+ priv/graphql/schemas/admin/blocking.gql       |  21 ++
+ .../admin/mongoose_graphql_admin_mutation.erl |   2 +
+ .../admin/mongoose_graphql_admin_query.erl    |   2 +
+ ...ngoose_graphql_blocking_admin_mutation.erl |  22 ++
+ .../mongoose_graphql_blocking_admin_query.erl |  15 ++
+ src/graphql/mongoose_graphql.erl              |   2 +
+ src/graphql/mongoose_graphql_handler.erl      |   2 +-
+ src/privacy/mod_blocking.erl                  |  85 ++++---
+ src/privacy/mod_blocking_api.erl              |  58 +++++
+ 15 files changed, 410 insertions(+), 29 deletions(-)
+ create mode 100644 big_tests/tests/graphql_blocking_SUITE.erl
+ create mode 100644 priv/graphql/schemas/admin/blocking.gql
+ create mode 100644 src/graphql/admin/mongoose_graphql_blocking_admin_mutation.erl
+ create mode 100644 src/graphql/admin/mongoose_graphql_blocking_admin_query.erl
+ create mode 100644 src/privacy/mod_blocking_api.erl
+
+diff --git a/big_tests/default.spec b/big_tests/default.spec
+index 154ae5e..a613033 100644
+--- a/big_tests/default.spec
++++ b/big_tests/default.spec
+@@ -50,6 +50,7 @@
+ {suites, "tests", graphql_external_services_SUITE}.
+ {suites, "tests", graphql_metric_SUITE}.
+ {suites, "tests", graphql_blocklist_SUITE}.
++{suites, "tests", graphql_blocking_SUITE}.
+ {suites, "tests", inbox_SUITE}.
+ {suites, "tests", inbox_extensions_SUITE}.
+ {suites, "tests", login_SUITE}.
+diff --git a/big_tests/dynamic_domains.spec b/big_tests/dynamic_domains.spec
+index b91097b..db0b90d 100644
+--- a/big_tests/dynamic_domains.spec
++++ b/big_tests/dynamic_domains.spec
+@@ -58,6 +58,7 @@
+ {suites, "tests", graphql_external_services_SUITE}.
+ {suites, "tests", graphql_metric_SUITE}.
+ {suites, "tests", graphql_blocklist_SUITE}.
++{suites, "tests", graphql_blocking_SUITE}.
+ {suites, "tests", inbox_SUITE}.
+ {suites, "tests", inbox_extensions_SUITE}.
+ {suites, "tests", login_SUITE}.
+diff --git a/big_tests/tests/graphql_blocking_SUITE.erl b/big_tests/tests/graphql_blocking_SUITE.erl
+new file mode 100644
+index 0000000..edd84b4
+--- /dev/null
++++ b/big_tests/tests/graphql_blocking_SUITE.erl
+@@ -0,0 +1,209 @@
++-module(graphql_blocking_SUITE).
++
++-compile([export_all, nowarn_export_all]).
++
++-import(distributed_helper, [mim/0]).
++-import(domain_helper, [domain/0, host_type/0]).
++-import(graphql_helper, [execute_command/4, get_err_code/1, get_not_loaded/1, get_ok_value/2,
++                         get_unauthorized/1, user_to_bin/1]).
++
++-include_lib("stdlib/include/assert.hrl").
++
++-define(NONEXISTING_DOMAIN, <<"abc@abc">>).
++-define(NONEXISTING_USER, <<"abc@", (domain())/binary>>).
++
++suite() ->
++    distributed_helper:require_rpc_nodes([mim]) ++ escalus:suite().
++
++all() ->
++    [{group, admin_http},
++     {group, admin_cli},
++     {group, domain_admin}].
++
++groups() ->
++    [{admin_http, [], admin_groups()},
++     {admin_cli, [], admin_groups()},
++     {domain_admin, [], domain_admin_groups()},
++     {admin_blocking, [parallel], admin_blocking_tests()},
++     {admin_blocking_not_configured, [parallel], admin_blocking_not_configured_tests()},
++     {domain_admin_blocking, [parallel], domain_admin_blocking_tests()}].
++
++admin_groups() ->
++    [{group, admin_blocking},
++     {group, admin_blocking_not_configured}].
++
++domain_admin_groups() ->
++    [{group, domain_admin_blocking},
++     {group, admin_blocking_not_configured}].
++
++admin_blocking_tests() ->
++    [admin_block_and_unblock,
++     admin_block_with_session,
++     admin_unblock_not_blocked,
++     admin_block_without_jids,
++     admin_blocking_nonexisting_user].
++
++admin_blocking_not_configured_tests() ->
++    [admin_get_blocking_list_not_configured,
++     admin_block_not_configured].
++
++domain_admin_blocking_tests() ->
++    [domain_admin_get_blocking_list_no_permission,
++     domain_admin_block_no_permission,
++     domain_admin_unblock_no_permission,
++     admin_block_and_unblock,
++     admin_block_with_session].
++
++%% Setup & Teardown
++
++init_per_suite(Config) ->
++    Config1 = ejabberd_node_utils:init(mim(), Config),
++    Config2 = escalus:init_per_suite(Config1),
++    dynamic_modules:save_modules(host_type(), Config2).
++
++end_per_suite(Config) ->
++    dynamic_modules:restore_modules(Config),
++    escalus:end_per_suite(Config).
++
++init_per_group(admin_http, Config) ->
++    graphql_helper:init_admin_handler(Config);
++init_per_group(admin_cli, Config) ->
++    graphql_helper:init_admin_cli(Config);
++init_per_group(domain_admin, Config) ->
++    graphql_helper:init_domain_admin_handler(Config);
++init_per_group(Group, Config) when Group == admin_blocking;
++                                   Group == domain_admin_blocking ->
++    Opts = config_parser_helper:mod_config_with_auto_backend(mod_blocking),
++    dynamic_modules:ensure_modules(host_type(), [{mod_blocking, Opts}]),
++    Config;
++init_per_group(admin_blocking_not_configured, Config) ->
++    dynamic_modules:ensure_modules(host_type(), [{mod_blocking, stopped}]),
++    Config.
++
++end_per_group(Group, _Config) when Group == admin_http;
++                                   Group == admin_cli;
++                                   Group == domain_admin ->
++    graphql_helper:clean(),
++    escalus_fresh:clean();
++end_per_group(_Group, _Config) ->
++    escalus_fresh:clean().
++
++init_per_testcase(TestCase, Config) ->
++    escalus:init_per_testcase(TestCase, Config).
++
++end_per_testcase(TestCase, Config) ->
++    escalus:end_per_testcase(TestCase, Config).
++
++%% Admin
++
++admin_block_and_unblock(Config) ->
++    Config1 = escalus_fresh:create_users(Config, [{alice, 1}, {bob, 1}, {kate, 1}]),
++    Alice = escalus_users:get_jid(Config1, alice),
++    Bob = jid_prep(escalus_users:get_jid(Config1, bob)),
++    Kate = jid_prep(escalus_users:get_jid(Config1, kate)),
++    ?assertEqual([], get_ok_value([data, blocking, getBlockingList],
++                                  get_blocking_list(Alice, Config1))),
++
++    Res1 = block(Alice, [Bob, Kate], Config1),
++    ?assertEqual([Bob, Kate], lists:sort(get_ok_value([data, blocking, block], Res1))),
++    ?assertEqual([Bob, Kate], lists:sort(get_ok_value([data, blocking, getBlockingList],
++                                                      get_blocking_list(Alice, Config1)))),
++
++    Res2 = unblock(Alice, [Bob], Config1),
++    ?assertEqual([Bob], get_ok_value([data, blocking, unblock], Res2)),
++    ?assertEqual([Kate], get_ok_value([data, blocking, getBlockingList],
++                                      get_blocking_list(Alice, Config1))).
++
++%% The change is pushed to the user's sessions, and applied there right away
++admin_block_with_session(Config) ->
++    escalus:fresh_story_with_config(Config, [{alice, 1}, {bob, 1}],
++                                    fun admin_block_with_session_story/3).
++
++admin_block_with_session_story(Config, Alice, Bob) ->
++    BobJid = escalus_utils:jid_to_lower(escalus_client:short_jid(Bob)),
++    Res = block(Alice, [BobJid], Config),
++    ?assertEqual([BobJid], get_ok_value([data, blocking, block], Res)),
++    Push = escalus:wait_for_stanza(Alice),
++    ?assert(mod_blocking_SUITE:is_xep191_push(<<"block">>, [BobJid], Push)),
++    %% Bob's messages don't reach Alice
++    escalus:send(Bob, escalus_stanza:chat_to(Alice, <<"Hi!">>)),
++    escalus:assert(is_error, [<<"cancel">>, <<"service-unavailable">>],
++                   escalus:wait_for_stanza(Bob)),
++    escalus_assert:has_no_stanzas(Alice),
++
++    Res2 = unblock(Alice, [BobJid], Config),
++    ?assertEqual([BobJid], get_ok_value([data, blocking, unblock], Res2)),
++    Push2 = escalus:wait_for_stanza(Alice),
++    ?assert(mod_blocking_SUITE:is_xep191_push(<<"unblock">>, [BobJid], Push2)),
++    escalus:send(Bob, escalus_stanza:chat_to(Alice, <<"Hi again!">>)),
++    escalus:assert(is_chat_message, [<<"Hi again!">>], escalus:wait_for_stanza(Alice)).
++
++admin_unblock_not_blocked(Config) ->
++    Config1 = escalus_fresh:create_users(Config, [{alice, 1}]),
++    Alice = escalus_users:get_jid(Config1, alice),
++    Res = unblock(Alice, [<<"someone@", (domain())/binary>>], Config1),
++    ?assertEqual([], get_ok_value([data, blocking, unblock], Res)).
++
++admin_block_without_jids(Config) ->
++    Config1 = escalus_fresh:create_users(Config, [{alice, 1}]),
++    Alice = escalus_users:get_jid(Config1, alice),
++    ?assertEqual(<<"bad_request">>, get_err_code(block(Alice, [], Config1))),
++    ?assertEqual(<<"bad_request">>, get_err_code(unblock(Alice, [], Config1))).
++
++admin_blocking_nonexisting_user(Config) ->
++    Target = <<"someone@", (domain())/binary>>,
++    ?assertEqual(<<"domain_not_found">>,
++                 get_err_code(get_blocking_list(?NONEXISTING_DOMAIN, Config))),
++    ?assertEqual(<<"user_not_found">>,
++                 get_err_code(get_blocking_list(?NONEXISTING_USER, Config))),
++    ?assertEqual(<<"domain_not_found">>,
++                 get_err_code(block(?NONEXISTING_DOMAIN, [Target], Config))),
++    ?assertEqual(<<"user_not_found">>,
++                 get_err_code(block(?NONEXISTING_USER, [Target], Config))),
++    ?assertEqual(<<"user_not_found">>,
++                 get_err_code(unblock(?NONEXISTING_USER, [Target], Config))).
++
++admin_get_blocking_list_not_configured(Config) ->
++    get_not_loaded(get_blocking_list(<<"alice@", (domain())/binary>>, Config)).
++
++admin_block_not_configured(Config) ->
++    get_not_loaded(block(<<"alice@", (domain())/binary>>, [<<"bob@localhost">>], Config)).
++
++%% Domain admin
++
++domain_admin_get_blocking_list_no_permission(Config) ->
++    escalus:fresh_story_with_config(Config, [{alice_bis, 1}],
++                                    fun(Config1, Alice) ->
++                                            get_unauthorized(get_blocking_list(Alice, Config1))
++                                    end).
++
++domain_admin_block_no_permission(Config) ->
++    escalus:fresh_story_with_config(Config, [{alice_bis, 1}],
++                                    fun(Config1, Alice) ->
++                                            Res = block(Alice, [<<"bob@localhost">>], Config1),
++                                            get_unauthorized(Res)
++                                    end).
++
++domain_admin_unblock_no_permission(Config) ->
++    escalus:fresh_story_with_config(Config, [{alice_bis, 1}],
++                                    fun(Config1, Alice) ->
++                                            Res = unblock(Alice, [<<"bob@localhost">>], Config1),
++                                            get_unauthorized(Res)
++                                    end).
++
++%% Helpers
++
++get_blocking_list(User, Config) ->
++    Vars = #{user => user_to_bin(User)},
++    execute_command(<<"blocking">>, <<"getBlockingList">>, Vars, Config).
++
++block(User, JIDs, Config) ->
++    Vars = #{user => user_to_bin(User), jids => JIDs},
++    execute_command(<<"blocking">>, <<"block">>, Vars, Config).
++
++unblock(User, JIDs, Config) ->
++    Vars = #{user => user_to_bin(User), jids => JIDs},
++    execute_command(<<"blocking">>, <<"unblock">>, Vars, Config).
++
++jid_prep(JID) ->
++    jid:to_binary(jid:from_binary(JID)).
+diff --git a/doc/listeners/listen-http.md b/doc/listeners/listen-http.md
+index 8910260..471a981 100644
+--- a/doc/listeners/listen-http.md
++++ b/doc/listeners/listen-http.md
+@@ -118,7 +118,7 @@ When set, enables authentication for the admin API, otherwise it is disabled. Re
+ * **Example:** `password = "secret"`
+ 
+ ### `listen.http.handlers.mongoose_graphql_handler.allowed_categories`
+-* **Syntax:** non-empty array of strings. Allowed values: `"checkAuth", "account", "domain", "last", "muc", "muc_light", "session", "stanza", "roster", "vcard", "private", "metric", "stat", "gdpr", "mnesia", "server", "inbox", "http_upload", "offline", "token", "cets"`
++* **Syntax:** non-empty array of strings. Allowed values: `"checkAuth", "account", "domain", "last", "muc", "muc_light", "session", "stanza", "roster", "vcard", "private", "metric", "stat", "gdpr", "mnesia", "server", "inbox", "http_upload", "offline", "token", "cets", "broadcast", "blocklist", "blocking"`
+ * **Default:** all GraphQL categories enabled
+ * **Example:** `allowed_categories = ["domain", "last"]`
+ 
+diff --git a/doc/modules/mod_blocking.md b/doc/modules/mod_blocking.md
+index 082d7f2..f6fddfa 100644
+--- a/doc/modules/mod_blocking.md
++++ b/doc/modules/mod_blocking.md
+@@ -25,6 +25,19 @@ The resource is then respectively user's nickname in case of `muc` or user's bar
+ 
+ Note: When a blocked user sends a message to a room, the server does not respond with an error but silently ignores it, i.e. doesn't deliver it to the user that issued the blocking.
+ 
++## Admin API
++
++The users' blocking lists can be managed with the `blocking` category of the [GraphQL admin API](../graphql-api/Admin-GraphQL.md),
++or with `mongooseimctl blocking`:
++
++* `getBlockingList(user)` returns the JIDs blocked by the user,
++* `block(user, jids)` blocks the JIDs for the user, and returns the blocked JIDs,
++* `unblock(user, jids)` unblocks the JIDs for the user, and returns the JIDs that were blocked before.
++
++The changes have the same effect as the blocking command sent by the user:
++the user's online resources receive the blocking push, and the presences of the affected contacts are updated.
++A domain admin can manage the blocking lists of the users in their domain.
++
+ ## Options
+ 
+ Same as in [`mod_privacy`](./mod_privacy.md#options).
+diff --git a/priv/graphql/schemas/admin/admin_schema.gql b/priv/graphql/schemas/admin/admin_schema.gql
+index e79cc85..51ae1c3 100644
+--- a/priv/graphql/schemas/admin/admin_schema.gql
++++ b/priv/graphql/schemas/admin/admin_schema.gql
+@@ -47,6 +47,8 @@ type AdminQuery{
+   broadcast: BroadcastAdminQuery
+   "Blocklist management"
+   blocklist: BlocklistAdminQuery
++  "Users' blocking lists (XEP-0191) management"
++  blocking: BlockingAdminQuery
+ }
+ 
+ """
+@@ -92,6 +94,8 @@ type AdminMutation @protected{
+   broadcast: BroadcastAdminMutation
+   "Blocklist management"
+   blocklist: BlocklistAdminMutation
++  "Users' blocking lists (XEP-0191) management"
++  blocking: BlockingAdminMutation
+ }
+ 
+ type AdminSubscription {
+diff --git a/priv/graphql/schemas/admin/blocking.gql b/priv/graphql/schemas/admin/blocking.gql
+new file mode 100644
+index 0000000..9be7ff7
+--- /dev/null
++++ b/priv/graphql/schemas/admin/blocking.gql
+@@ -0,0 +1,21 @@
++"""
++Allow admin to get the users' blocking lists (XEP-0191).
++"""
++type BlockingAdminQuery @protected @use(modules: ["mod_blocking"]) {
++  "Get the JIDs blocked by the user"
++  getBlockingList(user: JID!): [JID!]
++    @protected(type: DOMAIN, args: ["user"]) @use(args: ["user"])
++}
++
++"""
++Allow admin to manage the users' blocking lists (XEP-0191).
++The changes take effect immediately in the user's sessions, as if the user sent the blocking command.
++"""
++type BlockingAdminMutation @protected @use(modules: ["mod_blocking"]) {
++  "Block the JIDs for the user. Returns the blocked JIDs."
++  block(user: JID!, jids: [JID!]!): [JID!]
++    @protected(type: DOMAIN, args: ["user"]) @use(args: ["user"])
++  "Unblock the JIDs for the user. Returns the JIDs that were blocked before."
++  unblock(user: JID!, jids: [JID!]!): [JID!]
++    @protected(type: DOMAIN, args: ["user"]) @use(args: ["user"])
++}
+diff --git a/src/graphql/admin/mongoose_graphql_admin_mutation.erl b/src/graphql/admin/mongoose_graphql_admin_mutation.erl
+index 43e3c2d..33ab0ea 100644
+--- a/src/graphql/admin/mongoose_graphql_admin_mutation.erl
++++ b/src/graphql/admin/mongoose_graphql_admin_mutation.erl
+@@ -9,6 +9,8 @@ execute(_Ctx, _Obj, <<"account">>, _Args) ->
+     {ok, account};
+ execute(_Ctx, _Obj, <<"domain">>, _Args) ->
+     {ok, admin};
++execute(_Ctx, _Obj, <<"blocking">>, _Args) ->
++    {ok, blocking};
+ execute(_Ctx, _Obj, <<"blocklist">>, _Args) ->
+     {ok, blocklist};
+ execute(_Ctx, _Obj, <<"httpUpload">>, _Args) ->
+diff --git a/src/graphql/admin/mongoose_graphql_admin_query.erl b/src/graphql/admin/mongoose_graphql_admin_query.erl
+index 994a460..15f2808 100644
+--- a/src/graphql/admin/mongoose_graphql_admin_query.erl
++++ b/src/graphql/admin/mongoose_graphql_admin_query.erl
+@@ -9,6 +9,8 @@
+ 
+ execute(_Ctx, _Obj, <<"account">>, _Args) ->
+     {ok, account};
++execute(_Ctx, _Obj, <<"blocking">>, _Args) ->
++    {ok, blocking};
+ execute(_Ctx, _Obj, <<"blocklist">>, _Args) ->
+     {ok, blocklist};
+ execute(_Ctx, _Obj, <<"checkAuth">>, _Args) ->
+diff --git a/src/graphql/admin/mongoose_graphql_blocking_admin_mutation.erl b/src/graphql/admin/mongoose_graphql_blocking_admin_mutation.erl
+new file mode 100644
+index 0000000..ad62a2d
+--- /dev/null
++++ b/src/graphql/admin/mongoose_graphql_blocking_admin_mutation.erl
+@@ -0,0 +1,22 @@
++-module(mongoose_graphql_blocking_admin_mutation).
++
++-behaviour(mongoose_graphql).
++
++-export([execute/4]).
++
++-ignore_xref([execute/4]).
++
++-import(mongoose_graphql_helper, [make_error/2, make_error/3]).
++
++execute(_Ctx, blocking, <<"block">>, Args) ->
++    set_blocking(fun mod_blocking_api:block/2, Args);
++execute(_Ctx, blocking, <<"unblock">>, Args) ->
++    set_blocking(fun mod_blocking_api:unblock/2, Args).
++
++set_blocking(_Fun, #{<<"user">> := User, <<"jids">> := []}) ->
++    make_error(bad_request, <<"At least one JID is required">>, #{user => jid:to_binary(User)});
++set_blocking(Fun, #{<<"user">> := User, <<"jids">> := JIDs}) ->
++    case Fun(User, JIDs) of
++        {ok, Changed} -> {ok, [{ok, JID} || JID <- Changed]};
++        Error -> make_error(Error, #{user => jid:to_binary(User)})
++    end.
+diff --git a/src/graphql/admin/mongoose_graphql_blocking_admin_query.erl b/src/graphql/admin/mongoose_graphql_blocking_admin_query.erl
+new file mode 100644
+index 0000000..b60d9f8
+--- /dev/null
++++ b/src/graphql/admin/mongoose_graphql_blocking_admin_query.erl
+@@ -0,0 +1,15 @@
++-module(mongoose_graphql_blocking_admin_query).
++
++-behaviour(mongoose_graphql).
++
++-export([execute/4]).
++
++-ignore_xref([execute/4]).
++
++-import(mongoose_graphql_helper, [make_error/2]).
++
++execute(_Ctx, blocking, <<"getBlockingList">>, #{<<"user">> := User}) ->
++    case mod_blocking_api:get_blocking_list(User) of
++        {ok, JIDs} -> {ok, [{ok, JID} || JID <- JIDs]};
++        Error -> make_error(Error, #{user => jid:to_binary(User)})
++    end.
+diff --git a/src/graphql/mongoose_graphql.erl b/src/graphql/mongoose_graphql.erl
+index d092095..e2e257e 100644
+--- a/src/graphql/mongoose_graphql.erl
++++ b/src/graphql/mongoose_graphql.erl
+@@ -171,6 +171,8 @@ admin_mapping_rules() ->
+         'AdminAuthInfo' => mongoose_graphql_admin_auth_info,
+         'BlocklistAdminMutation' => mongoose_graphql_blocklist_admin_mutation,
+         'BlocklistAdminQuery' => mongoose_graphql_blocklist_admin_query,
++        'BlockingAdminMutation' => mongoose_graphql_blocking_admin_mutation,
++        'BlockingAdminQuery' => mongoose_graphql_blocking_admin_query,
+         'DomainAdminQuery' => mongoose_graphql_domain_admin_query,
+         'GdprAdminQuery' => mongoose_graphql_gdpr_admin_query,
+         'DomainAdminMutation' => mongoose_graphql_domain_admin_mutation,
+diff --git a/src/graphql/mongoose_graphql_handler.erl b/src/graphql/mongoose_graphql_handler.erl
+index 451741a..54c432d 100644
+--- a/src/graphql/mongoose_graphql_handler.erl
++++ b/src/graphql/mongoose_graphql_handler.erl
+@@ -287,7 +287,7 @@ allowed_categories() ->
+     [<<"checkAuth">>, <<"account">>, <<"domain">>, <<"last">>, <<"muc">>, <<"muc_light">>,
+      <<"session">>, <<"stanza">>, <<"roster">>, <<"vcard">>, <<"private">>, <<"metric">>,
+      <<"stat">>, <<"gdpr">>, <<"mnesia">>, <<"server">>, <<"inbox">>, <<"http_upload">>,
+-     <<"offline">>, <<"token">>, <<"cets">>, <<"broadcast">>, <<"blocklist">>].
++     <<"offline">>, <<"token">>, <<"cets">>, <<"broadcast">>, <<"blocklist">>, <<"blocking">>].
+ 
+ -spec check_password(jid:jid() | error, binary()) -> {true, mongoose_credentials:t()} | false.
+ -ifdef(TEST).
+diff --git a/src/privacy/mod_blocking.erl b/src/privacy/mod_blocking.erl
+index 6961ac4..5e8bd0f 100644
+--- a/src/privacy/mod_blocking.erl
++++ b/src/privacy/mod_blocking.erl
+@@ -12,6 +12,10 @@
+ -export([supported_features/0]).
+ -export([config_spec/0]).
+ 
++%% API
++-export([get_blocking_list/3,
++         set_blocking_list/5]).
++
+ -export([
+          process_iq_get/3,
+          process_iq_set/3,
+@@ -59,6 +63,35 @@ c2s_hooks(HostType) ->
+      {foreign_event, HostType, fun ?MODULE:foreign_event/3, #{}, 50}
+     ].
+ 
++%% API
++
++%% @doc Returns the user's blocking list (XEP-0191).
++-spec get_blocking_list(mongooseim:host_type(), jid:luser(), jid:lserver()) ->
++          {ok, [listitem()]} | {error, term()}.
++get_blocking_list(HostType, LUser, LServer) ->
++    case mod_privacy_backend:get_privacy_list(HostType, LUser, LServer, <<"blocking">>) of
++        {ok, List} -> {ok, List};
++        {error, not_found} -> {ok, []};
++        {error, Reason} -> {error, Reason};
++        Other -> {error, Other}
++    end.
++
++%% @doc Blocks or unblocks the given JIDs for the user, as if the user sent
++%% the blocking command (XEP-0191). The user's online resources get the
++%% blocking push, and the presence to the affected contacts is updated.
++-spec set_blocking_list(mongooseim:host_type(), jid:luser(), jid:lserver(),
++                        blocking_type(), [jid:literal_jid(), ...]) ->
++          {ok, [jid:literal_jid()]} | {error, term()}.
++set_blocking_list(HostType, LUser, LServer, Type, JIDs = [_ | _]) ->
++    maybe
++        {ok, CurrList} ?= get_blocking_list(HostType, LUser, LServer),
++        {ok, Changed, List, NType} ?=
++            modify_blocking_list(HostType, LUser, LServer, Type, JIDs, CurrList),
++        UserList = #userlist{name = <<"blocking">>, list = List, needdb = false},
++        broadcast_blocking_command(HostType, LUser, LServer, UserList, Changed, NType),
++        {ok, Changed}
++    end.
++
+ -spec user_send_iq(mongoose_acc:t(), mongoose_c2s_hooks:params(), map()) ->
+     mongoose_c2s_hooks:result().
+ user_send_iq(Acc, #{c2s_data := StateData}, #{host_type := HostType}) ->
+@@ -140,14 +173,7 @@ disco_local_features(Acc, _, _) ->
+ process_iq_get(Acc, #{from := #jid{luser = LUser, lserver = LServer},
+                iq := #iq{xmlns = ?NS_BLOCKING}}, _) ->
+     HostType = mongoose_acc:host_type(Acc),
+-    Res = case mod_privacy_backend:get_privacy_list(HostType, LUser, LServer, <<"blocking">>) of
+-              {error, not_found} ->
+-                  {ok, []};
+-              {ok, L} ->
+-                  {ok, L};
+-              E ->
+-                  {error, E}
+-          end,
++    Res = get_blocking_list(HostType, LUser, LServer),
+     IqRes = case Res of
+                 {ok, Lst} ->
+                     {result, blocking_query_response(Lst)};
+@@ -169,14 +195,10 @@ process_iq_set(Acc, #{from := From, iq := #iq{xmlns = ?NS_BLOCKING, sub_el = Sub
+     #xmlel{name = BType} = SubEl,
+     Type = parse_command_type(BType),
+     Usrs = exml_query:paths(SubEl, [{element, <<"item">>}, {attr, <<"jid">>}]),
+-    CurrList = case mod_privacy_backend:get_privacy_list(HostType, LUser, LServer, <<"blocking">>) of
+-                  {ok, List} ->
+-                      List;
+-                  {error, not_found} ->
+-                      [];
+-                  {error, Reason} ->
+-                      {error, Reason}
+-              end,
++    CurrList = case get_blocking_list(HostType, LUser, LServer) of
++                   {ok, List} -> List;
++                   {error, Reason} -> {error, Reason}
++               end,
+     %% process
+     {Acc1, Res} = process_blocking_iq_set(Type, Acc, LUser, LServer, CurrList, Usrs),
+     %% respond / notify
+@@ -210,18 +232,27 @@ process_blocking_iq_set(block, Acc, _, _, _, []) ->
+ process_blocking_iq_set(Type, Acc, LUser, LServer, CurrList, Usrs) ->
+     %% check who is being added / removed
+     HostType = mongoose_acc:host_type(Acc),
++    case modify_blocking_list(HostType, LUser, LServer, Type, Usrs, CurrList) of
++        {ok, _, _, _} = Result ->
++            {Acc, Result};
++        {error, not_found} ->
++            {Acc, {error, mongoose_xmpp_errors:item_not_found()}};
++        {error, _Reason} ->
++            {Acc, {error, mongoose_xmpp_errors:internal_server_error()}}
++    end.
++
++-spec modify_blocking_list(mongooseim:host_type(), jid:luser(), jid:lserver(),
++                           blocking_type(), [binary()], [listitem()]) ->
++          {ok, [binary()], [listitem()], block | unblock | unblock_all} | {error, term()}.
++modify_blocking_list(HostType, LUser, LServer, Type, Usrs, CurrList) ->
+     {NType, Changed, NewList} = blocking_list_modify(Type, Usrs, CurrList),
+     case mod_privacy_backend:replace_privacy_list(HostType, LUser, LServer, <<"blocking">>, NewList) of
+         {error, E} ->
+             {error, E};
+         ok ->
+             case mod_privacy_backend:set_default_list(HostType, LUser, LServer, <<"blocking">>) of
+-                ok ->
+-                    {Acc, {ok, Changed, NewList, NType}};
+-                {error, not_found} ->
+-                    {Acc, {error, mongoose_xmpp_errors:item_not_found()}};
+-                {error, _Reason} ->
+-                {Acc, {error, mongoose_xmpp_errors:internal_server_error()}}
++                ok -> {ok, Changed, NewList, NType};
++                {error, Reason} -> {error, Reason}
+             end
+     end.
+ 
+@@ -232,7 +263,8 @@ complete_iq_set(blocking_command, Acc, _, _, {error, Reason}) ->
+ complete_iq_set(blocking_command, Acc, LUser, LServer, {ok, Changed, List, Type}) ->
+     UserList = #userlist{name = <<"blocking">>, list = List, needdb = false},
+     % send the list to all users c2s processes (resources) to make it effective immediately
+-    broadcast_blocking_command(Acc, LUser, LServer, UserList, Changed, Type),
++    HostType = mongoose_acc:host_type(Acc),
++    broadcast_blocking_command(HostType, LUser, LServer, UserList, Changed, Type),
+     % return a response here so that c2s sets the list in its state
+     {Acc, {result, [], UserList}}.
+ %%complete_iq_set(blocking_command, _, _, _) ->
+@@ -305,11 +337,10 @@ make_blocking_list_entry(J) ->
+ 
+ %% @doc send iq confirmation to all of the user's resources
+ %% if we unblock all contacts then we don't list who's been unblocked
+-broadcast_blocking_command(Acc, LUser, LServer, UserList, _Changed, unblock_all) ->
+-    broadcast_blocking_command(Acc, LUser, LServer, UserList, [], unblock);
+-broadcast_blocking_command(Acc, LUser, LServer, UserList, Changed, Type) ->
++broadcast_blocking_command(HostType, LUser, LServer, UserList, _Changed, unblock_all) ->
++    broadcast_blocking_command(HostType, LUser, LServer, UserList, [], unblock);
++broadcast_blocking_command(HostType, LUser, LServer, UserList, Changed, Type) ->
+     Item = {blocking, UserList, Type, Changed},
+-    HostType = mongoose_acc:host_type(Acc),
+     mod_privacy:broadcast_item(HostType, LUser, LServer, ?MODULE, Item).
+ 
+ -spec blocking_query_response([mod_privacy:list_name()]) -> exml:element().
+diff --git a/src/privacy/mod_blocking_api.erl b/src/privacy/mod_blocking_api.erl
+new file mode 100644
+index 0000000..be59f6a
+--- /dev/null
++++ b/src/privacy/mod_blocking_api.erl
+@@ -0,0 +1,58 @@
++%% @doc API for managing the users' blocking lists (XEP-0191) without a session.
++-module(mod_blocking_api).
++
++-export([get_blocking_list/1, block/2, unblock/2]).
++
++-include("jlib.hrl").
++-include("mod_privacy.hrl").
++
++-type error() :: {domain_not_found | user_not_found | internal, iodata()}.
++
++%% @doc Returns the JIDs blocked by the user.
++-spec get_blocking_list(jid:jid()) -> {ok, [jid:jid()]} | error().
++get_blocking_list(User = #jid{luser = LUser, lserver = LServer}) ->
++    maybe
++        {ok, HostType} ?= get_host_type(User),
++        {ok, List} ?= mod_blocking:get_blocking_list(HostType, LUser, LServer),
++        {ok, [jid:make_noprep(Value) || #listitem{value = Value} <- List]}
++    else
++        {error, _} -> internal_error();
++        Error -> Error
++    end.
++
++%% @doc Blocks the given JIDs for the user. Returns the blocked JIDs.
++-spec block(jid:jid(), [jid:jid(), ...]) -> {ok, [jid:jid()]} | error().
++block(User, JIDs) ->
++    set_blocking_list(User, block, JIDs).
++
++%% @doc Unblocks the given JIDs for the user. Returns the JIDs that were blocked before.
++-spec unblock(jid:jid(), [jid:jid(), ...]) -> {ok, [jid:jid()]} | error().
++unblock(User, JIDs) ->
++    set_blocking_list(User, unblock, JIDs).
++
++%% Helpers
++
++set_blocking_list(User = #jid{luser = LUser, lserver = LServer}, Type, JIDs) ->
++    BinJIDs = lists:usort([jid:to_binary(jid:to_lower(JID)) || JID <- JIDs]),
++    maybe
++        {ok, HostType} ?= get_host_type(User),
++        {ok, Changed} ?= mod_blocking:set_blocking_list(HostType, LUser, LServer, Type, BinJIDs),
++        {ok, [jid:from_binary(JID) || JID <- Changed]}
++    else
++        {error, _} -> internal_error();
++        Error -> Error
++    end.
++
++get_host_type(User = #jid{lserver = LServer}) ->
++    case mongoose_domain_api:get_domain_host_type(LServer) of
++        {ok, HostType} ->
++            case ejabberd_auth:does_user_exist(HostType, User, stored) of
++                true -> {ok, HostType};
++                false -> {user_not_found, <<"User does not exist">>}
++            end;
++        {error, not_found} ->
++            {domain_not_found, <<"User's domain does not exist">>}
++    end.
++
++internal_error() ->
++    {internal, <<"Cannot access the blocking list">>}.
+-- 
+2.43.0
+
