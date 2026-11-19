@@ -43,6 +43,7 @@
 -ignore_xref([from_json/2, to_html/2, to_json/2]).
 
 -include("mongoose_config_spec.hrl").
+-include("mongoose_logger.hrl").
 
 %% mongoose_http_handler callbacks
 
@@ -184,13 +185,18 @@ auth_user(_, State) ->
     {ok, State#{authorized => false}}.
 
 auth_admin({bearer, Token}, #{jwt := _} = State) ->
-    case mongoose_graphql_jwt:verify(Token, State) of
-        {ok, _Claims} ->
+    case verify_jwt(Token, State) of
+        {ok, Claims} ->
+            log_jwt_success(Claims, State, #{}),
             {ok, State#{authorized => true,
+                        token_expires_at => mongoose_graphql_jwt:expires_at(Claims),
                         schema_ctx => #{authorized_as => admin}}};
-        {error, _} ->
+        error ->
             error
     end;
+auth_admin({bearer, _Token}, _State) ->
+    %% A token sent to a listener without JWT configured is rejected, not ignored
+    error;
 auth_admin({basic, Username, Password}, #{username := Username, password := Password} = State) ->
     {ok, State#{authorized => true,
                 schema_ctx => #{authorized_as => admin}
@@ -221,20 +227,25 @@ auth_domain_admin({basic, Username, Password}, State) ->
             error
     end;
 auth_domain_admin({bearer, Token}, #{jwt := #{domain_key := DomainKey}} = State) ->
-    case mongoose_graphql_jwt:verify(Token, State) of
+    case verify_jwt(Token, State) of
         {ok, Claims} ->
             case token_domain(mongoose_graphql_jwt:get_claim(DomainKey, Claims)) of
                 {ok, Domain} ->
+                    log_jwt_success(Claims, State, #{domain => Domain}),
                     Admin = jid:make_noprep(<<"admin">>, Domain, <<>>),
                     {ok, State#{authorized => true,
+                                token_expires_at => mongoose_graphql_jwt:expires_at(Claims),
                                 schema_ctx => #{authorized_as => domain_admin,
                                                 admin => Admin}}};
                 error ->
+                    log_jwt_failure(unknown_domain, State),
                     error
             end;
-        {error, _} ->
+        error ->
             error
     end;
+auth_domain_admin({bearer, _Token}, _State) ->
+    error;
 auth_domain_admin(_, State) ->
     {ok, State#{authorized => false}}.
 
@@ -252,6 +263,28 @@ token_domain(Domain) when is_binary(Domain) ->
     end;
 token_domain(_) ->
     error.
+
+verify_jwt(Token, State) ->
+    case mongoose_graphql_jwt:verify(Token, State) of
+        {ok, Claims} ->
+            {ok, Claims};
+        {error, Reason} ->
+            log_jwt_failure(Reason, State),
+            error
+    end.
+
+%% An audit trail of admin access. The token itself is a credential, and is never logged.
+log_jwt_success(Claims, #{schema_endpoint := Endpoint}, Extra) ->
+    ClaimInfo = maps:from_list([{binary_to_atom(Name), Value}
+                                || Name <- [<<"sub">>, <<"iss">>, <<"jti">>],
+                                   Value <- [mongoose_graphql_jwt:get_claim(Name, Claims)],
+                                   Value =/= undefined]),
+    ?LOG_INFO(maps:merge(ClaimInfo#{what => graphql_jwt_auth_succeeded,
+                                    schema_endpoint => Endpoint}, Extra)).
+
+log_jwt_failure(Reason, #{schema_endpoint := Endpoint}) ->
+    ?LOG_WARNING(#{what => graphql_jwt_auth_failed, schema_endpoint => Endpoint,
+                   reason => Reason}).
 
 read_jwt_keys(#{jwt := JwtOpts} = Opts) ->
     Opts#{jwt_keys => mongoose_graphql_jwt:read_keys(JwtOpts)};

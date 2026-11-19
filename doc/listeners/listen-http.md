@@ -137,8 +137,9 @@ On the `admin` endpoint, setting this option enables the authentication, just li
 * **Default:** no default, this option is mandatory
 
 The keys used to verify the token signatures. For the public key algorithms, the secret is the public key in the PEM format,
-so the server cannot issue tokens itself. The keys are tried in order.
+so the server cannot issue tokens itself. A private key is rejected. The keys are tried in order.
 When the token header contains a `kid`, only the keys with the same `kid` and the keys without a `kid` are tried.
+A token whose `kid` is not a string is rejected. An empty secret is rejected, and an empty environment variable is treated as unset.
 A file is read when the listener starts, while an environment variable is read for each request.
 
 #### `listen.http.handlers.mongoose_graphql_handler.jwt.issuer`
@@ -150,10 +151,12 @@ When set, the token is accepted only if its `iss` claim is equal to this value.
 
 #### `listen.http.handlers.mongoose_graphql_handler.jwt.audience`
 * **Syntax:** string
-* **Default:** not set
+* **Default:** no default, this option is mandatory
 * **Example:** `jwt.audience = "mongooseim-admin"`
 
-When set, the token is accepted only if its `aud` claim is equal to this value, or is a list containing it.
+The token is accepted only if its `aud` claim is equal to this value, or is a list containing it.
+Use a different audience for each endpoint, and one that your identity provider never puts in other tokens.
+Otherwise a token issued for something else, such as an XMPP client login with [`auth.jwt`](../authentication-methods/jwt.md) or a domain admin, could be used here if it is signed with the same key.
 
 #### `listen.http.handlers.mongoose_graphql_handler.jwt.domain_key` - only for `domain_admin`
 * **Syntax:** string
