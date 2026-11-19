@@ -290,7 +290,7 @@ make_tombstone(HostType, ArcID, _RetractionId,
 
 %% Moderation logic (XEP-0425)
 -spec moderate_room_message(Acc, Params, Extra) -> {ok, Acc} when
-    Acc :: ok | {error, item_not_found},
+    Acc :: ok | {error, item_not_found | not_supported},
     Params :: mod_muc_room:moderate_message_params(),
     Extra :: gen_hook:extra().
 moderate_room_message(Acc, Params = #{room_jid := RoomJID}, #{host_type := HostType}) ->

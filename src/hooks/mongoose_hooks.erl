@@ -1354,12 +1354,13 @@ room_packet(Server, FromNick, FromJID, JID, Packet) ->
 %%% @doc The `moderate_room_message' hook is called when a moderator retracts a message
 %%% from a MUC room (XEP-0425). Archive handlers replace the message with a tombstone.
 %%% They return `{error, item_not_found}' if the room archive has no such message.
+%%% Without a handler (no archive, or retraction disabled) the result is `{error, not_supported}'.
 -spec moderate_room_message(HostType, Params) -> Result when
     HostType :: mongooseim:host_type(),
     Params :: mod_muc_room:moderate_message_params(),
-    Result :: ok | {error, item_not_found}.
+    Result :: ok | {error, item_not_found | not_supported}.
 moderate_room_message(HostType, Params) ->
-    run_hook_for_host_type(moderate_room_message, HostType, ok, Params).
+    run_hook_for_host_type(moderate_room_message, HostType, {error, not_supported}, Params).
 
 -spec update_inbox_for_muc(HostType, Info) -> Result when
     HostType :: mongooseim:host_type(),

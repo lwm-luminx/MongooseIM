@@ -296,7 +296,11 @@ moderate_message_in_stopped_room(RoomJID = #jid{luser = Room, lserver = MucHost}
                 {ok, _} ->
                     Params = #{room_jid => RoomJID, stanza_id => StanzaID,
                                by => RoomJID, reason => Reason},
-                    mongoose_hooks:moderate_room_message(HostType, Params);
+                    %% Without an archive that supports it, there is nothing to moderate
+                    case moderate_archived_message(HostType, Params) of
+                        ok -> ok;
+                        {error, _} -> {error, item_not_found}
+                    end;
                 _ ->
                     {error, not_found}
             end;
@@ -944,7 +948,8 @@ can_send_broadcasts(Role, StateData) ->
     or not (StateData#state.config)#config.moderated.
 
 broadcast_room_packet(From, FromNick, Role, RMess, StateData) ->
-    #routed_message{packet = Packet, stable_stanza_id = StableID} = RMess,
+    #routed_message{packet = Packet0, stable_stanza_id = StableID} = RMess,
+    Packet = strip_moderation_elements(Packet0),
     TS = erlang:system_time(microsecond),
     Affiliation = get_affiliation(From, StateData),
     EventData = #{from_nick => FromNick, from_jid => From,
@@ -2594,23 +2599,49 @@ moderate_message(ByJID, StanzaID, Reason, StateData = #state{host_type = HostTyp
                                                              jid = RoomJID}) ->
     Params = #{room_jid => RoomJID, stanza_id => StanzaID, by => ByJID, reason => Reason},
     InHistory = is_message_in_history(StanzaID, StateData),
-    %% A message that is still in the room history may not be in the archive yet,
-    %% e.g. when the archive is written asynchronously
-    case {mongoose_hooks:moderate_room_message(HostType, Params), InHistory} of
-        {{error, item_not_found}, false} ->
-            {{error, item_not_found}, StateData};
-        _ ->
-            ?LOG_INFO(ls(#{what => muc_message_moderated, stanza_id => StanzaID,
-                           moderator => jid:to_binary(ByJID)}, StateData)),
-            broadcast_moderation(Params, StateData),
-            {ok, remove_message_from_history(StanzaID, StateData)}
+    %% A message that is only in the room history (e.g. the room is not archived)
+    %% can still be moderated there
+    case {moderate_archived_message(HostType, Params), InHistory} of
+        {ok, _} ->
+            {ok, apply_moderation(Params, StateData)};
+        {{error, _}, true} ->
+            {ok, apply_moderation(Params, StateData)};
+        {{error, _}, false} ->
+            {{error, item_not_found}, StateData}
     end.
 
+%% The async writer can still hold the message, so flush it first.
+%% Otherwise the message is not found, and is written unmoderated after the moderation.
+-spec moderate_archived_message(mongooseim:host_type(), moderate_message_params()) ->
+    ok | {error, item_not_found | not_supported}.
+moderate_archived_message(HostType, Params) ->
+    mongoose_hooks:mam_muc_archive_sync(HostType),
+    mongoose_hooks:moderate_room_message(HostType, Params).
+
+-spec apply_moderation(moderate_message_params(), state()) -> state().
+apply_moderation(Params = #{stanza_id := StanzaID, by := ByJID}, StateData) ->
+    ?LOG_INFO(ls(#{what => muc_message_moderated, stanza_id => StanzaID,
+                   moderator => jid:to_binary(ByJID)}, StateData)),
+    broadcast_moderation(Params, StateData),
+    remove_message_from_history(StanzaID, StateData).
+
+%% The moderation message goes through the same hooks as other room messages, so that it is
+%% archived (clients catching up with MAM learn about it) and updates the inbox
 -spec broadcast_moderation(moderate_message_params(), state()) -> ok.
-broadcast_moderation(Params, StateData = #state{jid = RoomJID}) ->
+broadcast_moderation(Params, StateData = #state{jid = RoomJID, host_type = HostType}) ->
     Packet = moderation_packet(Params),
+    EventData = #{from_nick => <<>>, from_jid => RoomJID, room_jid => RoomJID,
+                  role => moderator, affiliation => owner,
+                  timestamp => erlang:system_time(microsecond)},
+    FilteredPacket = mongoose_hooks:filter_room_packet(HostType, Packet, EventData),
+    run_update_inbox_for_muc_hook(HostType, #{host_type => HostType,
+                                              room_jid => RoomJID,
+                                              from_jid => RoomJID,
+                                              from_room_jid => RoomJID,
+                                              packet => FilteredPacket,
+                                              affiliations_map => StateData#state.affiliations}),
     maps_foreach(fun(_LJID, #user{jid = JID}) ->
-                         mongoose_router:route(mongoose_acc:new(RoomJID, JID, Packet, ?LOCATION))
+                         mongoose_router:route(mongoose_acc:new(RoomJID, JID, FilteredPacket, ?LOCATION))
                  end, StateData#state.users).
 
 -spec moderation_packet(moderate_message_params()) -> exml:element().
@@ -2623,9 +2654,37 @@ moderation_packet(#{stanza_id := StanzaID, by := ByJID, reason := Reason}) ->
     Retract = #xmlel{name = <<"retract">>,
                      attrs = #{<<"xmlns">> => ?NS_RETRACT_1, <<"id">> => StanzaID},
                      children = [Moderated | ReasonEls]},
+    %% It has no body, so ask for it to be archived (XEP-0334)
+    Store = #xmlel{name = <<"store">>, attrs = #{<<"xmlns">> => ?NS_HINTS}},
     #xmlel{name = <<"message">>,
            attrs = #{<<"type">> => <<"groupchat">>, <<"id">> => mongoose_bin:gen_from_crypto()},
-           children = [Retract]}.
+           children = [Retract, Store]}.
+
+%% Only the room can say that a message was moderated (XEP-0425, section 5), so these elements
+%% are removed from the occupants' messages
+-spec strip_moderation_elements(exml:element()) -> exml:element().
+strip_moderation_elements(Packet = #xmlel{children = Children}) ->
+    Packet#xmlel{children = [Child || Child <- Children, not is_moderation_element(Child)]}.
+
+is_moderation_element(#xmlel{attrs = #{<<"xmlns">> := ?NS_MESSAGE_MODERATE}}) ->
+    true;
+is_moderation_element(#xmlel{name = <<"retracted">>, attrs = #{<<"xmlns">> := ?NS_RETRACT_1}}) ->
+    true;
+is_moderation_element(El = #xmlel{name = <<"retract">>, attrs = #{<<"xmlns">> := ?NS_RETRACT_1}}) ->
+    exml_query:path(El, [{element_with_ns, <<"moderated">>, ?NS_MESSAGE_MODERATE}]) =/= undefined;
+is_moderation_element(_) ->
+    false.
+
+%% Messages can only be moderated by their stanza ID, which room messages get from MUC MAM
+%% or from mod_stanzaid
+-spec moderation_features(state()) -> [mongoose_disco:feature()].
+moderation_features(#state{host_type = HostType, jid = #jid{lserver = MucHost}}) ->
+    case gen_mod:is_loaded(HostType, mod_stanzaid) orelse
+         (gen_mod:is_loaded(HostType, mod_mam_muc)
+          andalso mod_mam_utils:is_mam_muc_enabled(MucHost, HostType)) of
+        true -> [?NS_MESSAGE_MODERATE];
+        false -> []
+    end.
 
 -spec is_message_in_history(binary(), state()) -> boolean().
 is_message_in_history(StanzaID, StateData) ->
@@ -3868,7 +3927,7 @@ process_iq_disco_info(From, get, Lang, StateData) ->
     HostType = StateData#state.host_type,
     IdentityXML = mongoose_disco:identities_to_xml([identity(get_title(StateData))]),
     FeatureXML =  mongoose_disco:get_muc_features(HostType, From, RoomJID, <<>>, Lang,
-                                                  room_features(Config)),
+                                                  room_features(Config, StateData)),
     InfoXML = iq_disco_info_extras(StateData),
     {result, IdentityXML ++ FeatureXML ++ InfoXML, StateData}.
 
@@ -3877,11 +3936,11 @@ identity(Name) ->
       type => <<"text">>,
       name => Name}.
 
--spec room_features(config()) -> [mongoose_disco:feature()].
-room_features(Config) ->
+-spec room_features(config(), state()) -> [mongoose_disco:feature()].
+room_features(Config, StateData) ->
+    moderation_features(StateData) ++
     [?NS_MUC,
      ?NS_MUC_STABLE_ID,
-     ?NS_MESSAGE_MODERATE,
      config_opt_to_feature((Config#config.public),
                            <<"muc_public">>, <<"muc_hidden">>),
      config_opt_to_feature((Config#config.persistent),

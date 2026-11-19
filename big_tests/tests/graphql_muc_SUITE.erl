@@ -710,9 +710,14 @@ admin_moderate_message_story(Config, Alice, Bob) ->
         rdbms ->
             %% The room archive has a tombstone in place of the message
             Res2 = get_room_messages(RoomJID, 50, null, Config),
-            #{<<"stanzas">> := [#{<<"stanza">> := StanzaXML}]} =
-                get_ok_value(?GET_MESSAGES_PATH, Res2),
-            {ok, Tombstone} = exml:parse(StanzaXML),
+            %% followed by the moderation message, for clients catching up later
+            #{<<"stanzas">> := StanzaMaps} = get_ok_value(?GET_MESSAGES_PATH, Res2),
+            Parsed = [element(2, exml:parse(XML)) || #{<<"stanza">> := XML} <- StanzaMaps],
+            RetractPath = [{element_with_ns, <<"retract">>, <<"urn:xmpp:message-retract:1">>},
+                           {attr, <<"id">>}],
+            {[Moderation], [Tombstone]} =
+                lists:partition(fun(S) -> exml_query:path(S, RetractPath) =/= undefined end, Parsed),
+            ?assertEqual(StanzaId, exml_query:path(Moderation, RetractPath)),
             ?assertEqual(undefined, exml_query:subelement(Tombstone, <<"body">>)),
             ?assertMatch(#xmlel{name = <<"retracted">>},
                          exml_query:subelement_with_ns(Tombstone,

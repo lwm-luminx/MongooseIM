@@ -498,7 +498,21 @@ moderated_tombstone(Packet, #{by := ByJID, reason := Reason}) ->
                        attrs = #{<<"xmlns">> => ?NS_RETRACT_1,
                                  <<"stamp">> => list_to_binary(Timestamp)},
                        children = [Moderated | ReasonEls]},
-    Packet#xmlel{children = [Retracted]}.
+    %% Keep what identifies the author (the muc#user item with the real JID, shown to those
+    %% allowed to see it, and the occupant ID) and the correction it was (XEP-0425, section 4)
+    Kept = [El || El <- Packet#xmlel.children, is_kept_in_moderated_tombstone(El)],
+    Packet#xmlel{children = [Retracted | Kept]}.
+
+is_kept_in_moderated_tombstone(#xmlel{name = <<"x">>, attrs = #{<<"xmlns">> := ?NS_MUC_USER}}) ->
+    true;
+is_kept_in_moderated_tombstone(#xmlel{name = <<"occupant-id">>,
+                                      attrs = #{<<"xmlns">> := <<"urn:xmpp:occupant-id:0">>}}) ->
+    true;
+is_kept_in_moderated_tombstone(#xmlel{name = <<"replace">>,
+                                      attrs = #{<<"xmlns">> := <<"urn:xmpp:message-correct:0">>}}) ->
+    true;
+is_kept_in_moderated_tombstone(_) ->
+    false.
 
 -spec maybe_append_origin_id(retraction_info()) -> [exml:element()].
 maybe_append_origin_id(#{origin_id := OriginID}) when is_binary(OriginID), <<>> =/= OriginID ->

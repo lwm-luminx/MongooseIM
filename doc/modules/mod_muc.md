@@ -29,10 +29,15 @@ The room removes the message from its history and sends the retraction to all oc
     <moderated by='room@muc.example.com/moderator-nick' xmlns='urn:xmpp:message-moderate:1'/>
     <reason>Spam</reason>
   </retract>
+  <store xmlns='urn:xmpp:hints'/>
 </message>
 ```
 
-When [MUC archiving](mod_mam.md#enable-muc-message-archive) is enabled with the `rdbms` backend, the message is also replaced with a tombstone in the room archive.
+The retraction message is archived like other room messages, so clients catching up with MAM learn about it, and it updates the occupants' inboxes.
+When [MUC archiving](mod_mam.md#enable-muc-message-archive) is enabled with the `rdbms` backend and message retraction, the message is also replaced with a tombstone in the room archive.
+The tombstone keeps the author's `muc#user` item, occupant ID and message correction element, if any.
+Any moderation elements in the occupants' own messages are removed, so only the room can announce a moderation.
+The feature is advertised only when room messages get stanza IDs, i.e. with MUC archiving or `mod_stanzaid`.
 If the message is found neither in the archive nor in the room history, the request fails with `item-not-found`.
 Other occupants get a `forbidden` error.
 
