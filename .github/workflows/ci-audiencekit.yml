@@ -128,6 +128,14 @@ jobs:
         run: escript tools/select_suites_to_run.erl big_tests/default.spec ${{ matrix.suites }}
       - name: Run big_tests
         run: tools/test.sh -p "${{ matrix.preset }}" -s false -e false -c false
+      - name: Print failed case details
+        if: failure()
+        run: |
+          for f in $(find big_tests/ct_report -name suite.log); do
+            awk '/^=case/{c=$0; p=0} /^=result/{p=0} /^=result/ && !/=result *(ok|skipped)/{print c; p=1; n=0} p && n<80 {print; n++} /^=/ && !/^=result/{p=0}' "$f"
+          done
+          echo "==== MongooseIM error log lines ===="
+          grep -h "level=error" _build/mim1/rel/mongooseim/log/mongooseim.log* | cut -c1-3000 | head -150 || true
       - name: Upload CT reports on failure
         if: failure()
         uses: actions/upload-artifact@v4
