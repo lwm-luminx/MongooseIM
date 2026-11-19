@@ -117,6 +117,54 @@ When set, enables authentication for the admin API, otherwise it is disabled. Re
 * **Default:** not set
 * **Example:** `password = "secret"`
 
+### `listen.http.handlers.mongoose_graphql_handler.jwt` - only for `admin` and `domain_admin`
+* **Syntax:** TOML table with the options listed below
+* **Default:** not set
+* **Example:** `jwt.keys = [{kid = "2025-01", secret.file = "jwt_public_key.pem", algorithm = "RS256"}]`
+
+When set, the endpoint also accepts JSON Web Tokens in the `Authorization: Bearer <token>` header.
+The tokens are accepted in addition to the passwords. See [Admin GraphQL API](../graphql-api/Admin-GraphQL.md#json-web-tokens) for details.
+On the `admin` endpoint, setting this option enables the authentication, just like setting `username` and `password`.
+
+#### `listen.http.handlers.mongoose_graphql_handler.jwt.keys`
+* **Syntax:** non-empty array of TOML tables with the following items:
+    * `secret` - mandatory TOML table with exactly one of the possible items listed below:
+        * `file` - string, path to the file with the secret,
+        * `env` - string, environment variable name with the secret,
+        * `value` - string, the secret value.
+    * `algorithm` - mandatory string, one of: `"HS256"`, `"RS256"`, `"ES256"`, `"HS384"`, `"RS384"`, `"ES384"`, `"HS512"`, `"RS512"`, `"ES512"`,
+    * `kid` - optional string, the key ID.
+* **Default:** no default, this option is mandatory
+
+The keys used to verify the token signatures. For the public key algorithms, the secret is the public key in the PEM format,
+so the server cannot issue tokens itself. A private key is rejected. The keys are tried in order.
+When the token header contains a `kid`, only the keys with the same `kid` and the keys without a `kid` are tried.
+A token whose `kid` is not a string is rejected. An empty secret is rejected, and an empty environment variable is treated as unset.
+A file is read when the listener starts, while an environment variable is read for each request.
+
+#### `listen.http.handlers.mongoose_graphql_handler.jwt.issuer`
+* **Syntax:** string
+* **Default:** not set
+* **Example:** `jwt.issuer = "https://auth.example.com"`
+
+When set, the token is accepted only if its `iss` claim is equal to this value.
+
+#### `listen.http.handlers.mongoose_graphql_handler.jwt.audience`
+* **Syntax:** string
+* **Default:** no default, this option is mandatory
+* **Example:** `jwt.audience = "mongooseim-admin"`
+
+The token is accepted only if its `aud` claim is equal to this value, or is a list containing it.
+Use a different audience for each endpoint, and one that your identity provider never puts in other tokens.
+Otherwise a token issued for something else, such as an XMPP client login with [`auth.jwt`](../authentication-methods/jwt.md) or a domain admin, could be used here if it is signed with the same key.
+
+#### `listen.http.handlers.mongoose_graphql_handler.jwt.domain_key` - only for `domain_admin`
+* **Syntax:** string
+* **Default:** `"domain"`
+* **Example:** `jwt.domain_key = "tenant"`
+
+Name of the claim containing the domain that the token holder administers.
+
 ### `listen.http.handlers.mongoose_graphql_handler.allowed_categories`
 * **Syntax:** non-empty array of strings. Allowed values: `"checkAuth", "account", "domain", "last", "muc", "muc_light", "session", "stanza", "roster", "vcard", "private", "metric", "stat", "gdpr", "mnesia", "server", "inbox", "http_upload", "offline", "token", "cets"`
 * **Default:** all GraphQL categories enabled
@@ -237,6 +285,20 @@ GraphQL API for the domain admin.
     host = "_"
     path = "/api/graphql"
     schema_endpoint = "domain_admin"
+```
+
+Domain admins can also authenticate with short-lived JSON Web Tokens signed by your identity provider.
+The tokens are verified with its public key, and the `tenant` claim names the domain:
+
+```toml
+  [[listen.http.handlers.mongoose_graphql_handler]]
+    host = "_"
+    path = "/api/graphql"
+    schema_endpoint = "domain_admin"
+    jwt.issuer = "https://auth.example.com"
+    jwt.audience = "mongooseim-domain-admin"
+    jwt.domain_key = "tenant"
+    jwt.keys = [{kid = "2025-01", secret.file = "/etc/mongooseim/jwt_public_key.pem", algorithm = "RS256"}]
 ```
 
 ### Example 4. User GraphQL API
