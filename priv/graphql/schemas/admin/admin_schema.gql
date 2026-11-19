@@ -47,6 +47,8 @@ type AdminQuery{
   broadcast: BroadcastAdminQuery
   "Blocklist management"
   blocklist: BlocklistAdminQuery
+  "Users' blocking lists (XEP-0191) management"
+  blocking: BlockingAdminQuery
 }
 
 """
@@ -92,6 +94,8 @@ type AdminMutation @protected{
   broadcast: BroadcastAdminMutation
   "Blocklist management"
   blocklist: BlocklistAdminMutation
+  "Users' blocking lists (XEP-0191) management"
+  blocking: BlockingAdminMutation
 }
 
 type AdminSubscription {
