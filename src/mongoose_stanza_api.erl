@@ -4,7 +4,7 @@
 -export([send_chat_message/5, send_headline_message/6, send_stanza/3, lookup_recent_messages/5]).
 
 %% Event API
--export([open_session/2, open_session/3, close_session/1,
+-export([open_session/3, close_session/1,
          room_presence_sent/3, handle_room_presence/2]).
 
 -include("jlib.hrl").
@@ -60,10 +60,6 @@ lookup_recent_messages(User, With, Before, Limit, CheckUser) ->
     fold(M, [fun get_host_type/1, fun check_user/1, fun lookup_messages/1]).
 
 %% Event API
-
--spec open_session(jid:jid(), boolean()) -> {unknown_user, iodata()} | {ok, stream()}.
-open_session(User, CheckUser) ->
-    open_session(User, CheckUser, undefined).
 
 %% @doc Opens a session for the user, with the given resource or a random one.
 %% A resource that is already in use is not taken over.
