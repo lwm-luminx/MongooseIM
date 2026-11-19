@@ -176,11 +176,11 @@ admin_unblock_when_unavailable_story(Config, Alice, Bob) ->
     escalus:send(Alice, escalus_stanza:presence(<<"unavailable">>)),
     escalus:assert(is_presence_with_type, [<<"unavailable">>], escalus:wait_for_stanza(Bob)),
     escalus_client:wait_for_stanzas(Alice, 1, 500), % own unavailable presence, if any
-    block(Alice, [BobJid], Config),
-    ?assert(mod_blocking_SUITE:is_xep191_push(<<"block">>, [BobJid], escalus:wait_for_stanza(Alice))),
+    %% Blocking pushes only go to available sessions, so Alice gets none here
+    ?assertEqual([BobJid], get_ok_value([data, blocking, block], block(Alice, [BobJid], Config))),
     escalus_client:wait_for_stanzas(Bob, 1, 500), % repeated unavailable, if any
-    unblock(Alice, [BobJid], Config),
-    ?assert(mod_blocking_SUITE:is_xep191_push(<<"unblock">>, [BobJid], escalus:wait_for_stanza(Alice))),
+    ?assertEqual([BobJid], get_ok_value([data, blocking, unblock], unblock(Alice, [BobJid], Config))),
+    escalus_assert:has_no_stanzas(Alice),
     %% Alice's session is still alive, and Bob doesn't see her as available
     escalus:send(Alice, mod_blocking_SUITE:get_blocklist_stanza()),
     escalus:assert(is_iq_result, escalus:wait_for_stanza(Alice)),
