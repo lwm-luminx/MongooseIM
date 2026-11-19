@@ -96,7 +96,7 @@ jwt_key_config_spec() ->
 
 algorithm_config_spec() ->
     #option{type = binary,
-            validate = {enum, maps:keys(algorithms())},
+            validate = {enum, maps:keys(mongoose_jwt:algorithms())},
             process = fun ?MODULE:process_algorithm/1}.
 
 jwt_secret_config_spec() ->
@@ -105,14 +105,19 @@ jwt_secret_config_spec() ->
                                        validate = filename},
                  <<"env">> => #option{type = string,
                                       validate = non_empty},
-                 <<"value">> => #option{type = binary}},
+                 <<"value">> => #option{type = binary,
+                                        validate = non_empty}},
        format_items = list,
        process = fun ?MODULE:process_jwt_secret/1
       }.
 
-process_jwt_secret([V]) -> V.
+process_jwt_secret([V]) -> V;
+process_jwt_secret(_) ->
+    %% The values are not included, as they are secret
+    error(#{what => jwt_one_secret_source_required,
+            text => <<"Exactly one of 'file', 'env' and 'value' is required">>}).
 
-process_algorithm(Alg) -> maps:get(Alg, algorithms()).
+process_algorithm(Alg) -> maps:get(Alg, mongoose_jwt:algorithms()).
 
 %% Either a single key ('secret' with 'algorithm'), or a list of 'keys', or both.
 process_jwt_opts(Opts = #{secret := _, algorithm := _}) -> Opts;
@@ -190,46 +195,43 @@ supported_features() -> [dynamic_domains].
 %% only the keys with that 'kid' and the keys without one are tried.
 -spec verify_token(mongooseim:host_type(), binary()) -> {ok, map()} | {error, term()}.
 verify_token(HostType, Token) ->
-    try jwerl:header(Token) of
-        Header when is_map(Header) ->
-            Keys = matching_keys(maps:get(kid, Header, undefined),
+    case mongoose_jwt:header(Token) of
+        {ok, Header} ->
+            Keys = matching_keys(maps:get(<<"kid">>, Header, undefined),
                                  persistent_term:get({?MODULE, HostType, keys})),
             verify_with_keys(Token, Keys, {error, no_matching_key});
-        _ ->
-            {error, invalid_token}
-    catch _:_ ->
-            {error, invalid_token}
+        {error, _} = Error ->
+            Error
     end.
 
--spec matching_keys(binary() | undefined, [key()]) -> [key()].
+%% A 'kid' that is not a string is malformed (RFC 7515, section 4.1.4), and matches no key
+-spec matching_keys(term(), [key()]) -> [key()].
+matching_keys(undefined, Keys) ->
+    Keys;
 matching_keys(Kid, Keys) when is_binary(Kid) ->
     [Key || Key = #{kid := KeyKid} <- Keys, KeyKid =:= Kid orelse KeyKid =:= undefined];
-matching_keys(_, Keys) ->
-    Keys.
+matching_keys(_, _Keys) ->
+    [].
 
 -spec verify_with_keys(binary(), [key()], {error, term()}) -> {ok, map()} | {error, term()}.
 verify_with_keys(_Token, [], LastError) ->
     LastError;
 verify_with_keys(Token, [#{algorithm := Alg, secret := Secret} | Keys], _LastError) ->
     Result = case secret_value(Secret) of
-                 {ok, Key} ->
-                     %% Errors are not logged, as they could contain the token
-                     try jwerl:verify(Token, Alg, Key)
-                     catch _:_ -> {error, invalid_token}
-                     end;
-                 {error, _} = SecretError ->
-                     SecretError
+                 {ok, Key} -> mongoose_jwt:verify(Token, Alg, Key);
+                 {error, _} = SecretError -> SecretError
              end,
     case Result of
-        {ok, TokenData} when is_map(TokenData) -> {ok, TokenData};
-        {error, _} = Error -> verify_with_keys(Token, Keys, Error);
-        _ -> verify_with_keys(Token, Keys, {error, invalid_token})
+        {ok, TokenData} -> {ok, TokenData};
+        {error, _} = Error -> verify_with_keys(Token, Keys, Error)
     end.
 
+%% An empty secret is treated as unset, because anyone could sign tokens with it
 -spec secret_value(secret()) -> {ok, binary()} | {error, {env_var_not_set, string()}}.
 secret_value({env, Var}) ->
     case os:getenv(Var) of
         false -> {error, {env_var_not_set, Var}};
+        "" -> {error, {env_var_not_set, Var}};
         Value -> {ok, list_to_binary(Value)}
     end;
 secret_value(Key) when is_binary(Key) ->
@@ -237,7 +239,9 @@ secret_value(Key) when is_binary(Key) ->
 
 -spec check_claims(map(), jid:luser(), jid:lserver(), map()) -> ok | {error, atom()}.
 check_claims(TokenData, LUser, LServer, Opts = #{username_key := UserKey}) ->
-    Checks = [{UserKey, {equal, LUser}, wrong_user}]
+    %% Tokens without 'exp' would never expire, so it is required
+    Checks = [{exp, is_number, missing_expiration},
+              {UserKey, {equal, LUser}, wrong_user}]
         ++ [{DomainKey, {equal, LServer}, wrong_domain}
             || DomainKey <- [maps:get(domain_key, Opts, undefined)], DomainKey =/= undefined]
         ++ [{iss, {equal, Issuer}, wrong_issuer}
@@ -254,14 +258,12 @@ check_claims(TokenData, [{Claim, Expected, Error} | Checks]) ->
         false -> {error, Error}
     end.
 
-%% jwerl decodes claim names to existing atoms only
+%% Claim names are binaries; the configured ones are atoms
 get_claim(Claim, TokenData) ->
-    case maps:find(Claim, TokenData) of
-        {ok, Value} -> Value;
-        error -> maps:get(atom_to_binary(Claim), TokenData, undefined)
-    end.
+    maps:get(atom_to_binary(Claim), TokenData, undefined).
 
 %% The 'aud' claim can be a string or a list of strings (RFC 7519)
+claim_matches(Value, is_number) -> is_number(Value);
 claim_matches(Value, {equal, Value}) -> true;
 claim_matches(Value, {contains, Value}) -> true;
 claim_matches(Values, {contains, Value}) when is_list(Values) -> lists:member(Value, Values);
@@ -274,27 +276,40 @@ read_keys(HostType) ->
     Opts = mongoose_config:get_opt([{auth, HostType}, jwt]),
     SingleKey = case Opts of
                     #{secret := Secret, algorithm := Alg} ->
-                        [#{kid => undefined, algorithm => Alg, secret => read_secret(Secret)}];
+                        [#{kid => undefined, algorithm => Alg, secret => Secret}];
                     #{} ->
                         []
                 end,
-    SingleKey ++ [#{kid => maps:get(kid, Key, undefined),
-                    algorithm => Alg,
-                    secret => read_secret(Secret)}
-                  || Key = #{algorithm := Alg, secret := Secret} <- maps:get(keys, Opts, [])].
+    [read_key(Key) || Key <- SingleKey ++ [Key#{kid => maps:get(kid, Key, undefined)}
+                                           || Key <- maps:get(keys, Opts, [])]].
 
--spec read_secret({value, binary()} | {env, string()} | {file, string()}) -> secret().
-read_secret({value, Secret}) ->
+read_key(#{kid := Kid, algorithm := Alg, secret := Secret}) ->
+    Value = read_secret(Secret, Kid),
+    check_key(Value, Alg, Kid),
+    #{kid => Kid, algorithm => Alg, secret => Value}.
+
+-spec read_secret({value, binary()} | {env, string()} | {file, string()},
+                  binary() | undefined) -> secret().
+read_secret({value, Secret}, _Kid) ->
     Secret;
-read_secret({env, Env}) ->
+read_secret({env, Env}, _Kid) ->
     {env, Env};
-read_secret({file, Path}) ->
-    {ok, Secret} = file:read_file(Path),
-    Secret.
+read_secret({file, Path}, Kid) ->
+    case file:read_file(Path) of
+        {ok, <<>>} -> error(#{what => jwt_secret_file_empty, path => Path, kid => Kid});
+        {ok, Secret} -> Secret;
+        {error, Reason} -> error(#{what => jwt_secret_file_unreadable, path => Path,
+                                   kid => Kid, reason => Reason})
+    end.
 
-%% Explicit mapping, because the atoms are owned by jwerl and might not exist yet
--spec algorithms() -> #{binary() => algorithm()}.
-algorithms() ->
-    #{<<"HS256">> => hs256, <<"RS256">> => rs256, <<"ES256">> => es256,
-      <<"HS384">> => hs384, <<"RS384">> => rs384, <<"ES384">> => es384,
-      <<"HS512">> => hs512, <<"RS512">> => rs512, <<"ES512">> => es512}.
+%% The RS and ES algorithms need a public key. Environment variables are checked when used.
+check_key({env, _}, _Alg, _Kid) ->
+    ok;
+check_key(_Secret, Alg, _Kid) when Alg =:= hs256; Alg =:= hs384; Alg =:= hs512 ->
+    ok;
+check_key(Secret, Alg, Kid) ->
+    case mongoose_jwt:is_public_key(Secret) of
+        true -> ok;
+        false -> error(#{what => jwt_public_key_required, algorithm => Alg, kid => Kid,
+                         text => <<"RS and ES algorithms need one PEM-encoded public key">>})
+    end.
