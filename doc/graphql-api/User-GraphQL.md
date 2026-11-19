@@ -10,6 +10,7 @@ The `stanza.subscribeForMessages` subscription opens an XMPP session for the use
 By default, the session has a random resource. Pass the `resource` argument to choose it, so that the session can be addressed with a known full JID.
 For example, after subscribing with `resource: "web"`, you can join a room with `muc.enterRoom(room: ..., nick: ..., resource: "web")`,
 and the room's messages are delivered to the subscription. Rooms entered this way are left automatically when the subscription ends. If the resource is already in use by another session, the subscription returns the `resource_conflict` error. A client that binds the same resource later takes over the session and ends the subscription, as do kicking the session and removing the user.
+Only messages are streamed by default. Pass `presences: true` to also receive the presences sent to the session, e.g. the presences of the room occupants after `muc.enterRoom`. The user's privacy lists and blocking list apply, and IQ requests sent to the session are answered with a `service-unavailable` error.
 
 ## Authentication
 

@@ -26,6 +26,7 @@ type StanzaUserSubscription @protected{
   A resource that is already in use is not taken over, but a client that binds the same resource
   later takes over the session, which ends the subscription. Kicking the session or removing the user
   ends it too.
+  Presences sent to the session are included when 'presences' is true.
   """
-  subscribeForMessages(resource: ResourceName): StanzaMap
+  subscribeForMessages(resource: ResourceName, presences: Boolean = false): StanzaMap
 }
