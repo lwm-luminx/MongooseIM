@@ -42,6 +42,7 @@
 
 %% ejabberd room handlers
 -export([disco_muc_features/3,
+         remove_user/3,
          filter_room_packet/3,
          forget_room/3]).
 
@@ -240,6 +241,33 @@ room_process_mam_iq(Acc, From, To, IQ, #{host_type := HostType}) ->
                            action => Action, acc => Acc, reason => Reason,
                            can_access_room => can_access_room(HostType, Acc, From, To)}),
             {Acc, return_action_not_allowed_error_iq(Reason, IQ)}
+    end.
+
+%% @doc Delete the messages that a removed user sent to rooms, when
+%% `delete_messages_of_removed_users' is enabled.
+%% The rooms can be on any host type, so every host type with the option enabled is cleaned.
+%% Buffered messages are flushed first, so that the async writer can't insert them afterwards.
+-spec remove_user(Acc, Params, Extra) -> {ok, Acc} when
+      Acc :: mongoose_acc:t(),
+      Params :: #{jid := jid:jid()},
+      Extra :: gen_hook:extra().
+remove_user(Acc, #{jid := #jid{luser = LUser, lserver = LServer}}, _Extra) ->
+    Params = #{scope => {sender, LServer, LUser}, before_id => mod_mam_utils:max_message_id()},
+    [delete_removed_user_messages(MUCHostType, LUser, LServer, Params)
+     || MUCHostType <- gen_mod:hosts_with_module(?MODULE),
+        gen_mod:get_module_opt(MUCHostType, ?MODULE, delete_messages_of_removed_users)],
+    {ok, Acc}.
+
+delete_removed_user_messages(HostType, LUser, LServer, Params) ->
+    mongoose_hooks:mam_muc_archive_sync(HostType),
+    case mongoose_hooks:mam_muc_delete_messages(HostType, Params) of
+        {ok, Count} ->
+            ?LOG_INFO(#{what => mam_muc_removed_user_messages_deleted, count => Count,
+                        muc_host_type => HostType, user => LUser, server => LServer});
+        {error, not_supported} ->
+            ?LOG_WARNING(#{what => mam_muc_removed_user_messages_not_deleted,
+                           reason => not_supported, muc_host_type => HostType,
+                           user => LUser, server => LServer})
     end.
 
 -spec forget_room(Acc, Params, Extra) -> {ok, Acc} when
@@ -679,7 +707,21 @@ hooks(HostType) ->
     [{disco_muc_features, HostType, fun ?MODULE:disco_muc_features/3, #{}, 99},
      {filter_room_packet, HostType, fun ?MODULE:filter_room_packet/3, #{}, 60},
      {forget_room, HostType, fun ?MODULE:forget_room/3, #{}, 90},
-     {get_personal_data, HostType, fun ?MODULE:get_personal_data/3, #{}, 50}].
+     {get_personal_data, HostType, fun ?MODULE:get_personal_data/3, #{}, 50}]
+    ++ remove_user_hooks(HostType).
+
+%% The first pass runs before mod_mam_pm (50), which can remove the user from the archive
+%% users table, where the backend looks up the messages' sender.
+%% The second pass runs after ejabberd_sm disconnects the user's sessions (100), and deletes
+%% the messages that the user sent to rooms in the meantime.
+remove_user_hooks(HostType) ->
+    case gen_mod:get_module_opt(HostType, ?MODULE, delete_messages_of_removed_users) of
+        true ->
+            [{Hook, HostType, fun ?MODULE:remove_user/3, #{}, Priority}
+             || Hook <- [remove_user, anonymous_purge], Priority <- [40, 110]];
+        false ->
+            []
+    end.
 
 add_iq_handlers(HostType, Opts) ->
     IQDisc = gen_mod:get_opt(iqdisc, Opts, parallel),

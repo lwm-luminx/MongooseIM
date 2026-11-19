@@ -7,7 +7,7 @@
 
 -include("../mongoose_graphql_types.hrl").
 
--import(mongoose_graphql_helper, [make_error/2]).
+-import(mongoose_graphql_helper, [make_error/2, null_to_undefined/1]).
 
 execute(_Ctx, mam, <<"deleteRoomMessages">>, #{<<"room">> := RoomJID, <<"before">> := Before}) ->
     format_result(mod_mam_api:delete_room_messages(RoomJID, Before),
@@ -16,6 +16,9 @@ execute(_Ctx, mam, <<"deleteOldRoomMessages">>,
         #{<<"mucDomain">> := MUCDomain, <<"before">> := Before}) ->
     format_result(mod_mam_api:delete_old_room_messages(MUCDomain, Before),
                   #{mucDomain => MUCDomain});
+execute(_Ctx, mam, <<"deleteUserRoomMessages">>, #{<<"user">> := UserJID, <<"before">> := Before}) ->
+    format_result(mod_mam_api:delete_user_room_messages(UserJID, null_to_undefined(Before)),
+                  #{user => jid:to_binary(UserJID)});
 execute(_Ctx, mam, <<"deleteUserMessages">>, #{<<"user">> := UserJID, <<"before">> := Before}) ->
     format_result(mod_mam_api:delete_user_messages(UserJID, Before),
                   #{user => jid:to_binary(UserJID)});
