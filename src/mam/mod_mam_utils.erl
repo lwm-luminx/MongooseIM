@@ -35,7 +35,6 @@
          get_origin_id/1,
          is_groupchat/1,
          should_page_be_flipped/1,
-         tombstone/2,
          tombstone/3,
          wrap_message/6,
          wrap_message/7,
