@@ -237,9 +237,15 @@ admin_subscribe_for_messages_with_presences_story(Config, Alice, Bob) ->
 admin_subscription_skips_blocked_sender(Config) ->
     HostType = domain_helper:host_type(),
     BlockingOpts = config_parser_helper:mod_config_with_auto_backend(mod_blocking),
+    WasLoaded = rpc(gen_mod, is_loaded, [HostType, mod_blocking]),
     dynamic_modules:ensure_modules(HostType, [{mod_blocking, BlockingOpts}]),
-    escalus:fresh_story_with_config(Config, [{alice, 1}, {bob, 1}, {kate, 1}],
-                                    fun admin_subscription_skips_blocked_sender_story/4).
+    try
+        escalus:fresh_story_with_config(Config, [{alice, 1}, {bob, 1}, {kate, 1}],
+                                        fun admin_subscription_skips_blocked_sender_story/4)
+    after
+        %% Leave the other cases with the modules they started with
+        WasLoaded orelse dynamic_modules:ensure_stopped(HostType, [mod_blocking])
+    end.
 
 admin_subscription_skips_blocked_sender_story(Config, Alice, Bob, Kate) ->
     AliceJid = escalus_utils:jid_to_lower(escalus_client:short_jid(Alice)),
@@ -334,9 +340,17 @@ admin_subscription_leaves_rooms_on_close_story(Config, Alice, Bob) ->
     rpc(mod_muc_api, enter_room, [jid:replace_resource(RoomJID, <<"bobek">>), SessionJid, undefined]),
     wait_helper:wait_until(fun() -> is_room_occupant(RoomJID, SessionJid) end, true,
                            #{name => sse_user_entered_room}),
+    %% The session has to know about the room before the stream ends
+    wait_helper:wait_until(fun() -> session_rooms(SessionJid) end, [RoomJID],
+                           #{name => sse_session_tracks_room}),
     sse_helper:stop_sse(Stream),
     wait_helper:wait_until(fun() -> is_room_occupant(RoomJID, SessionJid) end, false,
                            #{name => sse_user_left_room}).
+
+session_rooms(SessionJid) ->
+    Pid = rpc(ejabberd_sm, get_session_pid, [SessionJid]),
+    {dictionary, Dict} = rpc(erlang, process_info, [Pid, dictionary]),
+    maps:keys(proplists:get_value({mongoose_stanza_api, rooms}, Dict, #{})).
 
 is_room_occupant(RoomJID, UserJid) ->
     {ok, Users} = rpc(mod_muc_api, get_room_users, [RoomJID]),
