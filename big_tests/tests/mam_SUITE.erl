@@ -2547,6 +2547,8 @@ moderate_muc_message(Config) ->
         Subject = lists:last(KateStanzas),
         ?assertNotEqual(undefined, exml_query:subelement(Subject, <<"subject">>)),
         escalus_assert:has_no_stanzas(Kate),
+        %% Alice and Bob see Kate join
+        [escalus:assert(is_presence, escalus:wait_for_stanza(C)) || C <- [Alice, Bob]],
 
         %% ... and the room archive has a tombstone in place of the message,
         %% followed by the moderation message, for clients catching up later
