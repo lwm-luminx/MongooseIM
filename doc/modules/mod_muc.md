@@ -213,6 +213,7 @@ The ID stays the same for a user (identified by the real bare JID) in a room, al
 It is derived from the real JID with a random salt stored with the room, so other occupants can't learn the real JID from it.
 It lets clients tell whether two messages come from the same person, e.g. for message corrections and retractions.
 Both the rooms and the MUC service advertise the `urn:xmpp:occupant-id:0` feature.
+When this option is disabled, `occupant-id` elements sent by clients are still removed, so that they cannot be forged.
 
 ### `modules.mod_muc.hats`
   * **Syntax:** boolean

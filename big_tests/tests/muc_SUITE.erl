@@ -116,6 +116,7 @@ all() -> [
           {group, http_auth_no_server},
           {group, http_auth},
           {group, occupant_id},
+          {group, occupant_id_disabled},
           {group, hibernation},
           {group, room_registration_race_condition},
           {group, register},
@@ -128,7 +129,10 @@ groups() ->
          {occupant_id, [parallel], [occupant_id_is_advertised,
                                     occupant_id_in_presences_and_messages,
                                     occupant_id_is_stable_and_unique,
-                                    occupant_id_from_client_is_replaced]},
+                                    occupant_id_from_client_is_replaced,
+                                    occupant_id_kept_on_nick_change,
+                                    occupant_id_survives_room_restart]},
+         {occupant_id_disabled, [parallel], [occupant_id_from_client_is_removed_when_disabled]},
          {hibernation, [parallel], [room_is_hibernated,
                                     room_with_participants_is_hibernated,
                                     hibernation_metrics_are_updated,
@@ -440,6 +444,10 @@ init_per_group(occupant_id, Config) ->
     ConfigWithModules = dynamic_modules:save_modules(host_type(), Config),
     muc_helper:load_muc(host_type(), #{occupant_id => true}),
     ConfigWithModules;
+init_per_group(occupant_id_disabled, Config) ->
+    ConfigWithModules = dynamic_modules:save_modules(host_type(), Config),
+    muc_helper:load_muc(host_type(), #{occupant_id => false}),
+    ConfigWithModules;
 init_per_group(hibernation, Config) ->
     Config1 = dynamic_modules:save_modules(host_type(), Config),
     setup_mam(mam_helper:backend()),
@@ -496,7 +504,7 @@ end_per_group(G, Config) when G =:= http_auth_no_server;
     end,
     ejabberd_node_utils:call_fun(mongoose_wpool, stop, [http, global, muc_http_auth_test]),
     dynamic_modules:restore_modules(Config);
-end_per_group(occupant_id, Config) ->
+end_per_group(G, Config) when G =:= occupant_id; G =:= occupant_id_disabled ->
     dynamic_modules:restore_modules(Config);
 end_per_group(hibernation, Config) ->
     dynamic_modules:restore_modules(Config);
@@ -807,6 +815,56 @@ occupant_id_from_client_is_replaced(ConfigIn) ->
         ?assertEqual([BobId], [exml_query:attr(El, <<"id">>)
                                || El <- exml_query:subelements_with_ns(Received, ?NS_OCCUPANT_ID)])
     end).
+
+%% XEP-0421, section 6: the IDs can't be forged, even in rooms without them
+occupant_id_from_client_is_removed_when_disabled(ConfigIn) ->
+    story_with_room(ConfigIn, [], [{alice, 1}, {bob, 1}], fun(Config, Alice, Bob) ->
+        Room = ?config(room, Config),
+        escalus:send(Alice, stanza_muc_enter_room(Room, <<"alice">>)),
+        escalus:wait_for_stanzas(Alice, 2),
+        Forged = #xmlel{name = <<"occupant-id">>,
+                        attrs = #{<<"xmlns">> => ?NS_OCCUPANT_ID, <<"id">> => <<"forged">>}},
+        Join = #xmlel{children = JoinChildren} = stanza_muc_enter_room(Room, <<"bob">>),
+        escalus:send(Bob, Join#xmlel{children = JoinChildren ++ [Forged]}),
+        ?assertEqual([], exml_query:subelements_with_ns(escalus:wait_for_stanza(Alice),
+                                                        ?NS_OCCUPANT_ID)),
+        escalus:wait_for_stanzas(Bob, 3),
+        Msg = #xmlel{children = Children} =
+            escalus_stanza:groupchat_to(room_address(Room), <<"I am someone else">>),
+        escalus:send(Bob, Msg#xmlel{children = Children ++ [Forged]}),
+        ?assertEqual([], exml_query:subelements_with_ns(escalus:wait_for_stanza(Alice),
+                                                        ?NS_OCCUPANT_ID))
+    end).
+
+occupant_id_kept_on_nick_change(ConfigIn) ->
+    story_with_room(ConfigIn, [], [{alice, 1}, {bob, 1}], fun(Config, Alice, Bob) ->
+        Room = ?config(room, Config),
+        escalus:send(Alice, stanza_muc_enter_room(Room, <<"alice">>)),
+        escalus:wait_for_stanzas(Alice, 2),
+        escalus:send(Bob, stanza_muc_enter_room(Room, <<"bob">>)),
+        BobId = occupant_id(escalus:wait_for_stanza(Alice)),
+        escalus:wait_for_stanzas(Bob, 3),
+        escalus:send(Bob, stanza_muc_enter_room(Room, <<"robert">>)),
+        %% Alice gets the unavailable presence of the old nick and the presence of the new one
+        [Unavailable, Available] = escalus:wait_for_stanzas(Alice, 2),
+        ?assertEqual(BobId, occupant_id(Unavailable)),
+        ?assertEqual(BobId, occupant_id(Available)),
+        escalus:wait_for_stanzas(Bob, 2)
+    end).
+
+%% The salt is stored with the room, so the IDs survive a restart of the room process
+occupant_id_survives_room_restart(Config) ->
+    RoomName = fresh_room_name(),
+    escalus:fresh_story(Config, [{alice, 1}], fun(Alice) ->
+        given_fresh_room_for_user(Alice, RoomName, [{persistentroom, true}]),
+        IdBefore = occupant_id(leave_room(RoomName, Alice)),
+        stop_room(RoomName),
+        escalus:send(Alice, stanza_join_room(RoomName, <<"alice">>)),
+        [SelfPresence | _] = escalus:wait_for_stanzas(Alice, 2),
+        ?assertEqual(IdBefore, occupant_id(SelfPresence))
+    end),
+    destroy_room(muc_host(), RoomName),
+    forget_room(host_type(), muc_host(), RoomName).
 
 occupant_id(Stanza) ->
     Id = exml_query:path(Stanza, [{element_with_ns, <<"occupant-id">>, ?NS_OCCUPANT_ID},
