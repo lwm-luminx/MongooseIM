@@ -1025,6 +1025,9 @@ fresh_users(C) when C =:= offline_message;
                     C =:= archive_chat_markers;
                     C =:= dont_archive_chat_markers ->
     [{alice, 1}, {bob, 1}];
+fresh_users(moderate_muc_message) ->
+    %% Kate joins after the moderation to check the room history
+    [{alice, 1}, {bob, 1}, {kate, 1}];
 fresh_users(C) ->
     case lists:member(C, all_cases_with_room()) of
         true -> [{alice, 1}, {bob, 1}];
