@@ -23,7 +23,8 @@ all() ->
 
 groups() ->
     [{admin_stanza_http, [], [{group, admin_mam},
-                              {group, admin_no_mam_http}]},
+                              {group, admin_no_mam_http},
+                              {group, admin_sse_modules}]},
      {admin_stanza_cli, [], [{group, admin_mam},
                              {group, admin_no_mam_cli}]},
      {domain_admin_stanza, [], [{group, admin_mam}, % same as for admin
@@ -32,6 +33,8 @@ groups() ->
                         {group, user_no_mam}]},
      {admin_mam, [parallel], admin_mam_cases()},
      {admin_no_mam_http, [parallel], admin_stanza_cases(http) ++ admin_no_mam_cases()},
+     %% Not parallel: these cases load and unload modules, which races with other cases
+     {admin_sse_modules, [], admin_sse_module_cases()},
      {admin_no_mam_cli, [], admin_stanza_cases(cli) ++ admin_no_mam_cases()},
      {domain_admin_no_mam, [parallel], domain_admin_stanza_cases() ++ admin_no_mam_cases()},
      {user_mam, [parallel], user_mam_cases()},
@@ -56,12 +59,14 @@ admin_sse_cases() ->
      admin_subscribe_for_messages_with_resource,
      admin_subscribe_for_messages_with_resource_in_use,
      admin_subscribe_for_messages_with_presences,
-     admin_subscription_skips_blocked_sender,
      admin_subscription_rejects_iq,
      admin_subscribe_for_messages_to_unknown_user,
      admin_subscription_closed_on_kick,
      admin_subscription_closed_on_user_removal,
-     admin_subscription_replaced_by_client_session,
+     admin_subscription_replaced_by_client_session].
+
+admin_sse_module_cases() ->
+    [admin_subscription_skips_blocked_sender,
      admin_subscription_leaves_rooms_on_close].
 
 admin_mam_cases() ->
@@ -129,6 +134,7 @@ init_per_group(GN, Config) when GN =:= admin_mam;
                                 GN =:= user_mam ->
     init_mam(Config);
 init_per_group(GN, Config) when GN =:= admin_no_mam_http;
+                                GN =:= admin_sse_modules;
                                 GN =:= admin_no_mam_cli;
                                 GN =:= domain_admin_no_mam;
                                 GN =:= user_no_mam ->
