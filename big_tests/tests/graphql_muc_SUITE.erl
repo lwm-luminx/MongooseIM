@@ -823,7 +823,7 @@ admin_try_set_room_hat_hats_disabled_story(Config, Alice) ->
     ?assertNotEqual(nomatch, binary:match(get_err_msg(Res2), <<"not enabled">>)).
 
 admin_set_room_hat_muc_not_configured(Config) ->
-    RoomJID = jid:from_binary(?NONEXISTENT_ROOM2),
+    RoomJID = jid:from_binary(get_room_name()),
     get_not_loaded(set_room_hat(RoomJID, ?HOST_HAT, <<"Host">>, null, Config)),
     get_not_loaded(list_room_hats(RoomJID, Config)).
 
