@@ -2380,9 +2380,6 @@ list_room_hats(Room, Config) ->
     Vars = #{room => jid:to_binary(Room)},
     execute_command(<<"muc">>, <<"listRoomHats">>, Vars, Config).
 
-assert_success(Path, Res) ->
-    ?assertNotEqual(nomatch, binary:match(get_ok_value(Path, Res), <<"successfully">>)).
-
 %% Enters the room with each client in turn, and drops the presences and subject they receive
 enter_room_and_flush(RoomJID, ClientsAndNicks) ->
     [enter_room(RoomJID, Client, Nick) || {Client, Nick} <- ClientsAndNicks],
