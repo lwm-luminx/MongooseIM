@@ -377,6 +377,7 @@ retract_cases() ->
      ignore_bad_retraction,
      retract_message_v1,
      retract_message_v1_on_origin_id,
+     retract_message_v1_reusing_id,
      retract_wrong_message_v1].
 
 disabled_retract_cases() ->
@@ -934,6 +935,7 @@ maybe_skip(C, Config) when C =:= retract_message;
                            C =:= moderate_muc_message_without_retract_element;
                            C =:= retract_message_v1;
                            C =:= retract_message_v1_on_origin_id;
+                           C =:= retract_message_v1_reusing_id;
                            C =:= retract_wrong_message_v1;
                            C =:= retract_muc_message_v1;
                            C =:= retract_muc_message_v1_on_origin_id;
@@ -2377,7 +2379,15 @@ retract_message_v1_on_origin_id(Config) ->
 retract_wrong_message_v1(Config) ->
     test_retract_message_v1(Config, <<"wrong-id">>, fun(Msg) -> Msg end).
 
+%% A retraction that reuses the ID of the message it retracts still finds that message
+retract_message_v1_reusing_id(Config) ->
+    test_retract_message_v1(Config, message_id, fun(Msg) -> Msg end,
+                            fun(RetractMsg, MsgId) -> escalus_stanza:set_id(RetractMsg, MsgId) end).
+
 test_retract_message_v1(Config, RetractOn, PrepareMsg) ->
+    test_retract_message_v1(Config, RetractOn, PrepareMsg, fun(RetractMsg, _MsgId) -> RetractMsg end).
+
+test_retract_message_v1(Config, RetractOn, PrepareMsg, PrepareRetractMsg) ->
     P = ?config(props, Config),
     F = fun(Alice, Bob) ->
         %% GIVEN Alice sends a message to Bob
@@ -2393,7 +2403,8 @@ test_retract_message_v1(Config, RetractOn, PrepareMsg) ->
                         message_id -> MsgId;
                         WrongId -> WrongId
                     end,
-        RetractMsg = retraction_message_v1(<<"chat">>, escalus_utils:get_jid(Bob), RetractId),
+        RetractMsg = PrepareRetractMsg(
+                       retraction_message_v1(<<"chat">>, escalus_utils:get_jid(Bob), RetractId), MsgId),
         escalus:send(Alice, RetractMsg),
 
         %% THEN Bob receives the retraction ...
@@ -2686,7 +2697,7 @@ moderate_muc_message_without_retract_element(Config) ->
 retract_muc_message_v1(Config) ->
     test_retract_muc_message_v1(Config, stanza_id).
 
-%% When the room didn't assign a stanza ID, the client uses the origin ID
+%% Group chat messages are retracted only by their stanza ID, so an origin ID does nothing
 retract_muc_message_v1_on_origin_id(Config) ->
     test_retract_muc_message_v1(Config, origin_id).
 
@@ -2726,8 +2737,8 @@ test_retract_muc_message_v1(Config, RetractOn) ->
 
         %% ... and finds both messages in the room archive
         escalus:send(Bob, stanza_to_room(stanza_archive_request(P, <<"q1">>), Room)),
-        check_archive_after_retraction_v1(message_retraction_is_enabled(Config),
-                                          Bob, RetractMsg, Body)
+        ShouldRetract = message_retraction_is_enabled(Config) andalso RetractOn =:= stanza_id,
+        check_archive_after_retraction_v1(ShouldRetract, Bob, RetractMsg, Body)
     end,
     escalus:story(Config, [{alice, 1}, {bob, 1}], F).
 
