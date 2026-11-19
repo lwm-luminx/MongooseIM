@@ -56,6 +56,8 @@ admin_sse_cases() ->
      admin_subscribe_for_messages_with_resource,
      admin_subscribe_for_messages_with_resource_in_use,
      admin_subscribe_for_messages_with_presences,
+     admin_subscription_skips_blocked_sender,
+     admin_subscription_rejects_iq,
      admin_subscribe_for_messages_to_unknown_user,
      admin_subscription_closed_on_kick,
      admin_subscription_closed_on_user_removal,
@@ -230,6 +232,51 @@ admin_subscribe_for_messages_with_presences_story(Config, Alice, Bob) ->
     Vars = #{caller => To, resource => <<"sse-res">>, presences => true},
     {200, Stream} = execute_command_sse(<<"stanza">>, <<"subscribeForMessages">>, Vars, Config),
     assert_presence_and_message_are_streamed(Alice, To, <<"sse-res">>, Stream).
+
+%% The recipient's privacy lists apply to the subscription's session too (XEP-0191)
+admin_subscription_skips_blocked_sender(Config) ->
+    HostType = domain_helper:host_type(),
+    BlockingOpts = config_parser_helper:mod_config_with_auto_backend(mod_blocking),
+    dynamic_modules:ensure_modules(HostType, [{mod_blocking, BlockingOpts}]),
+    escalus:fresh_story_with_config(Config, [{alice, 1}, {bob, 1}, {kate, 1}],
+                                    fun admin_subscription_skips_blocked_sender_story/4).
+
+admin_subscription_skips_blocked_sender_story(Config, Alice, Bob, Kate) ->
+    AliceJid = escalus_utils:jid_to_lower(escalus_client:short_jid(Alice)),
+    escalus_client:send(Bob, mod_blocking_SUITE:block_users_stanza([AliceJid])),
+    escalus:assert_many([is_iq_result, fun(_) -> true end], escalus:wait_for_stanzas(Bob, 2)),
+    BobJid = escalus_client:short_jid(Bob),
+    {200, Stream} = subscribe_for_messages(BobJid, <<"sse-res">>, Config),
+    SessionJid = <<BobJid/binary, "/sse-res">>,
+    wait_helper:wait_until(fun() -> rpc(ejabberd_sm, get_session_pid, [jid:from_binary(SessionJid)])
+                                        =/= none end,
+                           true, #{name => sse_session_opened}),
+    escalus:send(Alice, escalus_stanza:chat_to(SessionJid, <<"Blocked">>)),
+    escalus:send(Kate, escalus_stanza:chat_to(SessionJid, <<"Allowed">>)),
+    Event = sse_helper:wait_for_event(Stream),
+    #{<<"stanza">> := StanzaBin} =
+        graphql_helper:get_value([data, stanza, subscribeForMessages], Event),
+    {ok, Stanza} = exml:parse(StanzaBin),
+    escalus:assert(is_chat_message, [<<"Allowed">>], Stanza),
+    sse_helper:stop_sse(Stream).
+
+%% The session can't answer requests, so they get an error
+admin_subscription_rejects_iq(Config) ->
+    escalus:fresh_story_with_config(Config, [{alice, 1}, {bob, 1}],
+                                    fun admin_subscription_rejects_iq_story/3).
+
+admin_subscription_rejects_iq_story(Config, Alice, Bob) ->
+    BobJid = escalus_client:short_jid(Bob),
+    {200, Stream} = subscribe_for_messages(BobJid, <<"sse-res">>, Config),
+    SessionJid = <<BobJid/binary, "/sse-res">>,
+    wait_helper:wait_until(fun() -> rpc(ejabberd_sm, get_session_pid, [jid:from_binary(SessionJid)])
+                                        =/= none end,
+                           true, #{name => sse_session_opened}),
+    escalus:send(Alice, escalus_stanza:to(escalus_stanza:iq_get(<<"jabber:iq:version">>, []),
+                                          SessionJid)),
+    escalus:assert(is_error, [<<"cancel">>, <<"service-unavailable">>],
+                   escalus:wait_for_stanza(Alice)),
+    sse_helper:stop_sse(Stream).
 
 %% Ending the session closes the stream, and no more messages are delivered over it
 admin_subscription_closed_on_kick(Config) ->

@@ -32,17 +32,46 @@ handle_event(Event) ->
 -spec handle_event(term(), #{presences := boolean()}) ->
           {ok, map() | null} | {ok, null, [{stream, close}]}.
 handle_event({route, Acc}, #{presences := Presences}) ->
-    {From, _To, Packet} = mongoose_acc:packet(Acc),
+    {From, To, Packet} = mongoose_acc:packet(Acc),
     case Packet of
-        Stanza = #xmlel{name = <<"message">>} ->
-            route_result(From, Stanza);
-        Stanza = #xmlel{name = <<"presence">>} when Presences ->
-            route_result(From, Stanza);
+        #xmlel{name = <<"iq">>} ->
+            reply_to_iq(From, To, Packet),
+            {ok, null};
+        #xmlel{name = Name} = Stanza when Name =:= <<"message">>;
+                                          Name =:= <<"presence">> andalso Presences ->
+            %% ejabberd_sm leaves the recipient's privacy checks to the session,
+            %% so that blocked senders (XEP-0016, XEP-0191) are not delivered
+            case is_allowed_by_privacy(Acc, From, To) of
+                true -> route_result(From, Stanza);
+                false -> {ok, null}
+            end;
         _ ->
             {ok, null} % Skip other stanza types
     end;
 handle_event(Event, _Opts) ->
     handle_other_event(Event).
+
+%% A session can't answer requests, so they get an error instead of no response (RFC 6120, 8.2.3)
+reply_to_iq(From, To, Packet) ->
+    case exml_query:attr(Packet, <<"type">>) of
+        Type when Type =:= <<"get">>; Type =:= <<"set">> ->
+            Err = jlib:make_error_reply(Packet, mongoose_xmpp_errors:service_unavailable()),
+            mongoose_router:route(mongoose_acc:new(To, From, Err, ?LOCATION)),
+            ok;
+        _ ->
+            ok
+    end.
+
+is_allowed_by_privacy(Acc, From, To = #jid{lserver = LServer}) ->
+    case mongoose_domain_api:get_domain_host_type(LServer) of
+        {ok, HostType} ->
+            PrivacyList = mongoose_hooks:privacy_get_user_list(HostType, To),
+            {Decision, _} = mongoose_privacy:privacy_check_packet(Acc, To, PrivacyList,
+                                                                  From, To, in),
+            Decision =:= allow;
+        {error, not_found} ->
+            false
+    end.
 
 route_result(From, Stanza) ->
     StanzaID = exml_query:attr(Stanza, <<"id">>, <<>>),
