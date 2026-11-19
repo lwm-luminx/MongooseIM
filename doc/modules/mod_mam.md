@@ -82,7 +82,7 @@ The [GraphQL admin API](../graphql-api/Admin-GraphQL.md) can delete messages arc
 * `mam.deleteOldRoomMessages(mucDomain, before)` from the archives of all rooms of a MUC service,
 * `mam.deleteUserMessages(user, before)` from the one-to-one archive of one user,
 * `mam.deleteOldMessages(domain, before)` from the one-to-one archives of all users of a domain.
-* `mam.deleteUserRoomMessages(user, before)` deletes the messages sent by one user from the archives of all MUC rooms of the user's host type. When `before` is omitted, all of them are deleted.
+* `mam.deleteUserRoomMessages(user, before)` deletes the messages sent by one user from the archives of all MUC rooms, on every host type with MUC archiving. The user can also be from a remote (federated) domain. When `before` is omitted, all of them are deleted.
 
 Each command returns the number of deleted messages.
 The same commands are available in `mongooseimctl` as `mam deleteRoomMessages` and so on.
@@ -232,6 +232,10 @@ The MUC host that will be archived if MUC archiving is enabled.
 When enabled, removing a user account (or purging an anonymous user) also deletes the messages that the user sent to MUC rooms from the room archives.
 By default these messages stay in the room archives after the account is removed.
 Only the `rdbms` backend supports this option.
+The messages are deleted from the room archives of every host type that has this option enabled,
+and the option has to be enabled for the user's own host type too, because that is where account removal is handled.
+Buffered messages are flushed from the async writer first. The deletion runs once before the user's sessions are closed,
+and once more after, for any message the user sent to a room in between.
 
 #### Example
 

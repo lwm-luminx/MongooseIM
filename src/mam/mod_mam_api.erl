@@ -46,19 +46,26 @@ delete_old_room_messages(MUCDomain, Before) ->
 
 %% @doc Delete messages that a user sent to rooms, archived before `Before',
 %% or at any time when `Before' is `undefined'.
+%% Rooms can be on any host type, and the user can be from a remote (federated) domain,
+%% so the messages are deleted from the room archives of every host type with MUC MAM.
 -spec delete_user_room_messages(jid:jid(), mod_mam:unix_timestamp() | undefined) ->
           delete_result().
 delete_user_room_messages(#jid{luser = LUser, lserver = LServer}, Before) ->
-    case mongoose_domain_api:get_domain_host_type(LServer) of
-        {ok, HostType} ->
-            BeforeID = case Before of
-                           undefined -> mod_mam_utils:max_message_id();
-                           _ -> before_id(Before)
-                       end,
-            Params = #{scope => {sender, LServer, LUser}, before_id => BeforeID},
-            format_result(mongoose_hooks:mam_muc_delete_messages(HostType, Params));
-        {error, not_found} ->
-            ?DOMAIN_NOT_FOUND_RESULT
+    BeforeID = case Before of
+                   undefined -> mod_mam_utils:max_message_id();
+                   _ -> before_id(Before)
+               end,
+    case BeforeID of
+        none ->
+            {ok, 0};
+        _ ->
+            Scope = {sender, LServer, LUser},
+            Results = [delete_muc_by_id(HostType, Scope, BeforeID)
+                       || HostType <- gen_mod:hosts_with_module(mod_mam_muc)],
+            case [Count || {ok, Count} <- Results] of
+                [] -> ?NOT_SUPPORTED_RESULT;
+                Counts -> {ok, lists:sum(Counts)}
+            end
     end.
 
 %% @doc Delete messages archived before `Before' from the one-to-one archive of a user.
@@ -106,10 +113,15 @@ delete_muc(HostType, Scope, Before) ->
         none ->
             {ok, 0};
         BeforeID ->
-            mongoose_hooks:mam_muc_archive_sync(HostType),
-            Params = #{scope => Scope, before_id => BeforeID},
-            format_result(mongoose_hooks:mam_muc_delete_messages(HostType, Params))
+            delete_muc_by_id(HostType, Scope, BeforeID)
     end.
+
+-spec delete_muc_by_id(mongooseim:host_type(), mod_mam:delete_messages_scope(),
+                       mod_mam:message_id()) -> delete_result().
+delete_muc_by_id(HostType, Scope, BeforeID) ->
+    mongoose_hooks:mam_muc_archive_sync(HostType),
+    Params = #{scope => Scope, before_id => BeforeID},
+    format_result(mongoose_hooks:mam_muc_delete_messages(HostType, Params)).
 
 %% Message IDs are timestamps in microseconds shifted left by 8 bits, with the node number
 %% in the lowest byte. The lowest ID for the given microsecond has node number 0,

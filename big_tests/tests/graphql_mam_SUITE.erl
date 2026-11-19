@@ -80,7 +80,9 @@ domain_admin_mam_tests() ->
      domain_admin_delete_old_messages_no_permission].
 
 removed_users_tests() ->
-    [removed_user_room_messages_are_deleted].
+    [removed_user_room_messages_are_deleted,
+     removed_user_buffered_room_messages_are_deleted,
+     purged_anonymous_user_room_messages_are_deleted].
 
 mam_not_configured_tests() ->
     [delete_room_messages_mam_not_configured,
@@ -122,7 +124,8 @@ init_per_group(removed_users, Config) ->
                 #{pm => #{},
                   muc => #{host => subhost_pattern(muc_helper:muc_host_pattern()),
                            delete_messages_of_removed_users => true},
-                  async_writer => #{enabled => false}}),
+                  %% Long enough that messages are still buffered when the user is removed
+                  async_writer => #{flush_interval => 5000}}),
     dynamic_modules:ensure_modules(host_type(), [{mod_mam, MAMOpts}]),
     Config;
 init_per_group(GroupName, Config) when GroupName =:= admin_mam_not_configured;
@@ -212,6 +215,38 @@ removed_user_room_messages_are_deleted_story(_Config, Alice, Bob) ->
     {ok, _} = rpc_apply(mongoose_account_api, unregister_user,
                         [escalus_client:username(Alice), escalus_client:server(Alice)]),
     %% Only Bob's messages are left
+    ?assertEqual(3, room_archive_size(Room)).
+
+%% A message still in the async writer's buffer is flushed and deleted too,
+%% instead of being inserted after the user is removed
+removed_user_buffered_room_messages_are_deleted(Config) ->
+    escalus:fresh_story_with_config(Config, [{alice, 1}, {bob, 1}],
+                                    fun removed_user_buffered_room_messages_are_deleted_story/3).
+
+removed_user_buffered_room_messages_are_deleted_story(_Config, Alice, Bob) ->
+    Room = fresh_room_name(),
+    put_client_room_msgs(Room, Bob),
+    put_client_room_msg_no_wait(Room, Alice),
+    {ok, _} = rpc_apply(mongoose_account_api, unregister_user,
+                        [escalus_client:username(Alice), escalus_client:server(Alice)]),
+    timer:sleep(6000),
+    ?assertEqual(3, room_archive_size(Room)).
+
+%% Anonymous users are purged with the anonymous_purge hook instead of remove_user
+purged_anonymous_user_room_messages_are_deleted(Config) ->
+    escalus:fresh_story_with_config(Config, [{alice, 1}, {bob, 1}],
+                                    fun purged_anonymous_user_room_messages_are_deleted_story/3).
+
+purged_anonymous_user_room_messages_are_deleted_story(_Config, Alice, Bob) ->
+    Room = fresh_room_name(),
+    put_client_room_msgs(Room, Alice),
+    put_client_room_msgs(Room, Bob),
+    LServer = escalus_utils:jid_to_lower(escalus_client:server(Alice)),
+    LUser = escalus_utils:jid_to_lower(escalus_client:username(Alice)),
+    Location = #{mfa => {?MODULE, ?FUNCTION_NAME, ?FUNCTION_ARITY}, line => ?LINE, file => ?FILE},
+    Acc = rpc_apply(mongoose_acc, new,
+                    [#{location => Location, lserver => LServer, host_type => host_type()}]),
+    rpc_apply(mongoose_hooks, anonymous_purge, [LServer, Acc, LUser]),
     ?assertEqual(3, room_archive_size(Room)).
 
 delete_user_messages(Config) ->
@@ -375,6 +410,24 @@ put_room_msgs(Room, SenderJID, Nick) ->
                        packet => escalus_stanza:groupchat_to(room_jid(Room), <<"Hi">>)}])
      || DateTime <- ?DATES],
     mam_helper:wait_for_room_archive_size(MUCHost, Room, Before + 3).
+
+%% Archive one room message from the client, without waiting for the async writer
+put_client_room_msg_no_wait(Room, Client) ->
+    MUCHost = muc_helper:muc_host(),
+    SenderJID = mongoose_helper:make_jid(escalus_client:username(Client),
+                                         escalus_client:server(Client),
+                                         escalus_client:resource(Client)),
+    ok = rpc_apply(mod_mam_muc, archive_message_for_ct,
+                   [#{message_id => rpc_apply(mod_mam_utils, generate_message_id,
+                                              [erlang:system_time(microsecond)]),
+                      archive_id => rpc_apply(mod_mam_muc, archive_id, [MUCHost, Room]),
+                      local_jid => mongoose_helper:make_jid(Room, MUCHost, <<>>),
+                      remote_jid => SenderJID,
+                      source_jid => mongoose_helper:make_jid(Room, MUCHost,
+                                                             escalus_client:username(Client)),
+                      origin_id => none,
+                      direction => incoming,
+                      packet => escalus_stanza:groupchat_to(room_jid(Room), <<"Hi">>)}]).
 
 room_archive_size(Room) ->
     rpc_apply(mod_mam_muc, archive_size, [muc_helper:muc_host(), Room]).
