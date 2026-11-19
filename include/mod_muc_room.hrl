@@ -92,7 +92,7 @@
                 occupant_id_salt :: binary() | undefined,
                 %% Hats (XEP-0317) defined in the room, and the hats worn by each bare JID
                 hats = [] :: [mod_muc_room:hat()],
-                hat_assignments = #{} :: #{jid:simple_bare_jid() => [mod_muc_room:hat_uri()]},
+                hat_assignments = #{} :: #{jid:simple_jid() => [mod_muc_room:hat_uri()]},
                 hibernate_timeout = 90000 :: timeout()
                }).
 

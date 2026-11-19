@@ -357,7 +357,7 @@ remove_hat(RoomJID, Uri) ->
 
 %% @doc Gives a hat defined in the room to the user (bare JID).
 -spec assign_hat(jid:jid(), jid:jid(), hat_uri()) ->
-    ok | {error, not_found | hat_not_found | hats_disabled}.
+    ok | {error, not_found | hat_not_found | hats_disabled | not_affiliated}.
 assign_hat(RoomJID, UserJID, Uri) ->
     sync_hats_event(RoomJID, {assign_hat, jid:to_lower(jid:to_bare(UserJID)), Uri}).
 
@@ -2919,7 +2919,7 @@ handle_hats_event({unassign_hat, LJID, Uri}, StateData = #state{hat_assignments 
     end.
 
 %% Stores the room, and broadcasts the presences of the occupants whose hats changed
--spec hats_changed([jid:simple_bare_jid()], state()) -> {ok, state()}.
+-spec hats_changed([jid:simple_jid()], state()) -> {ok, state()}.
 hats_changed(LJIDs, StateData) ->
     store_room_if_persistent(StateData),
     maps_foreach(fun(_LJID, #user{jid = JID}) ->
@@ -2930,7 +2930,7 @@ hats_changed(LJIDs, StateData) ->
                  end, StateData#state.users),
     {ok, StateData}.
 
--spec has_affiliation(jid:simple_bare_jid(), state()) -> boolean().
+-spec has_affiliation(jid:simple_jid(), state()) -> boolean().
 has_affiliation(LJID, #state{affiliations = Affiliations}) ->
     lookup_affiliation([LJID], Affiliations) =/= none.
 
@@ -2940,7 +2940,7 @@ prune_hat_assignments(StateData = #state{hat_assignments = Assignments}) ->
     StateData#state{hat_assignments = maps:filter(fun(LJID, _) -> has_affiliation(LJID, StateData) end,
                                                   Assignments)}.
 
--spec wearers([hat_uri()], state()) -> [jid:simple_bare_jid()].
+-spec wearers([hat_uri()], state()) -> [jid:simple_jid()].
 wearers(Uris, #state{hat_assignments = Assignments}) ->
     [LJID || {LJID, WornUris} <- maps:to_list(Assignments),
              lists:any(fun(Uri) -> lists:member(Uri, WornUris) end, Uris)].
