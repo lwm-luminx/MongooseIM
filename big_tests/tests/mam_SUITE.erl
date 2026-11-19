@@ -2624,6 +2624,8 @@ moderate_muc_message(Config) ->
         escalus_assert:has_no_stanzas(Kate),
         %% Alice and Bob see Kate join
         [escalus:assert(is_presence, escalus:wait_for_stanza(C)) || C <- [Alice, Bob]],
+        %% The moderation message goes through the async writer too
+        maybe_wait_for_archive(Config),
 
         %% ... and the room archive has a tombstone in place of the message,
         %% followed by the moderation message, for clients catching up later
