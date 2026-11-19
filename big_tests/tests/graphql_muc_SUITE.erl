@@ -770,10 +770,12 @@ admin_room_hats_kept_on_nick_change_story(Config, Alice, Bob) ->
                                          attrs = #{<<"uri">> => <<"urn:fake">>,
                                                    <<"title">> => <<"Owner">>}}]},
     %% Bob joins with forged hats, then changes his nick
-    escalus:send(Bob, escalus_stanza:to(escalus_stanza:presence(<<"available">>, [FakeHats]),
+    MucX = #xmlel{name = <<"x">>, attrs = #{<<"xmlns">> => <<"http://jabber.org/protocol/muc">>}},
+    escalus:send(Bob, escalus_stanza:to(escalus_stanza:presence(<<"available">>, [MucX, FakeHats]),
                                         jid:to_binary(jid:replace_resource(RoomJID, <<"bobek">>)))),
-    escalus:wait_for_stanza(Alice),
-    escalus:wait_for_stanzas(Bob, 3),
+    Joined = escalus:wait_for_stanza(Alice),
+    ?assertEqual([], exml_query:subelements_with_ns(Joined, ?NS_HATS)),
+    escalus_client:wait_for_stanzas(Bob, 10, 500),
     escalus:send(Bob, escalus_stanza:to(escalus_stanza:presence(<<"available">>),
                                         jid:to_binary(jid:replace_resource(RoomJID, <<"robert">>)))),
     [_Unavailable, Available] = escalus:wait_for_stanzas(Alice, 2),
@@ -829,7 +831,7 @@ admin_try_set_room_hat_hats_disabled_story(Config, Alice) ->
     ?assertNotEqual(nomatch, binary:match(get_err_msg(Res2), <<"not enabled">>)).
 
 admin_set_room_hat_muc_not_configured(Config) ->
-    RoomJID = jid:from_binary(?NONEXISTENT_ROOM2),
+    RoomJID = jid:from_binary(get_room_name()),
     get_not_loaded(set_room_hat(RoomJID, ?HOST_HAT, <<"Host">>, null, Config)),
     get_not_loaded(list_room_hats(RoomJID, Config)).
 
