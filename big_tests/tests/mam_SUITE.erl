@@ -416,7 +416,8 @@ muc_retract_cases() ->
      moderate_unknown_muc_message,
      moderate_muc_message_without_retract_element,
      retract_muc_message_v1,
-     retract_muc_message_v1_on_origin_id].
+     retract_muc_message_v1_on_origin_id,
+     occupant_cannot_send_moderation].
 
 disabled_muc_retract_cases() ->
     [retract_muc_message,
@@ -935,7 +936,8 @@ maybe_skip(C, Config) when C =:= retract_message;
                            C =:= retract_message_v1_on_origin_id;
                            C =:= retract_wrong_message_v1;
                            C =:= retract_muc_message_v1;
-                           C =:= retract_muc_message_v1_on_origin_id ->
+                           C =:= retract_muc_message_v1_on_origin_id;
+                           C =:= occupant_cannot_send_moderation ->
     ConfList = rdbms_configs(true, ct_helper:get_internal_database()),
     skip_if(not lists:member(?config(configuration, Config), ConfList),
             "message retraction not supported");
@@ -2605,14 +2607,19 @@ moderate_muc_message(Config) ->
         ?assertNotEqual(undefined, exml_query:subelement(Subject, <<"subject">>)),
         escalus_assert:has_no_stanzas(Kate),
 
-        %% ... and the room archive has a tombstone in place of the message
+        %% ... and the room archive has a tombstone in place of the message,
+        %% followed by the moderation message, for clients catching up later
         escalus:send(Bob, stanza_to_room(stanza_archive_request(P, <<"q1">>), Room)),
-        [ArcMsg] = respond_messages(assert_respond_size(1, wait_archive_respond(Bob))),
+        [ArcMsg, ArcModeration] = respond_messages(assert_respond_size(2, wait_archive_respond(Bob))),
+        #forwarded_message{message_children = ModerationChildren} =
+            parse_forwarded_message(ArcModeration),
+        ?assert(lists:any(fun(El) -> exml_query:attr(El, <<"xmlns">>) =:= <<"urn:xmpp:message-retract:1">>
+                          end, ModerationChildren)),
         Parsed = parse_forwarded_message(ArcMsg),
         case message_retraction_is_enabled(Config) of
             true ->
                 #forwarded_message{message_body = undefined,
-                                   message_children = [Retracted]} = Parsed,
+                                   message_children = [Retracted | _]} = Parsed,
                 ?assertEqual(<<"urn:xmpp:message-retract:1">>,
                              exml_query:attr(Retracted, <<"xmlns">>)),
                 ?assertEqual(ModeratorJID,
@@ -2721,6 +2728,28 @@ test_retract_muc_message_v1(Config, RetractOn) ->
         escalus:send(Bob, stanza_to_room(stanza_archive_request(P, <<"q1">>), Room)),
         check_archive_after_retraction_v1(message_retraction_is_enabled(Config),
                                           Bob, RetractMsg, Body)
+    end,
+    escalus:story(Config, [{alice, 1}, {bob, 1}], F).
+
+%% Only the room can say that a message was moderated (XEP-0425, section 5)
+occupant_cannot_send_moderation(Config) ->
+    F = fun(Alice, Bob) ->
+        Room = ?config(room, Config),
+        RoomAddr = room_address(Room),
+        enter_room_with_alice_and_bob(Room, Alice, Bob),
+        Moderated = #xmlel{name = <<"moderated">>,
+                           attrs = #{<<"xmlns">> => moderate_ns(), <<"by">> => RoomAddr}},
+        Retract = #xmlel{name = <<"retract">>,
+                         attrs = #{<<"xmlns">> => <<"urn:xmpp:message-retract:1">>,
+                                   <<"id">> => <<"B2GIQ57T4T81">>},
+                         children = [Moderated]},
+        Msg = escalus_stanza:groupchat_to(RoomAddr, <<"Not really moderated">>),
+        escalus:send(Bob, Msg#xmlel{children = [Retract, Moderated | Msg#xmlel.children]}),
+        Received = escalus:wait_for_stanza(Alice),
+        escalus:assert(is_groupchat_message, [<<"Not really moderated">>], Received),
+        ?assertEqual(undefined, exml_query:subelement_with_ns(Received, moderate_ns())),
+        ?assertEqual(undefined,
+                     exml_query:subelement_with_ns(Received, <<"urn:xmpp:message-retract:1">>))
     end,
     escalus:story(Config, [{alice, 1}, {bob, 1}], F).
 
