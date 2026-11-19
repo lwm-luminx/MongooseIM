@@ -20,6 +20,12 @@ type StanzaUserMutation @protected{
 }
 
 type StanzaUserSubscription @protected{
-  "Subscribe to incoming messages"
-  subscribeForMessages: StanzaMap
+  """
+  Subscribe to incoming messages.
+  The subscription opens a session with the given resource, or with a random one if it is not provided.
+  A resource that is already in use is not taken over, but a client that binds the same resource
+  later takes over the session, which ends the subscription. Kicking the session or removing the user
+  ends it too.
+  """
+  subscribeForMessages(resource: ResourceName): StanzaMap
 }
