@@ -23,10 +23,10 @@ This module supports [XEP-0424: Message Retraction](http://xmpp.org/extensions/x
 Both versions of the XEP are supported:
 
 * The current version (`urn:xmpp:message-retract:1`) uses a top-level `retract` element. Its `id` attribute refers to:
-    * the `stanza-id` assigned by the room, for messages of type `groupchat` (if the `id` is not a valid stanza ID, it is treated as an origin ID),
-    * the `id` attribute of the original message, for other messages. The archive stores it as the origin ID when the message has no `origin-id` element.
+    * the `stanza-id` assigned by the room, for messages of type `groupchat`, as the XEP requires,
+    * the `id` attribute of the original message, for other messages. The archive stores it as the origin ID when the message has no `origin-id` element. IDs longer than 250 bytes are not stored, and neither is the ID of a retraction message, so a retraction that reuses the retracted message's ID still finds that message.
 
-    The tombstone is a `<retracted xmlns='urn:xmpp:message-retract:1'/>` element whose `id` attribute is the `id` of the retraction message.
+    The tombstone is a `<retracted xmlns='urn:xmpp:message-retract:1'/>` element whose `id` attribute is the `id` of the retraction message. It keeps the author's `muc#user` item, occupant ID and message correction element, if any.
 * The older version (`urn:xmpp:message-retract:0`) wraps the `retract` element in an `apply-to` element (XEP-0422). Its `id` attribute has to be the same as the `id` attribute of the `origin-id` (or `stanza-id` when configured, see [below](#retraction-on-the-stanza-id)) element of the original message.
 
 In both cases:

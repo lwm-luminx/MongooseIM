@@ -409,12 +409,9 @@ get_retract_id(Packet) ->
 get_retract_1_id(_Type, <<>>) ->
     none;
 get_retract_1_id(<<"groupchat">>, Id) ->
-    try external_binary_to_mess_id(Id) of
-        _ -> {stanza_id, Id}
-    catch throw:invalid_stanza_id ->
-            %% The room did not assign stanza IDs, so the client used the origin ID
-            {origin_id, Id}
-    end;
+    %% Group chat messages are retracted by the stanza ID that the room assigned (XEP-0424, 3).
+    %% Guessing from the ID's format would mistake many client IDs for stanza IDs.
+    {stanza_id, Id};
 get_retract_1_id(_Type, Id) ->
     {origin_id, Id}.
 
@@ -434,12 +431,29 @@ get_fasten_retract_id(Packet) ->
 
 %% @doc Returns the origin ID of a message (XEP-0359), or its 'id' attribute if it has none.
 %% The current version of XEP-0424 refers to retracted messages by their 'id' attribute.
+%% A retraction message gets none, so that a retraction that reuses the ID of the message
+%% it retracts finds that message and not itself.
+%% IDs longer than the origin_id column are not stored either.
+-spec get_origin_id(exml:element()) -> binary() | none.
 get_origin_id(Packet) ->
-    case exml_query:path(Packet, [{element_with_ns, <<"origin-id">>, ?NS_STANZAID},
-                                  {attr, <<"id">>}], none) of
-        none -> exml_query:attr(Packet, <<"id">>, none);
-        OriginID -> OriginID
+    case get_retract_id(Packet) of
+        none ->
+            OriginID = case exml_query:path(Packet, [{element_with_ns, <<"origin-id">>, ?NS_STANZAID},
+                                                     {attr, <<"id">>}], none) of
+                           none -> exml_query:attr(Packet, <<"id">>, none);
+                           Id -> Id
+                       end,
+            limit_origin_id(OriginID);
+        _ ->
+            none
     end.
+
+-define(MAX_ORIGIN_ID_SIZE, 250).
+
+limit_origin_id(OriginID) when is_binary(OriginID), byte_size(OriginID) =< ?MAX_ORIGIN_ID_SIZE ->
+    OriginID;
+limit_origin_id(_) ->
+    none.
 
 is_groupchat(<<"groupchat">>) ->
     true;
@@ -499,8 +513,22 @@ tombstone(RetractionInfo = #{packet := Packet}, RetractionPacket, LocJid) ->
         undefined ->
             tombstone(RetractionInfo, LocJid);
         _ ->
-            Packet#xmlel{children = [retracted_1_element(RetractionPacket)]}
+            Kept = [El || El <- Packet#xmlel.children, is_kept_in_tombstone(El)],
+            Packet#xmlel{children = [retracted_1_element(RetractionPacket) | Kept]}
     end.
+
+%% Keep what identifies the author (the muc#user item with the real JID, shown to those allowed
+%% to see it, and the occupant ID) and the correction that the message was
+is_kept_in_tombstone(#xmlel{name = <<"x">>, attrs = #{<<"xmlns">> := ?NS_MUC_USER}}) ->
+    true;
+is_kept_in_tombstone(#xmlel{name = <<"occupant-id">>,
+                            attrs = #{<<"xmlns">> := <<"urn:xmpp:occupant-id:0">>}}) ->
+    true;
+is_kept_in_tombstone(#xmlel{name = <<"replace">>,
+                            attrs = #{<<"xmlns">> := <<"urn:xmpp:message-correct:0">>}}) ->
+    true;
+is_kept_in_tombstone(_) ->
+    false.
 
 %% The 'id' attribute refers to the retraction message, which is kept in the archive
 -spec retracted_1_element(exml:element()) -> exml:element().
