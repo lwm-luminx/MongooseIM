@@ -450,16 +450,18 @@ init_restored(#{init_type := start_restored,
     process_flag(trap_exit, true),
     Shaper = mongoose_shaper:new(RoomShaper),
     RoomJid = jid:make_bare(Room, Host),
-    State = set_opts(Opts, #state{host = Host, host_type = HostType,
-                                  server_host = ServerHost,
-                                  access = Access,
-                                  room = Room,
-                                  history = lqueue_new(HistorySize),
-                                  jid = RoomJid,
-                                  room_shaper = Shaper,
-                                  http_auth_pool = HttpAuthPool,
-                                  hibernate_timeout = read_hibernate_timeout(HostType)
-                                 }),
+    %% Affiliations removed while the room was stopped (e.g. by removing the user) take the hats along
+    State = prune_hat_assignments(
+              set_opts(Opts, #state{host = Host, host_type = HostType,
+                                    server_host = ServerHost,
+                                    access = Access,
+                                    room = Room,
+                                    history = lqueue_new(HistorySize),
+                                    jid = RoomJid,
+                                    room_shaper = Shaper,
+                                    http_auth_pool = HttpAuthPool,
+                                    hibernate_timeout = read_hibernate_timeout(HostType)
+                                   })),
     mongoose_instrument:execute(mod_muc_process_recreations, #{host_type => HostType},
                                 #{count => 1, jid => RoomJid}),
     State1 = maybe_add_occupant_id_salt(State),
@@ -734,7 +736,8 @@ handle_event({remove_user, UserU, UserS}, StateName, StateData) ->
 
 handle_event({set_affiliations, Affiliations},
              #state{hibernate_timeout = Timeout} = StateName, StateData) ->
-    {next_state, StateName, StateData#state{affiliations = Affiliations}, Timeout};
+    {next_state, StateName, prune_hat_assignments(StateData#state{affiliations = Affiliations}),
+     Timeout};
 
 handle_event(_Event, StateName, #state{hibernate_timeout = Timeout} = StateData) ->
     {next_state, StateName, StateData, Timeout}.
@@ -1517,7 +1520,9 @@ access_persistent(#state{access=Access}) ->
                       state()) -> state().
 set_affiliation(JID, none, StateData) ->
     LJID = jid:to_bare(jid:to_lower(JID)),
-    StateData#state{affiliations = maps:remove(LJID, StateData#state.affiliations)};
+    %% Hats are worn only by users with an affiliation
+    StateData#state{affiliations = maps:remove(LJID, StateData#state.affiliations),
+                    hat_assignments = maps:remove(LJID, StateData#state.hat_assignments)};
 set_affiliation(JID, AffOrAffReason, StateData) ->
     LJID = jid:to_bare(jid:to_lower(JID)),
     StateData#state{affiliations = maps:put(LJID, AffOrAffReason, StateData#state.affiliations)}.
@@ -1839,7 +1844,7 @@ strip_status(#xmlel{name = <<"presence">>, attrs = Attrs,
 -spec add_user_presence(jid:jid(), exml:element(), state()) -> state().
 add_user_presence(JID, Presence, StateData) ->
     LJID = jid:to_lower(JID),
-    FPresence = set_occupant_id(JID, filter_presence(Presence), StateData),
+    FPresence = set_occupant_id(JID, strip_hats(filter_presence(Presence)), StateData),
     Users =
     maps:update_with(
       LJID,
@@ -1853,7 +1858,7 @@ add_user_presence(JID, Presence, StateData) ->
                         state()) -> state().
 add_user_presence_un(JID, Presence, StateData) ->
     LJID = jid:to_lower(JID),
-    FPresence = set_occupant_id(JID, filter_presence(Presence), StateData),
+    FPresence = set_occupant_id(JID, strip_hats(filter_presence(Presence)), StateData),
     Users =
     maps:update_with(
       LJID,
@@ -2542,10 +2547,13 @@ send_nick_change(Presence, OldNick, JID, RealJID, Affiliation, Role,
                          Info#user.jid,
                          Unavailable,
                          ?LOCATION)),
-    Available = set_occupant_id(RealJID,
-                                nick_available_presence(Presence, MaybePublicJID, Affiliation,
-                                                        Role, MaybeSelfPresenceCode),
-                                S),
+    Available = set_hats(RealJID,
+                         set_occupant_id(RealJID,
+                                         nick_available_presence(Presence, MaybePublicJID,
+                                                                 Affiliation, Role,
+                                                                 MaybeSelfPresenceCode),
+                                         S),
+                         S),
     mongoose_router:route(
         mongoose_acc:new(jid:replace_resource(S#state.jid, Nick),
                          Info#user.jid,
@@ -2876,12 +2884,14 @@ handle_hats_event({remove_hat, Uri}, StateData = #state{hats = Hats, hat_assignm
             {{error, hat_not_found}, StateData}
     end;
 handle_hats_event({assign_hat, LJID, Uri}, StateData = #state{hats = Hats, hat_assignments = Assignments}) ->
-    case find_hat(Uri, Hats) of
-        {ok, _} ->
+    case {find_hat(Uri, Hats), has_affiliation(LJID, StateData)} of
+        {{ok, _}, false} ->
+            {{error, not_affiliated}, StateData};
+        {{ok, _}, true} ->
             Uris = maps:get(LJID, Assignments, []),
             NewUris = Uris ++ [Uri || not lists:member(Uri, Uris)],
             hats_changed([LJID], StateData#state{hat_assignments = Assignments#{LJID => NewUris}});
-        error ->
+        {error, _} ->
             {{error, hat_not_found}, StateData}
     end;
 handle_hats_event({unassign_hat, LJID, Uri}, StateData = #state{hat_assignments = Assignments}) ->
@@ -2909,6 +2919,16 @@ hats_changed(LJIDs, StateData) ->
                  end, StateData#state.users),
     {ok, StateData}.
 
+-spec has_affiliation(jid:simple_bare_jid(), state()) -> boolean().
+has_affiliation(LJID, #state{affiliations = Affiliations}) ->
+    lookup_affiliation([LJID], Affiliations) =/= none.
+
+%% Hats are worn only by users with an affiliation, so that they are removed with it
+-spec prune_hat_assignments(state()) -> state().
+prune_hat_assignments(StateData = #state{hat_assignments = Assignments}) ->
+    StateData#state{hat_assignments = maps:filter(fun(LJID, _) -> has_affiliation(LJID, StateData) end,
+                                                  Assignments)}.
+
 -spec wearers([hat_uri()], state()) -> [jid:simple_bare_jid()].
 wearers(Uris, #state{hat_assignments = Assignments}) ->
     [LJID || {LJID, WornUris} <- maps:to_list(Assignments),
@@ -2924,14 +2944,17 @@ find_hat(Uri, Hats) ->
 %% @doc Replaces any hats sent by the occupant with the hats the occupant wears in the room.
 %% Clients can't put on hats themselves.
 -spec set_hats(jid:jid(), exml:element(), state()) -> exml:element().
-set_hats(JID, Presence = #xmlel{children = Children}, StateData) ->
+%% Hats sent by clients are removed even when hats are disabled, so that they can't be forged.
+set_hats(JID, Presence, StateData) ->
+    Stripped = #xmlel{children = Children} = strip_hats(Presence),
     case is_hats_enabled(StateData) of
-        true ->
-            Children1 = [Child || Child <- Children, not is_hats_element(Child)],
-            Presence#xmlel{children = Children1 ++ hats_elements(JID, StateData)};
-        false ->
-            Presence
+        true -> Stripped#xmlel{children = Children ++ hats_elements(JID, StateData)};
+        false -> Stripped
     end.
+
+-spec strip_hats(exml:element()) -> exml:element().
+strip_hats(Presence = #xmlel{children = Children}) ->
+    Presence#xmlel{children = [Child || Child <- Children, not is_hats_element(Child)]}.
 
 is_hats_element(#xmlel{name = <<"hats">>, attrs = #{<<"xmlns">> := ?NS_HATS}}) -> true;
 is_hats_element(_) -> false.
@@ -2966,8 +2989,10 @@ hats_opts(#state{hats = Hats, hat_assignments = Assignments}) ->
 decode_hat([Uri, Title, null]) -> #{uri => Uri, title => Title};
 decode_hat([Uri, Title, Hue]) -> #{uri => Uri, title => Title, hue => Hue}.
 
+%% Malformed JIDs are skipped, so that bad stored data can't stop the room from starting
 decode_hat_assignments(Val) ->
-    maps:from_list([{jid:to_lower(jid:from_binary(JID)), Uris} || [JID | Uris] <- Val]).
+    maps:from_list([{jid:to_lower(Jid), Uris} || [JID | Uris] <- Val,
+                                                 Jid <- [jid:from_binary(JID)], Jid =/= error]).
 
 -spec lqueue_new(integer()) -> lqueue().
 lqueue_new(Max) ->

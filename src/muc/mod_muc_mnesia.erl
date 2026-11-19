@@ -125,7 +125,9 @@ known_room_opt_keys() ->
      subject,
      subject_author,
      affiliations,
-     occupant_id_salt].
+     occupant_id_salt,
+     hats,
+     hat_assignments].
 
 -spec forget_room(mongooseim:host_type(), jid:server(), mod_muc:room()) ->
     ok | {error, term()}.

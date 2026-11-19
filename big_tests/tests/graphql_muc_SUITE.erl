@@ -6,7 +6,7 @@
 -import(distributed_helper, [mim/0, require_rpc_nodes/1, rpc/4, subhost_pattern/1]).
 -import(graphql_helper, [execute_command/4, execute_user_command/5, get_ok_value/2, get_err_msg/1,
                          get_coercion_err_msg/1, user_to_bin/1, user_to_full_bin/1, user_to_jid/1,
-                         get_unauthorized/1, get_not_loaded/1]).
+                         get_unauthorized/1, get_not_loaded/1, get_err_code/1]).
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -162,6 +162,9 @@ admin_muc_hats_tests() ->
      admin_room_hats_override_client_hats,
      admin_room_hats_in_disco,
      admin_try_assign_nonexistent_room_hat,
+     admin_try_assign_room_hat_to_unaffiliated_user,
+     admin_room_hats_removed_with_affiliation,
+     admin_room_hats_kept_on_nick_change,
      admin_try_set_room_hat_with_invalid_args,
      admin_try_set_hat_in_nonexistent_room].
 
@@ -604,6 +607,7 @@ admin_set_and_assign_room_hat(Config) ->
 
 admin_set_and_assign_room_hat_story(Config, Alice, Bob) ->
     RoomJID = jid:from_binary(?config(room_jid, Config)),
+    make_member(RoomJID, Bob, Config),
     enter_room_and_flush(RoomJID, [{Alice, <<"ali">>}, {Bob, <<"bobek">>}]),
     Res = set_room_hat(RoomJID, ?HOST_HAT, <<"Host">>, 120.5, Config),
     assert_success(?SET_ROOM_HAT_PATH, Res),
@@ -630,6 +634,7 @@ admin_update_room_hat(Config) ->
 
 admin_update_room_hat_story(Config, Alice, Bob) ->
     RoomJID = jid:from_binary(?config(room_jid, Config)),
+    make_member(RoomJID, Bob, Config),
     enter_room_and_flush(RoomJID, [{Alice, <<"ali">>}, {Bob, <<"bobek">>}]),
     assert_success(?SET_ROOM_HAT_PATH, set_room_hat(RoomJID, ?HOST_HAT, <<"Host">>, null, Config)),
     assert_success(?ASSIGN_ROOM_HAT_PATH, assign_room_hat(RoomJID, Bob, ?HOST_HAT, Config)),
@@ -647,6 +652,7 @@ admin_unassign_room_hat(Config) ->
 
 admin_unassign_room_hat_story(Config, Alice, Bob) ->
     RoomJID = jid:from_binary(?config(room_jid, Config)),
+    make_member(RoomJID, Bob, Config),
     enter_room_and_flush(RoomJID, [{Alice, <<"ali">>}, {Bob, <<"bobek">>}]),
     assert_success(?SET_ROOM_HAT_PATH, set_room_hat(RoomJID, ?HOST_HAT, <<"Host">>, null, Config)),
     assert_success(?ASSIGN_ROOM_HAT_PATH, assign_room_hat(RoomJID, Bob, ?HOST_HAT, Config)),
@@ -666,6 +672,7 @@ admin_remove_room_hat(Config) ->
 
 admin_remove_room_hat_story(Config, Alice, Bob) ->
     RoomJID = jid:from_binary(?config(room_jid, Config)),
+    make_member(RoomJID, Bob, Config),
     enter_room_and_flush(RoomJID, [{Alice, <<"ali">>}, {Bob, <<"bobek">>}]),
     assert_success(?SET_ROOM_HAT_PATH, set_room_hat(RoomJID, ?HOST_HAT, <<"Host">>, null, Config)),
     assert_success(?ASSIGN_ROOM_HAT_PATH, assign_room_hat(RoomJID, Bob, ?HOST_HAT, Config)),
@@ -684,6 +691,7 @@ admin_room_hats_override_client_hats(Config) ->
 
 admin_room_hats_override_client_hats_story(Config, Alice, Bob) ->
     RoomJID = jid:from_binary(?config(room_jid, Config)),
+    make_member(RoomJID, Bob, Config),
     enter_room_and_flush(RoomJID, [{Alice, <<"ali">>}, {Bob, <<"bobek">>}]),
     FakeHats = #xmlel{name = <<"hats">>, attrs = #{<<"xmlns">> => ?NS_HATS},
                       children = [#xmlel{name = <<"hat">>,
@@ -721,6 +729,70 @@ admin_try_assign_nonexistent_room_hat_story(Config, Alice, Bob) ->
     enter_room_and_flush(RoomJID, [{Alice, <<"ali">>}]),
     Res = assign_room_hat(RoomJID, Bob, ?HOST_HAT, Config),
     ?assertNotEqual(nomatch, binary:match(get_err_msg(Res), <<"Hat not found">>)).
+
+admin_try_assign_room_hat_to_unaffiliated_user(Config) ->
+    muc_helper:story_with_room(Config, [], [{alice, 1}, {bob, 1}],
+                               fun admin_try_assign_room_hat_to_unaffiliated_user_story/3).
+
+admin_try_assign_room_hat_to_unaffiliated_user_story(Config, Alice, Bob) ->
+    RoomJID = jid:from_binary(?config(room_jid, Config)),
+    enter_room_and_flush(RoomJID, [{Alice, <<"ali">>}]),
+    assert_success(?SET_ROOM_HAT_PATH, set_room_hat(RoomJID, ?HOST_HAT, <<"Host">>, null, Config)),
+    Res = assign_room_hat(RoomJID, Bob, ?HOST_HAT, Config),
+    ?assertEqual(<<"not_affiliated">>, get_err_code(Res)).
+
+%% Hats are removed with the affiliation, so a recycled username can't inherit them
+admin_room_hats_removed_with_affiliation(Config) ->
+    muc_helper:story_with_room(Config, [], [{alice, 1}, {bob, 1}],
+                               fun admin_room_hats_removed_with_affiliation_story/3).
+
+admin_room_hats_removed_with_affiliation_story(Config, Alice, Bob) ->
+    RoomJID = jid:from_binary(?config(room_jid, Config)),
+    make_member(RoomJID, Bob, Config),
+    enter_room_and_flush(RoomJID, [{Alice, <<"ali">>}]),
+    assert_success(?SET_ROOM_HAT_PATH, set_room_hat(RoomJID, ?HOST_HAT, <<"Host">>, null, Config)),
+    assert_success(?ASSIGN_ROOM_HAT_PATH, assign_room_hat(RoomJID, Bob, ?HOST_HAT, Config)),
+    set_user_affiliation(RoomJID, Bob, none, Config),
+    ?assertMatch(#{<<"assignments">> := []},
+                 get_ok_value(?LIST_ROOM_HATS_PATH, list_room_hats(RoomJID, Config))).
+
+%% Changing the nick must neither drop the hats nor let a client put on its own
+admin_room_hats_kept_on_nick_change(Config) ->
+    muc_helper:story_with_room(Config, [], [{alice, 1}, {bob, 1}],
+                               fun admin_room_hats_kept_on_nick_change_story/3).
+
+admin_room_hats_kept_on_nick_change_story(Config, Alice, Bob) ->
+    RoomJID = jid:from_binary(?config(room_jid, Config)),
+    make_member(RoomJID, Bob, Config),
+    enter_room_and_flush(RoomJID, [{Alice, <<"ali">>}]),
+    FakeHats = #xmlel{name = <<"hats">>, attrs = #{<<"xmlns">> => ?NS_HATS},
+                      children = [#xmlel{name = <<"hat">>,
+                                         attrs = #{<<"uri">> => <<"urn:fake">>,
+                                                   <<"title">> => <<"Owner">>}}]},
+    %% Bob joins with forged hats, then changes his nick
+    escalus:send(Bob, escalus_stanza:to(escalus_stanza:presence(<<"available">>, [FakeHats]),
+                                        jid:to_binary(jid:replace_resource(RoomJID, <<"bobek">>)))),
+    escalus:wait_for_stanza(Alice),
+    escalus:wait_for_stanzas(Bob, 3),
+    escalus:send(Bob, escalus_stanza:to(escalus_stanza:presence(<<"available">>),
+                                        jid:to_binary(jid:replace_resource(RoomJID, <<"robert">>)))),
+    [_Unavailable, Available] = escalus:wait_for_stanzas(Alice, 2),
+    ?assertEqual([], exml_query:subelements_with_ns(Available, ?NS_HATS)),
+    escalus:wait_for_stanzas(Bob, 2),
+    %% With a hat assigned, the new nick wears it
+    assert_success(?SET_ROOM_HAT_PATH, set_room_hat(RoomJID, ?HOST_HAT, <<"Host">>, -0.0, Config)),
+    assert_success(?ASSIGN_ROOM_HAT_PATH, assign_room_hat(RoomJID, Bob, ?HOST_HAT, Config)),
+    [assert_hats(RoomJID, <<"robert">>, [{?HOST_HAT, <<"Host">>, <<"0.0">>}], Client)
+     || Client <- [Alice, Bob]],
+    escalus:send(Bob, escalus_stanza:to(escalus_stanza:presence(<<"available">>),
+                                        jid:to_binary(jid:replace_resource(RoomJID, <<"bob">>)))),
+    [_, Available2] = escalus:wait_for_stanzas(Alice, 2),
+    ?assertEqual([?HOST_HAT], [exml_query:attr(Hat, <<"uri">>)
+                               || Hat <- exml_query:paths(Available2, [{element_with_ns, <<"hats">>, ?NS_HATS},
+                                                                      {element, <<"hat">>}])]).
+
+make_member(RoomJID, User, Config) ->
+    assert_success(?SET_AFFILIATION_PATH, set_user_affiliation(RoomJID, User, member, Config)).
 
 admin_try_set_room_hat_with_invalid_args(Config) ->
     muc_helper:story_with_room(Config, [], [{alice, 1}],

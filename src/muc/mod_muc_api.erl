@@ -76,6 +76,8 @@
 -define(SET_ROLE_SUCC_RESULT, {ok, "Role set successfully"}).
 -define(HATS_DISABLED_RESULT, {hats_disabled, "Hats are not enabled for this MUC service"}).
 -define(HAT_NOT_FOUND_RESULT, {hat_not_found, "Hat not found"}).
+-define(NOT_AFFILIATED_RESULT,
+        {not_affiliated, "Hats can only be assigned to users with an affiliation in the room"}).
 
 -spec get_rooms(jid:lserver(), jid:jid(), non_neg_integer() | undefined,
                 non_neg_integer()) -> {ok, get_rooms_result()} | {muc_server_not_found, iolist()}.
@@ -289,8 +291,10 @@ set_room_hat(RoomJID, Uri, Title, Hue) ->
 remove_room_hat(RoomJID, Uri) ->
     format_hats_result(mod_muc_room:remove_hat(RoomJID, Uri), "Hat removed successfully").
 
+%% @doc Assigns a hat to a user with an affiliation (member or higher) in the room.
+%% The hats are removed with the affiliation, e.g. when the user is removed.
 -spec assign_room_hat(jid:jid(), jid:jid(), binary()) ->
-    {ok | room_not_found | hats_disabled | hat_not_found, iolist()}.
+    {ok | room_not_found | hats_disabled | hat_not_found | not_affiliated, iolist()}.
 assign_room_hat(RoomJID, UserJID, Uri) ->
     format_hats_result(mod_muc_room:assign_hat(RoomJID, UserJID, Uri), "Hat assigned successfully").
 
@@ -669,11 +673,13 @@ format_affs(AffsMap) ->
                   ({K, V}) -> {K, V}
               end, maps:to_list(AffsMap)).
 
+%% A decimal without an exponent (xs:decimal), and adding 0.0 turns -0.0 into 0.0
 format_hue(undefined) -> undefined;
-format_hue(Hue) -> float_to_binary(float(Hue), [short]).
+format_hue(Hue) -> float_to_binary(float(Hue) + 0.0, [{decimals, 6}, compact]).
 
 format_hats_result(ok, Msg) -> {ok, Msg};
 format_hats_result({ok, Hats}, _Msg) -> {ok, Hats};
 format_hats_result({error, not_found}, _Msg) -> ?ROOM_NOT_FOUND_RESULT;
 format_hats_result({error, hats_disabled}, _Msg) -> ?HATS_DISABLED_RESULT;
-format_hats_result({error, hat_not_found}, _Msg) -> ?HAT_NOT_FOUND_RESULT.
+format_hats_result({error, hat_not_found}, _Msg) -> ?HAT_NOT_FOUND_RESULT;
+format_hats_result({error, not_affiliated}, _Msg) -> ?NOT_AFFILIATED_RESULT.
