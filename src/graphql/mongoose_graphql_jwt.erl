@@ -4,7 +4,9 @@
 %% The tokens are verified with the keys configured for the listener. The keys
 %% are tried in order. If the token header has a `kid', only the keys with
 %% the same `kid' and the keys without one are tried.
-%% The `exp' claim is required, and `iss' and `aud' are checked when configured.
+%% The `exp' and `aud' claims are required. `aud' has to contain the configured audience,
+%% so that tokens issued for other services (such as XMPP clients) can't be used here,
+%% even when they are signed with the same key. `iss' is checked when configured.
 %% @end
 -module(mongoose_graphql_jwt).
 
@@ -14,20 +16,21 @@
          process_algorithm/1,
          read_keys/1,
          verify/2,
-         get_claim/2]).
+         get_claim/2,
+         expires_at/1]).
 
 -include("mongoose_config_spec.hrl").
 
--type algorithm() :: hs256 | rs256 | es256 | hs384 | rs384 | es384 | hs512 | rs512 | es512.
+-type algorithm() :: mongoose_jwt:algorithm().
 -type secret() :: binary() | {env, string()}.
 -type key() :: #{kid := binary() | undefined,
                  algorithm := algorithm(),
                  secret := secret()}.
 -type opts() :: #{keys := [map()],
                   issuer => binary(),
-                  audience => binary(),
+                  audience := binary(),
                   domain_key => binary()}.
--type claims() :: #{atom() | binary() => term()}.
+-type claims() :: mongoose_jwt:claims().
 
 -export_type([opts/0, claims/0]).
 
@@ -45,7 +48,7 @@ config_spec() ->
                  <<"domain_key">> => #option{type = binary,
                                              validate = non_empty}},
        defaults = #{<<"domain_key">> => <<"domain">>},
-       required = [<<"keys">>]
+       required = [<<"keys">>, <<"audience">>]
       }.
 
 key_config_spec() ->
@@ -54,7 +57,7 @@ key_config_spec() ->
                                       validate = non_empty},
                  <<"secret">> => secret_config_spec(),
                  <<"algorithm">> => #option{type = binary,
-                                            validate = {enum, maps:keys(algorithms())},
+                                            validate = {enum, maps:keys(mongoose_jwt:algorithms())},
                                             process = fun ?MODULE:process_algorithm/1}},
        required = [<<"secret">>, <<"algorithm">>]
       }.
@@ -65,7 +68,8 @@ secret_config_spec() ->
                                        validate = filename},
                  <<"env">> => #option{type = string,
                                       validate = non_empty},
-                 <<"value">> => #option{type = binary}},
+                 <<"value">> => #option{type = binary,
+                                        validate = non_empty}},
        format_items = list,
        process = fun ?MODULE:process_secret/1
       }.
@@ -78,7 +82,7 @@ process_secret(_Items) ->
     error(#{what => one_secret_source_required}).
 
 -spec process_algorithm(binary()) -> algorithm().
-process_algorithm(Alg) -> maps:get(Alg, algorithms()).
+process_algorithm(Alg) -> maps:get(Alg, mongoose_jwt:algorithms()).
 
 %% @doc Validates the JWT options of a GraphQL listener.
 -spec process_config(map()) -> ok.
@@ -92,15 +96,34 @@ process_config(_) ->
 %% environment variables are read for each request.
 -spec read_keys(opts()) -> [key()].
 read_keys(#{keys := Keys}) ->
-    [#{kid => maps:get(kid, Key, undefined),
-       algorithm => Alg,
-       secret => read_secret(Secret)} || Key = #{algorithm := Alg, secret := Secret} <- Keys].
+    [read_key(Key#{kid => maps:get(kid, Key, undefined)}) || Key <- Keys].
 
-read_secret({value, Secret}) -> Secret;
-read_secret({env, Var}) -> {env, Var};
-read_secret({file, Path}) ->
-    {ok, Secret} = file:read_file(Path),
-    Secret.
+read_key(#{kid := Kid, algorithm := Alg, secret := Secret}) ->
+    Value = read_secret(Secret, Kid),
+    check_key(Value, Alg, Kid),
+    #{kid => Kid, algorithm => Alg, secret => Value}.
+
+read_secret({value, Secret}, _Kid) -> Secret;
+read_secret({env, Var}, _Kid) -> {env, Var};
+read_secret({file, Path}, Kid) ->
+    case file:read_file(Path) of
+        {ok, <<>>} -> error(#{what => graphql_jwt_secret_file_empty, path => Path, kid => Kid});
+        {ok, Secret} -> Secret;
+        {error, Reason} -> error(#{what => graphql_jwt_secret_file_unreadable, path => Path,
+                                   kid => Kid, reason => Reason})
+    end.
+
+%% The RS and ES algorithms need a public key. Environment variables are checked when used.
+check_key({env, _}, _Alg, _Kid) ->
+    ok;
+check_key(_Secret, Alg, _Kid) when Alg =:= hs256; Alg =:= hs384; Alg =:= hs512 ->
+    ok;
+check_key(Secret, Alg, Kid) ->
+    case mongoose_jwt:is_public_key(Secret) of
+        true -> ok;
+        false -> error(#{what => graphql_jwt_public_key_required, algorithm => Alg, kid => Kid,
+                         text => <<"RS and ES algorithms need one PEM-encoded public key">>})
+    end.
 
 %% Verification
 
@@ -120,51 +143,50 @@ verify(Token, #{jwt := Opts, jwt_keys := Keys}) ->
     end.
 
 verify_signature(Token, Keys) ->
-    try jwerl:header(Token) of
-        Header when is_map(Header) ->
-            Kid = maps:get(kid, Header, undefined),
-            verify_with_keys(Token, matching_keys(Kid, Keys));
-        _ ->
-            {error, invalid_token}
-    catch _:_ ->
-            {error, invalid_token}
+    case mongoose_jwt:header(Token) of
+        {ok, Header} ->
+            Kid = maps:get(<<"kid">>, Header, undefined),
+            verify_with_keys(Token, matching_keys(Kid, Keys), {error, no_matching_key});
+        {error, _} = Error ->
+            Error
     end.
 
+%% A 'kid' that is not a string is malformed (RFC 7515, section 4.1.4), and matches no key
+matching_keys(undefined, Keys) ->
+    Keys;
 matching_keys(Kid, Keys) when is_binary(Kid) ->
     [Key || Key = #{kid := KeyKid} <- Keys, KeyKid =:= Kid orelse KeyKid =:= undefined];
-matching_keys(_, Keys) ->
-    Keys.
+matching_keys(_, _Keys) ->
+    [].
 
-verify_with_keys(_Token, []) ->
-    {error, invalid_token};
-verify_with_keys(Token, [#{algorithm := Alg, secret := Secret} | Keys]) ->
-    case secret_value(Secret) of
-        {ok, Key} ->
-            try jwerl:verify(Token, Alg, Key) of
-                {ok, Claims} when is_map(Claims) -> {ok, Claims};
-                _ -> verify_with_keys(Token, Keys)
-            catch _:_ ->
-                    verify_with_keys(Token, Keys)
-            end;
-        error ->
-            verify_with_keys(Token, Keys)
+verify_with_keys(_Token, [], LastError) ->
+    LastError;
+verify_with_keys(Token, [#{algorithm := Alg, secret := Secret} | Keys], _LastError) ->
+    Result = case secret_value(Secret) of
+                 {ok, Key} -> mongoose_jwt:verify(Token, Alg, Key);
+                 error -> {error, secret_not_set}
+             end,
+    case Result of
+        {ok, Claims} -> {ok, Claims};
+        {error, _} = Error -> verify_with_keys(Token, Keys, Error)
     end.
 
+%% An empty secret is treated as unset, because anyone could sign tokens with it
 secret_value({env, Var}) ->
     case os:getenv(Var) of
         false -> error;
+        "" -> error;
         Value -> {ok, list_to_binary(Value)}
     end;
 secret_value(Secret) when is_binary(Secret) ->
     {ok, Secret}.
 
-%% jwerl checks 'exp' only when it is present, but admin tokens must expire
-check_claims(Claims, Opts) ->
-    Checks = [{<<"exp">>, fun is_integer/1, missing_expiration}]
+%% mongoose_jwt checks 'exp' only when it is present, but admin tokens must expire
+check_claims(Claims, Opts = #{audience := Audience}) ->
+    Checks = [{<<"exp">>, fun is_number/1, missing_expiration},
+              {<<"aud">>, fun(Aud) -> has_audience(Aud, Audience) end, wrong_audience}]
         ++ [{<<"iss">>, fun(Iss) -> Iss =:= Issuer end, wrong_issuer}
-            || Issuer <- [maps:get(issuer, Opts, undefined)], Issuer =/= undefined]
-        ++ [{<<"aud">>, fun(Aud) -> has_audience(Aud, Audience) end, wrong_audience}
-            || Audience <- [maps:get(audience, Opts, undefined)], Audience =/= undefined],
+            || Issuer <- [maps:get(issuer, Opts, undefined)], Issuer =/= undefined],
     check_claims_loop(Claims, Checks).
 
 check_claims_loop(_Claims, []) ->
@@ -181,21 +203,11 @@ has_audience(Auds, Audience) when is_list(Auds) -> lists:member(Audience, Auds);
 has_audience(_, _) -> false.
 
 %% @doc Returns a claim value, or `undefined'.
-%% jwerl decodes the claim names to atoms when such atoms exist.
 -spec get_claim(binary(), claims()) -> term().
 get_claim(Name, Claims) ->
-    case maps:find(Name, Claims) of
-        {ok, Value} ->
-            Value;
-        error ->
-            try maps:get(binary_to_existing_atom(Name), Claims, undefined)
-            catch error:badarg -> undefined
-            end
-    end.
+    maps:get(Name, Claims, undefined).
 
-%% Explicit mapping, because the atoms are owned by jwerl and might not exist yet
--spec algorithms() -> #{binary() => algorithm()}.
-algorithms() ->
-    #{<<"HS256">> => hs256, <<"RS256">> => rs256, <<"ES256">> => es256,
-      <<"HS384">> => hs384, <<"RS384">> => rs384, <<"ES384">> => es384,
-      <<"HS512">> => hs512, <<"RS512">> => rs512, <<"ES512">> => es512}.
+%% @doc The expiration time of a verified token, in seconds since the epoch.
+-spec expires_at(claims()) -> integer().
+expires_at(#{<<"exp">> := Exp}) ->
+    trunc(Exp).

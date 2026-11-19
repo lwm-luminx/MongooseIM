@@ -610,9 +610,10 @@ listen_http_handlers_graphql(_Config) ->
 
 test_listen_http_handler_graphql_jwt(P, T) ->
     Key = #{<<"secret">> => #{<<"value">> => <<"secret">>}, <<"algorithm">> => <<"HS256">>},
-    J = fun(Opts) -> T(#{<<"jwt">> => Opts}) end,
+    %% The audience is required
+    J = fun(Opts) -> T(#{<<"jwt">> => maps:merge(#{<<"audience">> => <<"mim">>}, Opts)}) end,
     ?cfg(P ++ [jwt], #{keys => [#{secret => {value, <<"secret">>}, algorithm => hs256}],
-                       domain_key => <<"domain">>},
+                       audience => <<"mim">>, domain_key => <<"domain">>},
          J(#{<<"keys">> => [Key]})),
     ?cfg(P ++ [jwt, keys], [#{kid => <<"k1">>, secret => {env, "JWT_KEY"}, algorithm => rs256}],
          J(#{<<"keys">> => [#{<<"kid">> => <<"k1">>,
@@ -623,8 +624,11 @@ test_listen_http_handler_graphql_jwt(P, T) ->
     ?cfg(P ++ [jwt, domain_key], <<"dom">>,
          J(#{<<"keys">> => [Key], <<"domain_key">> => <<"dom">>})),
     ?cfg(P ++ [schema_endpoint], domain_admin,
-         T(#{<<"schema_endpoint">> => <<"domain_admin">>, <<"jwt">> => #{<<"keys">> => [Key]}})),
+         T(#{<<"schema_endpoint">> => <<"domain_admin">>,
+             <<"jwt">> => #{<<"keys">> => [Key], <<"audience">> => <<"mim">>}})),
     ?err(J(#{})),
+    ?err(T(#{<<"jwt">> => #{<<"keys">> => [Key]}})),
+    ?err(J(#{<<"keys">> => [Key#{<<"secret">> => #{<<"value">> => <<>>}}]})),
     ?err(J(#{<<"keys">> => []})),
     ?err(J(#{<<"keys">> => [maps:remove(<<"algorithm">>, Key)]})),
     ?err(J(#{<<"keys">> => [maps:remove(<<"secret">>, Key)]})),
@@ -636,7 +640,8 @@ test_listen_http_handler_graphql_jwt(P, T) ->
     ?err(J(#{<<"keys">> => [Key], <<"audience">> => <<>>})),
     ?err(J(#{<<"keys">> => [Key], <<"unknown">> => <<"x">>})),
     %% The user endpoint authenticates with the auth methods of the user's host type
-    ?err(T(#{<<"schema_endpoint">> => <<"user">>, <<"jwt">> => #{<<"keys">> => [Key]}})).
+    ?err(T(#{<<"schema_endpoint">> => <<"user">>,
+             <<"jwt">> => #{<<"keys">> => [Key], <<"audience">> => <<"mim">>}})).
 
 test_listen_http_handler_creds(P, T) ->
     CredsRaw = #{<<"username">> => <<"user">>, <<"password">> => <<"pass">>},

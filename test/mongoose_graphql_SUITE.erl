@@ -165,6 +165,7 @@ user_listener() ->
 
 admin_listener() ->
     [no_creds_defined_admin_can_access_protected,
+     bearer_token_rejected_without_jwt,
      auth_admin_can_access_protected_types | common_tests()].
 
 domain_admin_listener() ->
@@ -185,6 +186,10 @@ admin_jwt_listener() ->
      jwt_admin_no_creds_cannot_access_protected_types,
      jwt_admin_wrong_signature_error,
      jwt_admin_wrong_kid_error,
+     jwt_admin_non_string_kid_error,
+     jwt_admin_es256_token_accepted,
+     jwt_admin_der_es256_signature_error,
+     jwt_admin_hmac_token_signed_with_public_key_error,
      jwt_admin_wrong_algorithm_error,
      jwt_admin_malformed_token_error,
      jwt_admin_expired_token_error,
@@ -254,10 +259,11 @@ init_per_group(domain_admin_listener, Config) ->
     ListenerOpts = #{schema_endpoint => domain_admin},
     init_ep_listener(5560, domain_admin_schema_ep, ListenerOpts, Config2);
 init_per_group(admin_jwt_listener, Config) ->
+    EcKey = public_key:generate_key({namedCurve, secp256r1}),
     ListenerOpts = jwt_listener_opts(#{username => <<"admin">>,
                                        password => <<"secret">>,
-                                       schema_endpoint => admin}),
-    init_ep_listener(5561, admin_schema_ep, ListenerOpts, Config);
+                                       schema_endpoint => admin}, ec_public_pem(EcKey)),
+    init_ep_listener(5561, admin_schema_ep, ListenerOpts, [{ec_key, EcKey} | Config]);
 init_per_group(domain_admin_jwt_listener, Config) ->
     Config1 = meck_module_and_service_checking(Config),
     Config2 = meck_domain_api(Config1),
@@ -1050,7 +1056,30 @@ jwt_admin_malformed_token_error(Config) ->
     assert_bearer_rejected(Config, <<"a.b.c">>).
 
 jwt_admin_expired_token_error(Config) ->
-    assert_jwt_rejected(Config, (valid_claims())#{exp => now_s() - 10}, <<"key-a">>).
+    %% Expired longer ago than the allowed clock skew
+    assert_jwt_rejected(Config, (valid_claims())#{exp => now_s() - 3600}, <<"key-a">>).
+
+jwt_admin_non_string_kid_error(Config) ->
+    [assert_bearer_rejected(Config, make_token(<<"HS256">>, sha256, Kid, valid_claims(), <<"key-a">>))
+     || Kid <- [123, null, [<<"a">>]]].
+
+jwt_admin_es256_token_accepted(Config) ->
+    Token = make_es256_token(valid_claims(), ?config(ec_key, Config), raw),
+    Body = #{query => "{ field }"},
+    {Status, Data} = execute_bearer(?config(endpoint_addr, Config), Body, Token),
+    assert_access_granted(Status, Data).
+
+jwt_admin_der_es256_signature_error(Config) ->
+    assert_bearer_rejected(Config, make_es256_token(valid_claims(), ?config(ec_key, Config), der)).
+
+jwt_admin_hmac_token_signed_with_public_key_error(Config) ->
+    %% The public key is known to everyone, so it must not work as an HMAC secret
+    Pem = ec_public_pem(?config(ec_key, Config)),
+    assert_bearer_rejected(Config, make_token(<<"HS256">>, sha256, <<"ec">>, valid_claims(), Pem)).
+
+bearer_token_rejected_without_jwt(Config) ->
+    %% A listener without JWT configured rejects tokens instead of ignoring them
+    assert_jwt_rejected(Config, valid_claims(), <<"key-a">>).
 
 jwt_admin_token_without_expiration_error(Config) ->
     assert_jwt_rejected(Config, maps:remove(exp, valid_claims()), <<"key-a">>).
@@ -1601,8 +1630,14 @@ random_request_id() ->
     binary:encode_hex(crypto:strong_rand_bytes(8), lowercase).
 
 jwt_listener_opts(Opts) ->
+    jwt_listener_opts(Opts, undefined).
+
+jwt_listener_opts(Opts, EcPem) ->
+    EcKeys = [#{kid => <<"ec">>, algorithm => es256, secret => {value, EcPem}}
+              || EcPem =/= undefined],
     JwtOpts = #{keys => [#{kid => <<"a">>, algorithm => hs256, secret => {value, <<"key-a">>}},
-                         #{kid => <<"b">>, algorithm => hs256, secret => {value, <<"key-b">>}}],
+                         #{kid => <<"b">>, algorithm => hs256, secret => {value, <<"key-b">>}}
+                         | EcKeys],
                 issuer => <<"issuer">>,
                 audience => <<"mim">>,
                 domain_key => <<"domain">>},
@@ -1637,6 +1672,24 @@ make_token(Alg, Sha, Kid, Claims, Key) ->
                         case Kid of undefined -> #{}; _ -> #{kid => Kid} end),
     Input = <<(b64(jiffy:encode(Header)))/binary, ".", (b64(jiffy:encode(Claims)))/binary>>,
     <<Input/binary, ".", (b64(crypto:mac(hmac, Sha, Key, Input)))/binary>>.
+
+%% JWS uses R || S, each 32 bytes for P-256 (RFC 7518, section 3.4)
+make_es256_token(Claims, EcKey, SigFormat) ->
+    Header = #{alg => <<"ES256">>, typ => <<"JWT">>, kid => <<"ec">>},
+    Input = <<(b64(jiffy:encode(Header)))/binary, ".", (b64(jiffy:encode(Claims)))/binary>>,
+    Der = public_key:sign(Input, sha256, EcKey),
+    Sig = case SigFormat of
+              der ->
+                  Der;
+              raw ->
+                  {'ECDSA-Sig-Value', R, S} = public_key:der_decode('ECDSA-Sig-Value', Der),
+                  <<R:32/unit:8, S:32/unit:8>>
+          end,
+    <<Input/binary, ".", (b64(Sig))/binary>>.
+
+ec_public_pem({'ECPrivateKey', _, _, Params, Pub, _}) ->
+    Entry = public_key:pem_entry_encode('SubjectPublicKeyInfo', {{'ECPoint', Pub}, Params}),
+    public_key:pem_encode([Entry]).
 
 b64(Bin) ->
     base64:encode(Bin, #{mode => urlsafe, padding => false}).
