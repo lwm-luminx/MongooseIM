@@ -24,7 +24,9 @@ type StanzaAdminSubscription @protected{
   """
   Subscribe for the given user's incoming messages.
   The subscription opens a session with the given resource, or with a random one if it is not provided.
-  A resource that is already in use is not taken over.
+  A resource that is already in use is not taken over, but a client that binds the same resource
+  later takes over the session, which ends the subscription. Kicking the session or removing the user
+  ends it too.
   """
   subscribeForMessages(caller: JID!, resource: ResourceName): StanzaMap
     @protected(type: DOMAIN, args: ["caller"])

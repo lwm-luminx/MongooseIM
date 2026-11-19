@@ -57,7 +57,9 @@ admin_sse_cases() ->
      admin_subscribe_for_messages_with_resource_in_use,
      admin_subscribe_for_messages_to_unknown_user,
      admin_subscription_closed_on_kick,
-     admin_subscription_closed_on_user_removal].
+     admin_subscription_closed_on_user_removal,
+     admin_subscription_replaced_by_client_session,
+     admin_subscription_leaves_rooms_on_close].
 
 admin_mam_cases() ->
     [admin_get_last_messages,
@@ -236,6 +238,50 @@ admin_subscription_closed_on_user_removal(Config) ->
     {ok, _} = rpc(mongoose_account_api, unregister_user, [LUser, LServer]),
     assert_sse_closed(Stream),
     ?assertEqual([], rpc(ejabberd_sm, get_user_resources, [jid:from_binary(BobJid)])).
+
+%% A client binding the same resource takes over the subscription's session
+admin_subscription_replaced_by_client_session(Config) ->
+    Config1 = escalus_fresh:create_users(Config, [{bob, 1}]),
+    BobJid = escalus_users:get_jid(Config1, bob),
+    Resource = <<"res1">>, % the resource that escalus uses for Bob
+    {200, Stream} = subscribe_for_messages(BobJid, Resource, Config1),
+    [_] = wait_for_sse_session(BobJid),
+    {ok, Bob} = escalus_client:start(Config1, bob, Resource),
+    assert_sse_closed(Stream),
+    escalus_client:send(Bob, escalus_stanza:chat_to(escalus_client:full_jid(Bob), <<"Hi!">>)),
+    escalus:assert(is_chat_message, [<<"Hi!">>], escalus:wait_for_stanza(Bob)),
+    escalus_client:stop(Config1, Bob).
+
+%% Rooms entered with the GraphQL API from the subscription's session are left when it closes,
+%% so the user doesn't stay in them as an occupant without a session
+admin_subscription_leaves_rooms_on_close(Config) ->
+    muc_helper:load_muc(),
+    try
+        escalus:fresh_story_with_config(Config, [{alice, 1}, {bob, 1}],
+                                        fun admin_subscription_leaves_rooms_on_close_story/3)
+    after
+        muc_helper:unload_muc()
+    end.
+
+admin_subscription_leaves_rooms_on_close_story(Config, Alice, Bob) ->
+    RoomJID = jid:make_bare(muc_helper:fresh_room_name(), muc_helper:muc_host()),
+    AliceJid = jid:from_binary(escalus_client:full_jid(Alice)),
+    {ok, _} = rpc(mod_muc_api, create_instant_room, [RoomJID, AliceJid, <<"ali">>]),
+    BobJid = escalus_client:short_jid(Bob),
+    {200, Stream} = subscribe_for_messages(BobJid, <<"sse-res">>, Config),
+    SessionJid = jid:replace_resource(jid:from_binary(BobJid), <<"sse-res">>),
+    wait_helper:wait_until(fun() -> rpc(ejabberd_sm, get_session_pid, [SessionJid]) =/= none end,
+                           true, #{name => sse_session_opened}),
+    rpc(mod_muc_api, enter_room, [jid:replace_resource(RoomJID, <<"bobek">>), SessionJid, undefined]),
+    wait_helper:wait_until(fun() -> is_room_occupant(RoomJID, SessionJid) end, true,
+                           #{name => sse_user_entered_room}),
+    sse_helper:stop_sse(Stream),
+    wait_helper:wait_until(fun() -> is_room_occupant(RoomJID, SessionJid) end, false,
+                           #{name => sse_user_left_room}).
+
+is_room_occupant(RoomJID, UserJid) ->
+    {ok, Users} = rpc(mod_muc_api, get_room_users, [RoomJID]),
+    lists:any(fun(#{jid := Jid}) -> Jid =:= UserJid end, Users).
 
 wait_for_sse_session(BareJid) ->
     Jid = jid:from_binary(BareJid),

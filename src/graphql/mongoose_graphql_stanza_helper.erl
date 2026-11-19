@@ -37,6 +37,9 @@ handle_event({route, Acc}) ->
 handle_event({message, Dir, {UserPid, Jid}, Stanza}) ->
     Timestamp = os:system_time(microsecond),
     trace_result(Timestamp, UserPid, Jid, Dir, Stanza);
+handle_event({mongoose_stanza_api, room_presence, Action, RoomJID}) ->
+    mongoose_stanza_api:handle_room_presence(Action, RoomJID),
+    {ok, null};
 handle_event({'$gen_cast', {exit, Reason}}) ->
     %% ejabberd_sm ends a session with mongoose_c2s:exit/2, e.g. when the session is kicked,
     %% the user is removed or another session takes over the resource.
