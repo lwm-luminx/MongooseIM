@@ -244,6 +244,7 @@ handle_room_presence(Action, RoomJID) ->
     ok.
 
 leave_rooms(Jid) ->
+    ?LOG_ERROR(#{what => debug_sse_leave_rooms, jid => Jid, rooms => get_rooms()}),
     [mod_muc_api:exit_room(RoomJID, Jid) || RoomJID <- maps:values(get_rooms())],
     erase(?ROOMS_KEY),
     ok.

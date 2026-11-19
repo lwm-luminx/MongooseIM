@@ -344,6 +344,9 @@ admin_subscription_leaves_rooms_on_close_story(Config, Alice, Bob) ->
     wait_helper:wait_until(fun() -> session_rooms(SessionJid) end, [RoomJID],
                            #{name => sse_session_tracks_room}),
     sse_helper:stop_sse(Stream),
+    wait_helper:wait_until(fun() -> rpc(ejabberd_sm, get_session_pid, [SessionJid]) end, none,
+                           #{name => sse_session_closed}),
+    ct:log("DEBUG room users after close: ~p", [rpc(mod_muc_api, get_room_users, [RoomJID])]),
     wait_helper:wait_until(fun() -> is_room_occupant(RoomJID, SessionJid) end, false,
                            #{name => sse_user_left_room}).
 
