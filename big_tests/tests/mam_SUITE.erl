@@ -2626,12 +2626,17 @@ moderate_muc_message(Config) ->
         %% ... and the room archive has a tombstone in place of the message,
         %% followed by the moderation message, for clients catching up later
         escalus:send(Bob, stanza_to_room(stanza_archive_request(P, <<"q1">>), Room)),
-        [ArcMsg, ArcModeration] = respond_messages(assert_respond_size(2, wait_archive_respond(Bob))),
-        #forwarded_message{message_children = ModerationChildren} =
-            parse_forwarded_message(ArcModeration),
-        ?assert(lists:any(fun(El) -> exml_query:attr(El, <<"xmlns">>) =:= <<"urn:xmpp:message-retract:1">>
-                          end, ModerationChildren)),
-        Parsed = parse_forwarded_message(ArcMsg),
+        ArcMsgs = [parse_forwarded_message(M)
+                   || M <- respond_messages(wait_archive_respond(Bob))],
+        ct:log("Room archive after moderation: ~p", [ArcMsgs]),
+        %% The original message, now a tombstone, keeps its stanza ID
+        [Parsed] = [M || M = #forwarded_message{result_id = Id} <- ArcMsgs, Id =:= StanzaId],
+        %% The room archived exactly one moderation message, after the original one
+        IsModeration = fun(#forwarded_message{message_children = Children}) ->
+                               lists:any(fun(El) -> is_retract_element(El) end, Children)
+                       end,
+        [_ArcModeration] = [M || M = #forwarded_message{result_id = Id} <- ArcMsgs,
+                                 Id =/= StanzaId, IsModeration(M)],
         case message_retraction_is_enabled(Config) of
             true ->
                 #forwarded_message{message_body = undefined,
@@ -4489,6 +4494,10 @@ moderate_iq(RoomAddr, StanzaId, Reason) ->
                                          attrs = #{<<"xmlns">> => <<"urn:xmpp:message-retract:1">>}}
                                   | ReasonEls]},
     escalus_stanza:to(escalus_stanza:iq(<<"set">>, [Moderate]), RoomAddr).
+
+is_retract_element(El) ->
+    exml_query:attr(El, <<"xmlns">>) =:= <<"urn:xmpp:message-retract:1">>
+        andalso El#xmlel.name =:= <<"retract">>.
 
 assert_moderation_message(Msg, RoomAddr, StanzaId, ModeratorJID, Reason) ->
     escalus:assert(is_message, Msg),
