@@ -140,24 +140,29 @@ blocking_push_to_resources(Action, JIDs, StateData) ->
     ok.
 
 -spec blocking_presence_to_contacts(blocking_type(), [binary()], mongoose_c2s:data()) -> ok.
-blocking_presence_to_contacts(_Action, [], _StateData) -> ok;
-blocking_presence_to_contacts(Action, [Jid | JIDs], StateData) ->
+blocking_presence_to_contacts(Action, JIDs, StateData) ->
     Presences = mod_presence:maybe_get_handler(StateData),
-    Pres = case Action of
-               block ->
-                   mod_presence:presence_unavailable_stanza();
-               unblock ->
-                   mod_presence:get(Presences, last)
-           end,
-    T = jid:from_binary(Jid),
-    case mod_presence:is_subscribed_to_my_presence(T, jid:to_bare(T), Presences) of
-        true ->
-            F = jid:to_bare(mongoose_c2s:get_jid(StateData)),
-            mongoose_router:route(mongoose_acc:new(F, T, Pres, ?LOCATION));
-        false ->
+    case presence_for_contacts(Action, Presences) of
+        undefined ->
+            %% The session has no current presence (it never sent one, or went unavailable),
+            %% so there is nothing to restore for the unblocked contacts
+            ok;
+        Pres ->
+            %% Presence comes from the session's full JID, so the contacts' clients
+            %% update this resource (XEP-0191, sections 3.3 and 3.4)
+            F = mongoose_c2s:get_jid(StateData),
+            [mongoose_router:route(mongoose_acc:new(F, T, Pres, ?LOCATION))
+             || Jid <- JIDs,
+                T <- [jid:from_binary(Jid)],
+                T =/= error,
+                mod_presence:is_subscribed_to_my_presence(T, jid:to_bare(T), Presences)],
             ok
-    end,
-    blocking_presence_to_contacts(Action, JIDs, StateData).
+    end.
+
+presence_for_contacts(block, _Presences) ->
+    mod_presence:presence_unavailable_stanza();
+presence_for_contacts(unblock, Presences) ->
+    mod_presence:get(Presences, last).
 
 -spec disco_local_features(mongoose_disco:feature_acc(), map(), map()) ->
     {ok, mongoose_disco:feature_acc()}.

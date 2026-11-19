@@ -39,6 +39,11 @@ domain_admin_groups() ->
 admin_blocking_tests() ->
     [admin_block_and_unblock,
      admin_block_with_session,
+     admin_block_notifies_contacts,
+     admin_unblock_when_unavailable,
+     admin_block_domain_jid,
+     admin_block_self,
+     admin_block_invalid_jid,
      admin_unblock_not_blocked,
      admin_block_without_jids,
      admin_blocking_nonexisting_user].
@@ -137,6 +142,74 @@ admin_block_with_session_story(Config, Alice, Bob) ->
     ?assert(mod_blocking_SUITE:is_xep191_push(<<"unblock">>, [BobJid], Push2)),
     escalus:send(Bob, escalus_stanza:chat_to(Alice, <<"Hi again!">>)),
     escalus:assert(is_chat_message, [<<"Hi again!">>], escalus:wait_for_stanza(Alice)).
+
+%% XEP-0191 3.3 and 3.4: contacts subscribed to the user's presence get unavailable
+%% when blocked and the current presence when unblocked, from the user's full JID
+admin_block_notifies_contacts(Config) ->
+    escalus:fresh_story_with_config(Config, [{alice, 1}, {bob, 1}],
+                                    fun admin_block_notifies_contacts_story/3).
+
+admin_block_notifies_contacts_story(Config, Alice, Bob) ->
+    mod_blocking_SUITE:subscribe(Bob, Alice),
+    AliceFullJid = escalus_client:full_jid(Alice),
+    BobJid = escalus_utils:jid_to_lower(escalus_client:short_jid(Bob)),
+    block(Alice, [BobJid], Config),
+    ?assert(mod_blocking_SUITE:is_xep191_push(<<"block">>, [BobJid], escalus:wait_for_stanza(Alice))),
+    Unavailable = escalus:wait_for_stanza(Bob),
+    escalus:assert(is_presence_with_type, [<<"unavailable">>], Unavailable),
+    escalus:assert(is_stanza_from, [AliceFullJid], Unavailable),
+
+    unblock(Alice, [BobJid], Config),
+    ?assert(mod_blocking_SUITE:is_xep191_push(<<"unblock">>, [BobJid], escalus:wait_for_stanza(Alice))),
+    Available = escalus:wait_for_stanza(Bob),
+    escalus:assert(is_presence_with_type, [<<"available">>], Available),
+    escalus:assert(is_stanza_from, [AliceFullJid], Available).
+
+%% A session that went unavailable has no presence to restore, and must not crash
+admin_unblock_when_unavailable(Config) ->
+    escalus:fresh_story_with_config(Config, [{alice, 1}, {bob, 1}],
+                                    fun admin_unblock_when_unavailable_story/3).
+
+admin_unblock_when_unavailable_story(Config, Alice, Bob) ->
+    mod_blocking_SUITE:subscribe(Bob, Alice),
+    BobJid = escalus_utils:jid_to_lower(escalus_client:short_jid(Bob)),
+    escalus:send(Alice, escalus_stanza:presence(<<"unavailable">>)),
+    escalus:assert(is_presence_with_type, [<<"unavailable">>], escalus:wait_for_stanza(Bob)),
+    escalus_client:wait_for_stanzas(Alice, 1, 500), % own unavailable presence, if any
+    block(Alice, [BobJid], Config),
+    ?assert(mod_blocking_SUITE:is_xep191_push(<<"block">>, [BobJid], escalus:wait_for_stanza(Alice))),
+    escalus_client:wait_for_stanzas(Bob, 1, 500), % repeated unavailable, if any
+    unblock(Alice, [BobJid], Config),
+    ?assert(mod_blocking_SUITE:is_xep191_push(<<"unblock">>, [BobJid], escalus:wait_for_stanza(Alice))),
+    %% Alice's session is still alive, and Bob doesn't see her as available
+    escalus:send(Alice, mod_blocking_SUITE:get_blocklist_stanza()),
+    escalus:assert(is_iq_result, escalus:wait_for_stanza(Alice)),
+    escalus_assert:has_no_stanzas(Bob).
+
+%% XEP-0191 allows blocking whole domains
+admin_block_domain_jid(Config) ->
+    Config1 = escalus_fresh:create_users(Config, [{alice, 1}]),
+    Alice = escalus_users:get_jid(Config1, alice),
+    Domain = <<"spam.example">>,
+    ?assertEqual([Domain], get_ok_value([data, blocking, block], block(Alice, [Domain], Config1))),
+    ?assertEqual([Domain], get_ok_value([data, blocking, getBlockingList],
+                                        get_blocking_list(Alice, Config1))),
+    ?assertEqual([Domain], get_ok_value([data, blocking, unblock], unblock(Alice, [Domain], Config1))),
+    ?assertEqual([], get_ok_value([data, blocking, getBlockingList],
+                                  get_blocking_list(Alice, Config1))).
+
+admin_block_self(Config) ->
+    Config1 = escalus_fresh:create_users(Config, [{alice, 1}]),
+    Alice = escalus_users:get_jid(Config1, alice),
+    ?assertEqual(<<"bad_request">>, get_err_code(block(Alice, [<<Alice/binary, "/res">>], Config1))),
+    ?assertEqual([], get_ok_value([data, blocking, getBlockingList],
+                                  get_blocking_list(Alice, Config1))).
+
+admin_block_invalid_jid(Config) ->
+    Config1 = escalus_fresh:create_users(Config, [{alice, 1}]),
+    Alice = escalus_users:get_jid(Config1, alice),
+    ?assertEqual(<<"bad_request">>, get_err_code(block(Alice, [<<"@">>], Config1))),
+    ?assertEqual(<<"bad_request">>, get_err_code(unblock(Alice, [<<"@">>], Config1))).
 
 admin_unblock_not_blocked(Config) ->
     Config1 = escalus_fresh:create_users(Config, [{alice, 1}]),
