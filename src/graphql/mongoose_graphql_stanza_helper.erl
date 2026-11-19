@@ -23,13 +23,14 @@ get_last_messages(Caller, Limit, With, Before, CheckUser) ->
             Error
     end.
 
--spec handle_event(term()) -> {ok, map() | null}.
+-spec handle_event(term()) -> {ok, map() | null} | {ok, null, [{stream, close}]}.
 handle_event(Event) ->
     handle_event(Event, #{presences => false}).
 
 %% @doc Converts an event for a subscription stream. Messages are always passed,
 %% and presences only when requested.
--spec handle_event(term(), #{presences := boolean()}) -> {ok, map() | null}.
+-spec handle_event(term(), #{presences := boolean()}) ->
+          {ok, map() | null} | {ok, null, [{stream, close}]}.
 handle_event({route, Acc}, #{presences := Presences}) ->
     {From, _To, Packet} = mongoose_acc:packet(Acc),
     case Packet of
@@ -51,6 +52,15 @@ route_result(From, Stanza) ->
 handle_other_event({message, Dir, {UserPid, Jid}, Stanza}) ->
     Timestamp = os:system_time(microsecond),
     trace_result(Timestamp, UserPid, Jid, Dir, Stanza);
+handle_other_event({mongoose_stanza_api, room_presence, Action, RoomJID}) ->
+    mongoose_stanza_api:handle_room_presence(Action, RoomJID),
+    {ok, null};
+handle_other_event({'$gen_cast', {exit, Reason}}) ->
+    %% ejabberd_sm ends a session with mongoose_c2s:exit/2, e.g. when the session is kicked,
+    %% the user is removed or another session takes over the resource.
+    %% Closing the stream runs 'terminate', which closes the session.
+    ?LOG_INFO(#{what => graphql_sse_session_terminated, reason => Reason}),
+    {ok, null, [{stream, close}]};
 handle_other_event(Msg) ->
     ?UNEXPECTED_INFO(Msg),
     {ok, null}.

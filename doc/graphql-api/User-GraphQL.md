@@ -9,7 +9,7 @@ The new GraphQL user API contains all commands from the client REST API and prov
 The `stanza.subscribeForMessages` subscription opens an XMPP session for the user, which lasts as long as the SSE connection.
 By default, the session has a random resource. Pass the `resource` argument to choose it, so that the session can be addressed with a known full JID.
 For example, after subscribing with `resource: "web"`, you can join a room with `muc.enterRoom(room: ..., nick: ..., resource: "web")`,
-and the room's messages are delivered to the subscription. Leave the room with `muc.exitRoom` before closing the subscription, because closing it doesn't send an unavailable presence. If the resource is already in use by another session, the subscription returns the `resource_conflict` error.
+and the room's messages are delivered to the subscription. Rooms entered this way are left automatically when the subscription ends. If the resource is already in use by another session, the subscription returns the `resource_conflict` error. A client that binds the same resource later takes over the session and ends the subscription, as do kicking the session and removing the user.
 Only messages are streamed by default. Pass `presences: true` to also receive the presences sent to the session, e.g. the presences of the room occupants after `muc.enterRoom`.
 
 ## Authentication
