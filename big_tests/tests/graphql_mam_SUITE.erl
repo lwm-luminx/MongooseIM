@@ -18,6 +18,7 @@
 %% Messages are archived at these dates, and deleted before the cut-off date
 -define(DATES, [{{2020, 1, 1}, {10, 0, 0}}, {{2020, 1, 3}, {10, 0, 0}}, {{2020, 1, 5}, {10, 0, 0}}]).
 -define(BEFORE, <<"2020-01-04T00:00:00Z">>).
+-define(FAR_FUTURE, <<"9999-12-31T23:59:59Z">>).
 
 suite() ->
     require_rpc_nodes([mim]) ++ escalus:suite().
@@ -50,6 +51,10 @@ admin_mam_tests() ->
      delete_old_room_messages,
      delete_user_messages,
      delete_old_messages,
+     delete_user_messages_before_1970,
+     delete_user_messages_far_future,
+     delete_room_messages_far_future,
+     delete_user_messages_flushes_async_writer,
      delete_room_messages_unknown_muc_server,
      delete_old_room_messages_unknown_muc_server,
      delete_user_messages_unknown_domain,
@@ -96,7 +101,8 @@ init_per_group(GroupName, Config) when GroupName =:= admin_mam;
     MAMOpts = mam_helper:config_opts(
                 #{pm => #{},
                   muc => #{host => subhost_pattern(muc_helper:muc_host_pattern())},
-                  async_writer => #{enabled => false}}),
+                  %% Long enough that messages are still buffered when they are deleted
+                  async_writer => #{flush_interval => 5000}}),
     dynamic_modules:ensure_modules(host_type(), [{mod_mam, MAMOpts}]),
     Config;
 init_per_group(GroupName, Config) when GroupName =:= admin_mam_not_configured;
@@ -169,6 +175,49 @@ delete_old_messages_story(Config, Alice, Bob) ->
     ?assert(get_ok_value(?OLD_DELETE_PATH, Res) >= 4),
     ?assertEqual(1, archive_size(Alice)),
     ?assertEqual(1, archive_size(Bob)).
+
+delete_user_messages_before_1970(Config) ->
+    escalus:fresh_story_with_config(Config, [{alice, 1}, {bob, 1}],
+                                    fun delete_user_messages_before_1970_story/3).
+
+delete_user_messages_before_1970_story(Config, Alice, Bob) ->
+    put_msgs(Alice, Bob),
+    Res = delete_user_messages(escalus_client:short_jid(Alice), <<"1969-12-31T23:59:59Z">>, Config),
+    ?assertEqual(0, get_ok_value(?USER_DELETE_PATH, Res)),
+    ?assertEqual(3, archive_size(Alice)).
+
+%% A date after the largest message ID (in the year 4253) deletes everything
+delete_user_messages_far_future(Config) ->
+    escalus:fresh_story_with_config(Config, [{alice, 1}, {bob, 1}],
+                                    fun delete_user_messages_far_future_story/3).
+
+delete_user_messages_far_future_story(Config, Alice, Bob) ->
+    put_msgs(Alice, Bob),
+    Res = delete_user_messages(escalus_client:short_jid(Alice), ?FAR_FUTURE, Config),
+    ?assertEqual(3, get_ok_value(?USER_DELETE_PATH, Res)),
+    ?assertEqual(0, archive_size(Alice)),
+    ?assertEqual(3, archive_size(Bob)).
+
+delete_room_messages_far_future(Config) ->
+    Room = fresh_room_name(),
+    put_room_msgs(Room),
+    Res = delete_room_messages(room_jid(Room), ?FAR_FUTURE, Config),
+    ?assertEqual(3, get_ok_value(?ROOM_DELETE_PATH, Res)),
+    ?assertEqual(0, room_archive_size(Room)).
+
+%% A message sent just now is still in the async writer's buffer, and is deleted too
+delete_user_messages_flushes_async_writer(Config) ->
+    escalus:fresh_story_with_config(Config, [{alice, 1}, {bob, 1}],
+                                    fun delete_user_messages_flushes_async_writer_story/3).
+
+delete_user_messages_flushes_async_writer_story(Config, Alice, Bob) ->
+    escalus:send(Alice, escalus_stanza:chat_to(Bob, <<"Hi">>)),
+    escalus:assert(is_chat_message, [<<"Hi">>], escalus:wait_for_stanza(Bob)),
+    Res = delete_user_messages(escalus_client:short_jid(Alice), ?FAR_FUTURE, Config),
+    ?assertEqual(1, get_ok_value(?USER_DELETE_PATH, Res)),
+    %% Nothing is written after the deletion, once the flush interval has passed
+    timer:sleep(6000),
+    ?assertEqual(0, archive_size(Alice)).
 
 delete_room_messages_unknown_muc_server(Config) ->
     Res = delete_room_messages(<<"room@unknown.muc.server">>, ?BEFORE, Config),

@@ -3,15 +3,15 @@ Allow admin to manage message archives (XEP-0313).
 """
 type MAMAdminMutation @protected{
   "Delete messages archived before the given date from a MUC room's archive. Returns the number of deleted messages"
-  deleteRoomMessages(room: BareJID!, before: DateTime!): Int
+  deleteRoomMessages(room: BareJID!, before: DateTime!): SafeInt
     @protected(type: DOMAIN, args: ["room"]) @use(modules: ["mod_mam_muc"], args: ["room"])
   "Delete messages archived before the given date from the archives of all rooms of a MUC service. Returns the number of deleted messages"
-  deleteOldRoomMessages(mucDomain: DomainName!, before: DateTime!): Int
+  deleteOldRoomMessages(mucDomain: DomainName!, before: DateTime!): SafeInt
     @protected(type: DOMAIN, args: ["mucDomain"]) @use(modules: ["mod_mam_muc"], args: ["mucDomain"])
   "Delete messages archived before the given date from a user's one-to-one archive. Returns the number of deleted messages"
-  deleteUserMessages(user: JID!, before: DateTime!): Int
+  deleteUserMessages(user: BareJID!, before: DateTime!): SafeInt
     @protected(type: DOMAIN, args: ["user"]) @use(modules: ["mod_mam_pm"], args: ["user"])
   "Delete messages archived before the given date from the one-to-one archives of all users of a domain. Returns the number of deleted messages"
-  deleteOldMessages(domain: DomainName!, before: DateTime!): Int
+  deleteOldMessages(domain: DomainName!, before: DateTime!): SafeInt
     @protected(type: DOMAIN, args: ["domain"]) @use(modules: ["mod_mam_pm"], args: ["domain"])
 }

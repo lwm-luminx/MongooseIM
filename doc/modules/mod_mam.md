@@ -77,6 +77,8 @@ The same commands are available in `mongooseimctl` as `mam deleteRoomMessages` a
 Unlike [message retraction](#message-retraction), which keeps a tombstone in place of the retracted message, these commands remove the messages from the database.
 Only the `rdbms` backend supports them; with other backends they return a `not_supported` error.
 Large deletions can be split into batches with [`delete_domain_limit`](#modulesmod_mamdelete_domain_limit).
+Messages still buffered by the [asynchronous writer](#modulesmod_mamasync_writerenabled) are written to the database before the deletion, so they are deleted too.
+These commands only delete from the archive. Copies kept elsewhere are not affected: the last message of each conversation in [`mod_inbox`](mod_inbox.md), and the recent history that a running MUC room keeps in memory and sends to occupants who join (until the room stops or the history is full).
 
 ## Options
 
