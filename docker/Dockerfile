@@ -26,9 +26,14 @@ LABEL org.opencontainers.image.source="https://github.com/lwm-luminx/MongooseIM"
 RUN apt-get update \
  && apt-get install -y --no-install-recommends unixodbc zlib1g libexpat1 ca-certificates \
  && rm -rf /var/lib/apt/lists/*
-COPY --from=build /mongooseim /usr/lib/mongooseim
+# Runs as an unprivileged user that owns the release, so the node can write its logs,
+# Mnesia directory and rendered config, but nothing else on the system
+RUN groupadd --system mongooseim \
+ && useradd --system --gid mongooseim --home-dir /usr/lib/mongooseim --shell /usr/sbin/nologin mongooseim
+COPY --from=build --chown=mongooseim:mongooseim /mongooseim /usr/lib/mongooseim
 RUN ln -s /usr/lib/mongooseim/bin/mongooseimctl /usr/bin/mongooseimctl
 WORKDIR /usr/lib/mongooseim
+USER mongooseim
 # 5222 c2s, 5269 s2s, 5280 BOSH/WebSocket, 5285 user GraphQL, 5551 admin GraphQL, 8888 components
 EXPOSE 4369 5222 5269 5280 5285 5551 8888
 CMD ["/usr/lib/mongooseim/bin/mongooseim", "foreground"]
