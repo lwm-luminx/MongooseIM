@@ -885,6 +885,7 @@ auth_jwt(_Config) ->
     ?cfgh([auth, jwt, algorithm], es384,
           auth_raw(<<"jwt">>, Opts#{<<"algorithm">> := <<"ES384">>})),
     ?errh(auth_raw(<<"jwt">>, Opts#{<<"secret">> := #{<<"value">> => 123}})),
+    ?errh(auth_raw(<<"jwt">>, Opts#{<<"secret">> := #{<<"value">> => <<>>}})),
     ?errh(auth_raw(<<"jwt">>, Opts#{<<"secret">> := #{<<"file">> => <<>>}})),
     ?errh(auth_raw(<<"jwt">>, Opts#{<<"secret">> := #{<<"env">> => <<>>}})),
     ?errh(auth_raw(<<"jwt">>, Opts#{<<"secret">> := #{<<"file">> => <<"/jwt_secret">>,

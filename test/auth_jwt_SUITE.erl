@@ -15,13 +15,14 @@
 %%--------------------------------------------------------------------
 
 all() ->
-    [{group, generic}, {group, public_key}, {group, multiple_keys}, {group, claims},
-     {group, env_secret}].
+    [{group, generic}, {group, public_key}, {group, ecdsa}, {group, multiple_keys},
+     {group, claims}, {group, env_secret}].
 
 groups() ->
     [
      {generic, [parallel], generic_tests()},
      {public_key, [], public_key_tests()},
+     {ecdsa, [], ecdsa_tests()},
      {multiple_keys, [parallel], multiple_keys_tests()},
      {claims, [parallel], claims_tests()},
      {env_secret, [], env_secret_tests()}
@@ -32,6 +33,9 @@ generic_tests() ->
      check_password_succeeds_for_correct_token,
      check_password_fails_for_wrong_token,
      check_password_fails_for_correct_token_but_wrong_username,
+     check_password_fails_for_expired_token,
+     check_password_fails_without_expiration,
+     check_password_fails_for_other_algorithm,
      authorize,
      does_user_exist,
      remove_user_returns_ok,
@@ -40,7 +44,14 @@ generic_tests() ->
 
 public_key_tests() ->
     [
-     check_password_succeeds_for_pubkey_signed_token
+     check_password_succeeds_for_pubkey_signed_token,
+     check_password_fails_for_hmac_token_signed_with_public_key
+    ].
+
+ecdsa_tests() ->
+    [
+     check_password_succeeds_for_ecdsa_signed_token,
+     check_password_fails_for_der_encoded_ecdsa_signature
     ].
 
 multiple_keys_tests() ->
@@ -48,6 +59,7 @@ multiple_keys_tests() ->
      check_password_succeeds_for_any_key_without_kid,
      check_password_uses_key_with_matching_kid,
      check_password_fails_for_unknown_kid,
+     check_password_fails_for_non_string_kid,
      check_password_fails_for_unknown_key,
      check_password_fails_for_malformed_token
     ].
@@ -65,7 +77,8 @@ claims_tests() ->
 env_secret_tests() ->
     [
      check_password_reads_secret_from_env,
-     check_password_fails_when_env_var_is_not_set
+     check_password_fails_when_env_var_is_not_set,
+     check_password_fails_when_env_var_is_empty
     ].
 
 suite() ->
@@ -92,9 +105,20 @@ init_per_group(public_key, Config) ->
     PrivkeyPath = filename:join([Root, "tools", "ssl", "mongooseim", "privkey.pem"]),
     PubkeyPath = filename:join([Root, "tools", "ssl", "mongooseim", "pubkey.pem"]),
     {ok, PrivKey} = file:read_file(PrivkeyPath),
+    {ok, PubKey} = file:read_file(PubkeyPath),
     set_auth_opts({file, PubkeyPath}, rs256, bookingNumber),
     ok = ejabberd_auth_jwt:start(?HOST_TYPE),
-    [{priv_key, PrivKey} | Config];
+    [{priv_key, PrivKey}, {pub_key, PubKey} | Config];
+init_per_group(ecdsa, Config) ->
+    %% One key for each curve, with standard (R || S) signatures made here
+    Curves = [{<<"es256">>, es256, secp256r1}, {<<"es384">>, es384, secp384r1},
+              {<<"es512">>, es512, secp521r1}],
+    Keys = [{Kid, Alg, public_key:generate_key({namedCurve, Curve})} || {Kid, Alg, Curve} <- Curves],
+    set_jwt_opts(#{username_key => bookingNumber,
+                   keys => [#{kid => Kid, algorithm => Alg, secret => {value, ec_public_pem(Priv)}}
+                            || {Kid, Alg, Priv} <- Keys]}),
+    ok = ejabberd_auth_jwt:start(?HOST_TYPE),
+    [{ec_keys, Keys} | Config];
 init_per_group(multiple_keys, Config) ->
     set_jwt_opts(#{username_key => bookingNumber,
                    keys => [#{kid => <<"old">>, algorithm => hs256, secret => {value, ?OLD_KEY}},
@@ -136,8 +160,9 @@ check_password_succeeds_for_correct_token(_Config) ->
                                             generate_token(hs256, 0, ?JWT_KEY)).
 
 check_password_fails_for_wrong_token(_C) ->
+    %% Not valid for another hour, which is more than the allowed clock skew
     false = ejabberd_auth_jwt:check_password(?HOST_TYPE, ?USERNAME, ?DOMAIN,
-                                             generate_token(hs256, 60, ?JWT_KEY)).
+                                             generate_token(hs256, 3600, ?JWT_KEY)).
 
 check_password_fails_for_correct_token_but_wrong_username(_C) ->
     false = ejabberd_auth_jwt:check_password(?HOST_TYPE, ?WRONG_USERNAME, ?DOMAIN,
@@ -169,6 +194,34 @@ check_password_succeeds_for_pubkey_signed_token(C) ->
     Key = proplists:get_value(priv_key, C),
     true = ejabberd_auth_jwt:check_password(?HOST_TYPE, ?USERNAME, ?DOMAIN,
                                             generate_token(rs256, 0, Key)).
+
+check_password_fails_for_hmac_token_signed_with_public_key(C) ->
+    %% The public key is known to everyone, so it must not be accepted as an HMAC secret
+    PubKey = proplists:get_value(pub_key, C),
+    false = check_token(make_token(#{}, claims(), PubKey)).
+
+check_password_succeeds_for_ecdsa_signed_token(C) ->
+    [true = check_token(make_ecdsa_token(Kid, Alg, Priv, raw))
+     || {Kid, Alg, Priv} <- proplists:get_value(ec_keys, C)].
+
+check_password_fails_for_der_encoded_ecdsa_signature(C) ->
+    [false = check_token(make_ecdsa_token(Kid, Alg, Priv, der))
+     || {Kid, Alg, Priv} <- proplists:get_value(ec_keys, C)].
+
+check_password_fails_for_expired_token(_C) ->
+    Now = erlang:system_time(second),
+    false = check_token(make_token(#{}, (claims())#{exp => Now - 3600}, ?JWT_KEY)).
+
+check_password_fails_without_expiration(_C) ->
+    false = check_token(make_token(#{}, maps:remove(exp, claims()), ?JWT_KEY)).
+
+check_password_fails_for_other_algorithm(_C) ->
+    [false = check_token(make_token(#{alg => Alg}, claims(), ?JWT_KEY))
+     || Alg <- [<<"none">>, <<"HS512">>]].
+
+check_password_fails_for_non_string_kid(_C) ->
+    [false = check_token(make_token(#{kid => Kid}, claims(), ?NEW_KEY))
+     || Kid <- [123, null, [<<"new">>]]].
 
 check_password_succeeds_for_any_key_without_kid(_C) ->
     true = check_token(make_token(#{}, claims(), ?OLD_KEY)),
@@ -222,6 +275,14 @@ check_password_reads_secret_from_env(_C) ->
 check_password_fails_when_env_var_is_not_set(_C) ->
     false = check_token(generate_token(hs256, 0, ?JWT_KEY)).
 
+check_password_fails_when_env_var_is_empty(_C) ->
+    os:putenv("JWT_TEST_SECRET", ""),
+    try
+        false = check_token(make_token(#{}, claims(), <<>>))
+    after
+        os:unsetenv("JWT_TEST_SECRET")
+    end.
+
 %%--------------------------------------------------------------------
 %% Helpers
 %%--------------------------------------------------------------------
@@ -245,6 +306,30 @@ make_token(ExtraHeader, Claims, Key) ->
     Input = <<Header/binary, ".", Payload/binary>>,
     Signature = base64url(crypto:mac(hmac, sha256, Key, Input)),
     <<Input/binary, ".", Signature/binary>>.
+
+%% JWS uses R || S, each padded to the curve size (RFC 7518, section 3.4)
+make_ecdsa_token(Kid, Alg, Priv, SigFormat) ->
+    {Name, Digest, Size} = case Alg of
+                               es256 -> {<<"ES256">>, sha256, 32};
+                               es384 -> {<<"ES384">>, sha384, 48};
+                               es512 -> {<<"ES512">>, sha512, 66}
+                           end,
+    Header = base64url(jsx:encode(#{alg => Name, typ => <<"JWT">>, kid => Kid})),
+    Payload = base64url(jsx:encode(claims())),
+    Input = <<Header/binary, ".", Payload/binary>>,
+    Der = public_key:sign(Input, Digest, Priv),
+    Sig = case SigFormat of
+              der ->
+                  Der;
+              raw ->
+                  {'ECDSA-Sig-Value', R, S} = public_key:der_decode('ECDSA-Sig-Value', Der),
+                  <<R:Size/unit:8, S:Size/unit:8>>
+          end,
+    <<Input/binary, ".", (base64url(Sig))/binary>>.
+
+ec_public_pem({'ECPrivateKey', _, _, Params, Pub, _}) ->
+    Entry = public_key:pem_entry_encode('SubjectPublicKeyInfo', {{'ECPoint', Pub}, Params}),
+    public_key:pem_encode([Entry]).
 
 base64url(Bin) ->
     base64:encode(Bin, #{mode => urlsafe, padding => false}).

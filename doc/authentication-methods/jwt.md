@@ -7,12 +7,14 @@ A wide range of signature algorithms is supported, including those using public 
 
 The module checks the signature and validity of the following parameters:
 
-* `exp` - an expired token is rejected,
+* `exp` - a token without it, or an expired token, is rejected,
 * `iat` - a token must be issued in the past,
 * `nbf` - a token might not be valid *yet*.
 
-These claims are checked only when they are present in the token.
-A token without `exp` never expires, so make sure that your token issuer always sets it.
+`iat` and `nbf` are checked only when they are present in the token.
+The times allow for 60 seconds of difference between the clocks of the token issuer and MongooseIM.
+The `alg` header of the token has to name the algorithm configured for the key, so a token signed with any other algorithm (including `none`) is rejected.
+ECDSA signatures (`ES256`, `ES384` and `ES512`) use the standard JWS format, as described in [RFC 7518](https://www.rfc-editor.org/rfc/rfc7518#section-3.4).
 
 Optionally, the module can also check the issuer (`iss`), the audience (`aud`) and the domain of the user.
 Several keys can be configured at the same time, which makes it possible to rotate the signing keys without downtime.
@@ -30,8 +32,9 @@ It requires the `SASL PLAIN` mechanism listed in `sasl_mechanisms`.
 * **Example:** `secret.env = "JWT_SECRET"`
 
 This is the JWT secret used for the authentication. You can store it in a file, as an environment variable or specify it directly.
-For public key algorithms, it is the public key in the PEM format.
+For public key algorithms, it is the public key in the PEM format. A private key is rejected.
 A file is read when the module starts, while an environment variable is read for each authentication attempt.
+An empty secret is rejected, and an empty environment variable is treated as unset.
 
 ### `auth.jwt.algorithm`
 * **Syntax:** string, one of: `"HS256"`, `"RS256"`, `"ES256"`, `"HS384"`, `"RS384"`, `"ES384"`, `"HS512"`, `"RS512"`, `"ES512"`
@@ -50,6 +53,7 @@ Name of the algorithm used to sign the JWT.
 
 Additional keys used to verify the tokens. They are tried in order, after the key specified with `secret` and `algorithm` (if any).
 When the token header contains a `kid`, only the keys with the same `kid` and the keys without a `kid` are tried.
+A token whose `kid` is not a string is rejected.
 At least one key needs to be configured, either with `secret` or with `keys`.
 
 ### `auth.jwt.username_key`
