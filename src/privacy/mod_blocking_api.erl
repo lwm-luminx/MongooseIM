@@ -6,7 +6,7 @@
 -include("jlib.hrl").
 -include("mod_privacy.hrl").
 
--type error() :: {domain_not_found | user_not_found | internal, iodata()}.
+-type error() :: {domain_not_found | user_not_found | bad_request | internal, iodata()}.
 
 %% @doc Returns the JIDs blocked by the user.
 -spec get_blocking_list(jid:jid()) -> {ok, [jid:jid()]} | error().
@@ -14,7 +14,9 @@ get_blocking_list(User = #jid{luser = LUser, lserver = LServer}) ->
     maybe
         {ok, HostType} ?= get_host_type(User),
         {ok, List} ?= mod_blocking:get_blocking_list(HostType, LUser, LServer),
-        {ok, [jid:make_noprep(Value) || #listitem{value = Value} <- List]}
+        %% A "blocking" list written over XEP-0016 may hold group or subscription
+        %% items, which are not JIDs
+        {ok, [jid:make_noprep(Value) || #listitem{type = jid, value = Value} <- List]}
     else
         {error, _} -> internal_error();
         Error -> Error
@@ -23,7 +25,13 @@ get_blocking_list(User = #jid{luser = LUser, lserver = LServer}) ->
 %% @doc Blocks the given JIDs for the user. Returns the blocked JIDs.
 -spec block(jid:jid(), [jid:jid(), ...]) -> {ok, [jid:jid()]} | error().
 block(User, JIDs) ->
-    set_blocking_list(User, block, JIDs).
+    case lists:any(fun(JID) -> jid:are_bare_equal(User, JID) end, JIDs) of
+        true ->
+            %% Blocking one's own JID would also drop the blocking and roster pushes
+            {bad_request, <<"A user cannot block their own JID">>};
+        false ->
+            set_blocking_list(User, block, JIDs)
+    end.
 
 %% @doc Unblocks the given JIDs for the user. Returns the JIDs that were blocked before.
 -spec unblock(jid:jid(), [jid:jid(), ...]) -> {ok, [jid:jid()]} | error().
@@ -37,7 +45,7 @@ set_blocking_list(User = #jid{luser = LUser, lserver = LServer}, Type, JIDs) ->
     maybe
         {ok, HostType} ?= get_host_type(User),
         {ok, Changed} ?= mod_blocking:set_blocking_list(HostType, LUser, LServer, Type, BinJIDs),
-        {ok, [jid:from_binary(JID) || JID <- Changed]}
+        {ok, [JID || JID <- lists:map(fun jid:from_binary/1, Changed), JID =/= error]}
     else
         {error, _} -> internal_error();
         Error -> Error

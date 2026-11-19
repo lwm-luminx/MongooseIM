@@ -36,6 +36,7 @@ or with `mongooseimctl blocking`:
 
 The changes have the same effect as the blocking command sent by the user:
 the user's online resources receive the blocking push, and the presences of the affected contacts are updated.
+The JIDs to block or unblock can be bare domains (for example `spam.example`), and a user cannot be made to block their own JID.
 A domain admin can manage the blocking lists of the users in their domain.
 
 ## Options

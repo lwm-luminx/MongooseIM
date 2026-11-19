@@ -15,8 +15,23 @@ execute(_Ctx, blocking, <<"unblock">>, Args) ->
 
 set_blocking(_Fun, #{<<"user">> := User, <<"jids">> := []}) ->
     make_error(bad_request, <<"At least one JID is required">>, #{user => jid:to_binary(User)});
-set_blocking(Fun, #{<<"user">> := User, <<"jids">> := JIDs}) ->
-    case Fun(User, JIDs) of
-        {ok, Changed} -> {ok, [{ok, JID} || JID <- Changed]};
-        Error -> make_error(Error, #{user => jid:to_binary(User)})
+set_blocking(Fun, #{<<"user">> := User, <<"jids">> := BinJIDs}) ->
+    %% Domain JIDs are allowed here, so the JID scalar (which needs a local part) is not used
+    case parse_jids(BinJIDs) of
+        {ok, JIDs} ->
+            case Fun(User, JIDs) of
+                {ok, Changed} -> {ok, [{ok, JID} || JID <- Changed]};
+                Error -> make_error(Error, #{user => jid:to_binary(User)})
+            end;
+        {error, BinJID} ->
+            make_error(bad_request, <<"Invalid JID">>, #{user => jid:to_binary(User), jid => BinJID})
     end.
+
+parse_jids(BinJIDs) ->
+    lists:foldr(fun(_BinJID, {error, _} = Error) -> Error;
+                   (BinJID, {ok, Acc}) ->
+                        case jid:from_binary(BinJID) of
+                            error -> {error, BinJID};
+                            JID -> {ok, [JID | Acc]}
+                        end
+                end, {ok, []}, BinJIDs).
