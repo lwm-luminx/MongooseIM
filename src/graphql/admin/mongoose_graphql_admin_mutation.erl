@@ -19,6 +19,8 @@ execute(_Ctx, _Obj, <<"inbox">>, _Args) ->
     {ok, inbox};
 execute(_Ctx, _Obj, <<"last">>, _Args) ->
     {ok, last};
+execute(_Ctx, _Obj, <<"mam">>, _Args) ->
+    {ok, mam};
 execute(_Ctx, _Obj, <<"muc">>, _Args) ->
     {ok, muc};
 execute(_Ctx, _Obj, <<"muc_light">>, _Args) ->

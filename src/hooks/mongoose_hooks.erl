@@ -90,6 +90,7 @@
          mam_set_prefs/6,
          mam_get_prefs/4,
          mam_remove_archive/3,
+         mam_delete_messages/2,
          mam_lookup_messages/2,
          mam_archive_message/2,
          mam_archive_sync/1,
@@ -101,6 +102,7 @@
          mam_muc_set_prefs/6,
          mam_muc_get_prefs/4,
          mam_muc_remove_archive/3,
+         mam_muc_delete_messages/2,
          mam_muc_lookup_messages/2,
          mam_muc_archive_message/2,
          mam_muc_archive_sync/1,
@@ -963,6 +965,16 @@ mam_remove_archive(HostType, ArchiveID, Owner) ->
     Params = #{archive_id => ArchiveID, owner => Owner},
     run_hook_for_host_type(mam_remove_archive, HostType, ok, Params).
 
+%%% @doc The `mam_delete_messages' hook is called in order to delete one-to-one messages
+%%% archived before a given message ID, either from one user's archive or from all archives
+%%% of a domain. The result is `{error, not_supported}' if no archive backend handles it.
+-spec mam_delete_messages(HostType, Params) -> Result when
+      HostType :: mongooseim:host_type(),
+      Params :: mod_mam:delete_messages_params(),
+      Result :: {ok, non_neg_integer()} | {error, not_supported}.
+mam_delete_messages(HostType, Params) ->
+    run_hook_for_host_type(mam_delete_messages, HostType, {error, not_supported}, Params).
+
 %%% @doc The `mam_lookup_messages' hook is to retrieve
 %%% archived messages for given search parameters.
 -spec mam_lookup_messages(HostType, Params) -> Result when
@@ -1083,6 +1095,17 @@ mam_muc_get_prefs(HostType, DefaultMode, ArchiveID, Room) ->
 mam_muc_remove_archive(HostType, ArchiveID, Room) ->
     Params = #{archive_id => ArchiveID, room => Room},
     run_hook_for_host_type(mam_muc_remove_archive, HostType, ok, Params).
+
+%%% @doc The `mam_muc_delete_messages' hook is called in order to delete room messages
+%%% archived before a given message ID, either from one room's archive or from the archives
+%%% of all rooms of a MUC service. The result is `{error, not_supported}' if no archive
+%%% backend handles it.
+-spec mam_muc_delete_messages(HostType, Params) -> Result when
+      HostType :: mongooseim:host_type(),
+      Params :: mod_mam:delete_messages_params(),
+      Result :: {ok, non_neg_integer()} | {error, not_supported}.
+mam_muc_delete_messages(HostType, Params) ->
+    run_hook_for_host_type(mam_muc_delete_messages, HostType, {error, not_supported}, Params).
 
 %%% @doc The `mam_muc_lookup_messages' hook is to retrieve archived
 %%% MUC messages for any given search parameters.
