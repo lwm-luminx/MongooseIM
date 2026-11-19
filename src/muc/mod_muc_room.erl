@@ -165,6 +165,8 @@
         room_jid := jid:jid(),
         stanza_id := binary(),
         by := jid:jid(),
+        %% The moderator's occupant ID (XEP-0421), when the room has them
+        by_occupant_id => binary(),
         reason := binary() | undefined
        }.
 -export_type([moderate_message_params/0]).
@@ -2639,7 +2641,7 @@ process_iq_moderate(From, SubEl, StateData) ->
                 {ok, StanzaID, Reason} ->
                     {FromNick, _Role} = get_participant_data(From, StateData),
                     ByJID = jid:replace_resource(StateData#state.jid, FromNick),
-                    case moderate_message(ByJID, StanzaID, Reason, StateData) of
+                    case moderate_message(ByJID, From, StanzaID, Reason, StateData) of
                         {ok, NewStateData} ->
                             {ok, NewStateData};
                         {{error, item_not_found}, NewStateData} ->
@@ -2668,9 +2670,20 @@ parse_moderate_request(SubEl) ->
 
 -spec moderate_message(jid:jid(), binary(), binary() | undefined, state()) ->
     {ok | {error, item_not_found}, state()}.
-moderate_message(ByJID, StanzaID, Reason, StateData = #state{host_type = HostType,
-                                                             jid = RoomJID}) ->
-    Params = #{room_jid => RoomJID, stanza_id => StanzaID, by => ByJID, reason => Reason},
+moderate_message(ByJID, StanzaID, Reason, StateData) ->
+    moderate_message(ByJID, undefined, StanzaID, Reason, StateData).
+
+%% ModeratorJID is the moderator's real JID, or undefined when the room itself moderates
+-spec moderate_message(jid:jid(), jid:jid() | undefined, binary(), binary() | undefined,
+                       state()) ->
+    {ok | {error, item_not_found}, state()}.
+moderate_message(ByJID, ModeratorJID, StanzaID, Reason,
+                 StateData = #state{host_type = HostType, jid = RoomJID}) ->
+    Params0 = #{room_jid => RoomJID, stanza_id => StanzaID, by => ByJID, reason => Reason},
+    Params = case ModeratorJID =/= undefined andalso is_occupant_id_enabled(StateData) of
+                 true -> Params0#{by_occupant_id => occupant_id(ModeratorJID, StateData)};
+                 false -> Params0
+             end,
     InHistory = is_message_in_history(StanzaID, StateData),
     %% A message that is only in the room history (e.g. the room is not archived)
     %% can still be moderated there
@@ -2718,10 +2731,8 @@ broadcast_moderation(Params, StateData = #state{jid = RoomJID, host_type = HostT
                  end, StateData#state.users).
 
 -spec moderation_packet(moderate_message_params()) -> exml:element().
-moderation_packet(#{stanza_id := StanzaID, by := ByJID, reason := Reason}) ->
-    Moderated = #xmlel{name = <<"moderated">>,
-                       attrs = #{<<"xmlns">> => ?NS_MESSAGE_MODERATE,
-                                 <<"by">> => jid:to_binary(ByJID)}},
+moderation_packet(Params = #{stanza_id := StanzaID, reason := Reason}) ->
+    Moderated = mod_mam_utils:moderated_element(Params),
     ReasonEls = [#xmlel{name = <<"reason">>, children = [#xmlcdata{content = Reason}]}
                  || is_binary(Reason)],
     Retract = #xmlel{name = <<"retract">>,

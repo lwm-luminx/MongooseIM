@@ -37,6 +37,7 @@
          should_page_be_flipped/1,
          tombstone/2,
          moderated_tombstone/2,
+         moderated_element/1,
          tombstone/3,
          wrap_message/6,
          wrap_message/7,
@@ -576,11 +577,9 @@ retracted_element(#{retract_on := stanza_id,
 %% @doc Replaces the content of a message retracted by a room moderator (XEP-0425).
 -spec moderated_tombstone(exml:element(), mod_muc_room:moderate_message_params()) ->
     exml:element().
-moderated_tombstone(Packet, #{by := ByJID, reason := Reason}) ->
+moderated_tombstone(Packet, Params = #{reason := Reason}) ->
     Timestamp = calendar:system_time_to_rfc3339(erlang:system_time(second), [{offset, "Z"}]),
-    Moderated = #xmlel{name = <<"moderated">>,
-                       attrs = #{<<"xmlns">> => ?NS_MESSAGE_MODERATE,
-                                 <<"by">> => jid:to_binary(ByJID)}},
+    Moderated = moderated_element(Params),
     ReasonEls = [#xmlel{name = <<"reason">>, children = [#xmlcdata{content = Reason}]}
                  || is_binary(Reason)],
     Retracted = #xmlel{name = <<"retracted">>,
@@ -602,6 +601,21 @@ is_kept_in_moderated_tombstone(#xmlel{name = <<"replace">>,
     true;
 is_kept_in_moderated_tombstone(_) ->
     false.
+
+%% @doc The moderated element of XEP-0425, with the moderator's occupant ID (XEP-0421) if known
+-spec moderated_element(mod_muc_room:moderate_message_params()) -> exml:element().
+moderated_element(Params = #{by := ByJID}) ->
+    OccupantIdEls = case Params of
+                        #{by_occupant_id := OccupantId} ->
+                            [#xmlel{name = <<"occupant-id">>,
+                                    attrs = #{<<"xmlns">> => <<"urn:xmpp:occupant-id:0">>,
+                                              <<"id">> => OccupantId}}];
+                        #{} ->
+                            []
+                    end,
+    #xmlel{name = <<"moderated">>,
+           attrs = #{<<"xmlns">> => ?NS_MESSAGE_MODERATE, <<"by">> => jid:to_binary(ByJID)},
+           children = OccupantIdEls}.
 
 -spec maybe_append_origin_id(retraction_info()) -> [exml:element()].
 maybe_append_origin_id(#{origin_id := OriginID}) when is_binary(OriginID), <<>> =/= OriginID ->
