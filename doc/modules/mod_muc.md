@@ -7,6 +7,43 @@ It's a common XMPP group chat solution.
 This extension consists of two Erlang modules: `mod_muc` and `mod_muc_room`, the latter being the room code itself.
 Note that only `mod_muc` needs to be enabled in the configuration file.
 
+### Message moderation
+
+Rooms support [XEP-0425: Moderated Message Retraction](https://xmpp.org/extensions/xep-0425.html) (`urn:xmpp:message-moderate:1`).
+An occupant with the `moderator` role can retract any message in the room by its [stanza ID](https://xmpp.org/extensions/xep-0359.html):
+
+```xml
+<iq type='set' to='room@muc.example.com' id='retract-1'>
+  <moderate id='stanza-id-1' xmlns='urn:xmpp:message-moderate:1'>
+    <retract xmlns='urn:xmpp:message-retract:1'/>
+    <reason>Spam</reason>
+  </moderate>
+</iq>
+```
+
+The room removes the message from its history and sends the retraction to all occupants from the room's bare JID:
+
+```xml
+<message type='groupchat' from='room@muc.example.com' id='...'>
+  <retract id='stanza-id-1' xmlns='urn:xmpp:message-retract:1'>
+    <moderated by='room@muc.example.com/moderator-nick' xmlns='urn:xmpp:message-moderate:1'/>
+    <reason>Spam</reason>
+  </retract>
+  <store xmlns='urn:xmpp:hints'/>
+</message>
+```
+
+The retraction message is archived like other room messages, so clients catching up with MAM learn about it, and it updates the occupants' inboxes.
+When [MUC archiving](mod_mam.md#enable-muc-message-archive) is enabled with the `rdbms` backend and message retraction, the message is also replaced with a tombstone in the room archive.
+The tombstone keeps the author's `muc#user` item, occupant ID and message correction element, if any.
+Any moderation elements in the occupants' own messages are removed, so only the room can announce a moderation.
+The feature is advertised only when room messages get stanza IDs, i.e. with MUC archiving or `mod_stanzaid`.
+If the message is found neither in the archive nor in the room history, the request fails with `item-not-found`.
+Other occupants get a `forbidden` error.
+
+Administrators can do the same with the `muc.moderateMessage` command of the [GraphQL admin API](../graphql-api/Admin-GraphQL.md) (or `mongooseimctl muc moderateMessage`).
+In this case the moderator is the room itself.
+
 ## Options
 
 ### `modules.mod_muc.host`
