@@ -395,12 +395,14 @@ put_client_room_msgs(Room, Client) ->
 
 put_room_msgs(Room, SenderJID, Nick) ->
     MUCHost = muc_helper:muc_host(),
+    %% Messages from different senders on the same date need different IDs in one room
+    Offset = erlang:unique_integer([positive]) rem 1000000,
     RoomJID = mongoose_helper:make_jid(Room, MUCHost, <<>>),
     RoomArcID = rpc_apply(mod_mam_muc, archive_id, [MUCHost, Room]),
     SrcJID = mongoose_helper:make_jid(Room, MUCHost, Nick),
     Before = room_archive_size(Room),
     [ok = rpc_apply(mod_mam_muc, archive_message_for_ct,
-                    [#{message_id => message_id(DateTime),
+                    [#{message_id => message_id(DateTime, Offset),
                        archive_id => RoomArcID,
                        local_jid => RoomJID,
                        remote_jid => SenderJID,
@@ -432,10 +434,11 @@ put_client_room_msg_no_wait(Room, Client) ->
 room_archive_size(Room) ->
     rpc_apply(mod_mam_muc, archive_size, [muc_helper:muc_host(), Room]).
 
-message_id(DateTime) ->
+%% Offset is in microseconds, below one second, so the date stays the same
+message_id(DateTime, Offset) ->
     Seconds = calendar:datetime_to_gregorian_seconds(DateTime)
         - calendar:datetime_to_gregorian_seconds({{1970, 1, 1}, {0, 0, 0}}),
-    rpc_apply(mod_mam_utils, encode_compact_uuid, [Seconds * 1000000, 1]).
+    rpc_apply(mod_mam_utils, encode_compact_uuid, [Seconds * 1000000 + Offset, 1]).
 
 %% Commands
 

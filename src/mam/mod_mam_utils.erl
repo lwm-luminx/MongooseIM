@@ -1515,7 +1515,8 @@ prepare_delete_sender_messages(#{delete_domain_limit := infinity}, Query) ->
                            ['mam_server_user.server', 'mam_server_user.user_name', id],
                            <<"DELETE FROM mam_muc_message WHERE sender_id IN "
                              "(SELECT id FROM mam_server_user WHERE server = ? AND user_name = ?)"
-                             " AND id < ?">>);
+                             " AND id < ?">>),
+    ok;
 prepare_delete_sender_messages(#{delete_domain_limit := Limit}, Query) ->
     LimitSQL = rdbms_queries:limit(Limit),
     mongoose_rdbms:prepare(Query, mam_muc_message,
@@ -1524,7 +1525,8 @@ prepare_delete_sender_messages(#{delete_domain_limit := Limit}, Query) ->
                              "(SELECT * FROM (SELECT msg.room_id, msg.id FROM mam_muc_message msg"
                              " INNER JOIN mam_server_user msu ON msu.id = msg.sender_id"
                              " WHERE msu.server = ? AND msu.user_name = ? AND msg.id < ?",
-                             LimitSQL/binary, ") AS T)">>).
+                             LimitSQL/binary, ") AS T)">>),
+    ok.
 
 -spec delete_messages_sql(atom(), atom(), pos_integer() | infinity, [atom()]) -> binary().
 delete_messages_sql(Table, ArchiveColumn, infinity, FilterColumns) ->
