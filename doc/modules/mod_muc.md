@@ -460,9 +460,12 @@ The room's process can be recreated on demand, for example when a presence sent 
 When the `hats` option is enabled, each room can define hats: roles with a URI, a title and an optional hue,
 such as "Host" or "Moderator on duty".
 Hats are given to users by their bare JID, so they apply to every session of that user in the room.
+A hat can only be given to a user who has an affiliation in the room (member, admin or owner),
+and the user's hats are taken off when that affiliation is removed, for example when the account is deleted.
 The room adds a `<hats xmlns='urn:xmpp:hats:0'/>` element listing the user's hats to every presence it broadcasts
 for that user, and advertises the `urn:xmpp:hats:0` feature in its disco#info.
-Any `hats` element sent by a client in its own presence is removed, so users cannot put on hats themselves.
+Any `hats` element sent by a client in its own presence is always removed, including on nick changes,
+so users cannot put on hats themselves.
 When a hat is defined, changed or taken off, the room broadcasts the new presence of every affected occupant.
 
 Hats are stored together with the room configuration, so they persist with persistent rooms.
