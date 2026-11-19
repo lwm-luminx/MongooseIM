@@ -1,3 +1,15 @@
 _build
 big_tests/_build
 *.beam
+# Keep local secrets and keys out of the image. .git stays: tools/generate_vsn.sh needs it.
+.env*
+*.key
+priv/ssl
+# The build generates fresh test certificates here; only the recipes are needed
+tools/ssl/*
+!tools/ssl/Makefile
+!tools/ssl/*.cnf
+# Not needed to build the release
+big_tests
+test
+doc
