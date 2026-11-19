@@ -72,8 +72,7 @@ get_blocking_list(HostType, LUser, LServer) ->
     case mod_privacy_backend:get_privacy_list(HostType, LUser, LServer, <<"blocking">>) of
         {ok, List} -> {ok, List};
         {error, not_found} -> {ok, []};
-        {error, Reason} -> {error, Reason};
-        Other -> {error, Other}
+        {error, Reason} -> {error, Reason}
     end.
 
 %% @doc Blocks or unblocks the given JIDs for the user, as if the user sent
