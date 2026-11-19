@@ -2533,8 +2533,10 @@ moderate_muc_message(Config) ->
         %% THEN Alice gets a result and everyone in the room gets the retraction from the room
         AliceStanzas = escalus:wait_for_stanzas(Alice, 2),
         escalus:assert_many([is_iq_result, is_message], AliceStanzas),
-        ModeratorJID = <<RoomAddr/binary, "/", (nick(Alice))/binary>>,
-        [assert_moderation_message(Msg, RoomAddr, StanzaId, ModeratorJID, Reason)
+        %% The room sends from its normalised (lowercase) JID
+        LRoomAddr = escalus_utils:jid_to_lower(RoomAddr),
+        ModeratorJID = <<LRoomAddr/binary, "/", (nick(Alice))/binary>>,
+        [assert_moderation_message(Msg, LRoomAddr, StanzaId, ModeratorJID, Reason)
          || Msg <- [escalus:wait_for_stanza(Bob) |
                     [S || S <- AliceStanzas, escalus_pred:is_message(S)]]],
 
