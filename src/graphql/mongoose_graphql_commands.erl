@@ -159,8 +159,9 @@ convert_input_type(Type, Value) when Type =:= <<"Int">>;
                                      Type =:= <<"PosInt">>;
                                      Type =:= <<"NonNegInt">> -> binary_to_integer(Value);
 convert_input_type(<<"Float">>, Value) -> binary_to_number(Value);
-convert_input_type(<<"Boolean">>, <<"true">>) -> true;
-convert_input_type(<<"Boolean">>, <<"false">>) -> false;
+%% graphql-erlang names the built-in Boolean type 'Bool' in introspection
+convert_input_type(<<"Bool">>, <<"true">>) -> true;
+convert_input_type(<<"Bool">>, <<"false">>) -> false;
 convert_input_type(_, Value) -> Value.
 
 %% GraphQL accepts integers as Float input, and binary_to_float/1 requires a decimal point

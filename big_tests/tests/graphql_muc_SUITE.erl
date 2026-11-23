@@ -640,7 +640,8 @@ admin_set_and_assign_room_hat_story(Config, Alice, Bob) ->
     BobJID = escalus_utils:jid_to_lower(escalus_client:short_jid(Bob)),
     ?assertEqual(#{<<"hats">> => [#{<<"uri">> => ?HOST_HAT, <<"title">> => <<"Host">>,
                                     <<"hue">> => 120.5}],
-                   <<"assignments">> => [#{<<"jid">> => BobJID, <<"hats">> => [?HOST_HAT]}]},
+                   <<"assignments">> => [#{<<"jid">> => BobJID, <<"hats">> => [?HOST_HAT]}],
+                   <<"scopedAssignments">> => []},
                  get_ok_value(?LIST_ROOM_HATS_PATH, Res3)),
     %% Assigning the same hat again changes nothing
     assert_success(?ASSIGN_ROOM_HAT_PATH, assign_room_hat(RoomJID, Bob, ?HOST_HAT, Config)),
@@ -699,7 +700,7 @@ admin_remove_room_hat_story(Config, Alice, Bob) ->
      || Client <- [Alice, Bob]],
     assert_success(?REMOVE_ROOM_HAT_PATH, remove_room_hat(RoomJID, ?HOST_HAT, Config)),
     [assert_hats(RoomJID, <<"bobek">>, [], Client) || Client <- [Alice, Bob]],
-    ?assertEqual(#{<<"hats">> => [], <<"assignments">> => []},
+    ?assertEqual(#{<<"hats">> => [], <<"assignments">> => [], <<"scopedAssignments">> => []},
                  get_ok_value(?LIST_ROOM_HATS_PATH, list_room_hats(RoomJID, Config))),
     Res = remove_room_hat(RoomJID, ?HOST_HAT, Config),
     ?assertNotEqual(nomatch, binary:match(get_err_msg(Res), <<"Hat not found">>)).
