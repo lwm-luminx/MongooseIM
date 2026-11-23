@@ -1,0 +1,330 @@
+name: AudienceKit CI
+
+on:
+  push:
+    branches:
+      - audiencekit
+      - audiencekit-build
+      - audiencekit-ci
+  pull_request:
+    branches:
+      - audiencekit
+      - audiencekit-build
+      - mam-admin-delete
+      - graphql-sse-session-resource
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Validation mode ('all_prs' tests every open PR branch; 'branch' tests current ref)"
+        required: false
+        default: "all_prs"
+        type: choice
+        options:
+          - all_prs
+          - branch
+
+permissions:
+  contents: read
+
+env:
+  OTP_VERSION: '28.4.2'
+  KEEP_COVER_RUNNING: '1'
+  SKIP_AUTO_COMPILE: 'true'
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Mode A: Standard CI for pull_request / push to audiencekit / audiencekit-build
+  # ---------------------------------------------------------------------------
+  branch_checks:
+    name: xref & unit tests (${{ github.head_ref || github.ref_name }})
+    if: >-
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'push' && github.ref_name != 'audiencekit-ci') ||
+      (github.event_name == 'workflow_dispatch' && inputs.mode == 'branch')
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/rebar3
+          key: rebar3-${{ hashFiles('rebar.lock') }}
+      - name: Create certificates
+        run: make certs
+      - name: Run xref
+        run: ./rebar3 xref
+      - name: Run unit Common Test suites
+        run: ./rebar3 ct --dir test --suite config_parser_SUITE,auth_jwt_SUITE,mongoose_graphql_SUITE
+
+  branch_dialyzer:
+    name: dialyzer (${{ github.head_ref || github.ref_name }})
+    if: >-
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'push' && github.ref_name != 'audiencekit-ci') ||
+      (github.event_name == 'workflow_dispatch' && inputs.mode == 'branch')
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/rebar3
+            _build/default/*_plt
+          key: dialyzer-${{ env.OTP_VERSION }}-${{ hashFiles('rebar.lock') }}
+      - name: Run dialyzer
+        run: ./rebar3 dialyzer
+
+  branch_big_tests:
+    name: big_tests (${{ matrix.preset }})
+    if: >-
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'push' && github.ref_name != 'audiencekit-ci') ||
+      (github.event_name == 'workflow_dispatch' && inputs.mode == 'branch')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - preset: pgsql_mnesia
+            suites: "graphql_mam_SUITE graphql_muc_SUITE graphql_stanza_SUITE graphql_blocking_SUITE mam_SUITE muc_SUITE"
+          - preset: internal_mnesia
+            suites: "muc_SUITE graphql_muc_SUITE graphql_stanza_SUITE graphql_blocking_SUITE"
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/rebar3
+          key: rebar3-${{ hashFiles('rebar.lock') }}
+      - name: Create certificates
+        run: make certs
+      - name: Configure preset
+        run: tools/gh-actions-configure-preset.sh "${{ matrix.preset }}" TESTSPEC=default.spec
+      - name: Configure releases
+        run: tools/configure $REL_CONFIG
+      - name: Build releases
+        run: tools/build-releases.sh
+      - name: Build big_tests
+        run: tools/build-tests.sh
+      - name: Start backends
+        run: tools/setup-db.sh
+      - name: Select AudienceKit test suites
+        run: escript tools/select_suites_to_run.erl big_tests/default.spec ${{ matrix.suites }}
+      - name: Run big_tests
+        run: tools/test.sh -p "${{ matrix.preset }}" -s false -e false -c false
+      - name: Upload CT reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ct-reports-branch-${{ matrix.preset }}
+          path: |
+            big_tests/ct_report
+            _build/mim1/rel/mongooseim/log
+
+  # ---------------------------------------------------------------------------
+  # Mode B: Per-PR Validation Matrix across PRs #1-#12
+  # ---------------------------------------------------------------------------
+  pr_unit_and_xref:
+    name: "Unit & Xref: ${{ matrix.label }}"
+    if: >-
+      (github.event_name == 'push' && github.ref_name == 'audiencekit-ci') ||
+      (github.event_name == 'workflow_dispatch' && inputs.mode == 'all_prs')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: "PR #1 (mam-admin-delete)"
+            ref: mam-admin-delete
+            ct_suites: ""
+          - label: "PR #2 (mam-muc-remove-user)"
+            ref: mam-muc-remove-user
+            ct_suites: "config_parser_SUITE"
+          - label: "PR #3 (muc-moderated-retraction)"
+            ref: muc-moderated-retraction
+            ct_suites: ""
+          - label: "PR #4 (mam-retract-v1)"
+            ref: mam-retract-v1
+            ct_suites: ""
+          - label: "PR #5 (muc-occupant-id)"
+            ref: muc-occupant-id
+            ct_suites: "config_parser_SUITE"
+          - label: "PR #6 (jwt-auth-keys-and-claims)"
+            ref: jwt-auth-keys-and-claims
+            ct_suites: "config_parser_SUITE,auth_jwt_SUITE"
+          - label: "PR #7 (graphql-admin-jwt)"
+            ref: graphql-admin-jwt
+            ct_suites: "config_parser_SUITE,mongoose_graphql_SUITE"
+          - label: "PR #8 (graphql-sse-session-resource)"
+            ref: graphql-sse-session-resource
+            ct_suites: ""
+          - label: "PR #9 (graphql-sse-presences)"
+            ref: graphql-sse-presences
+            ct_suites: ""
+          - label: "PR #10 (blocking-admin-api)"
+            ref: blocking-admin-api
+            ct_suites: ""
+          - label: "PR #11 (muc-hats)"
+            ref: muc-hats
+            ct_suites: "config_parser_SUITE"
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/rebar3
+          key: rebar3-${{ hashFiles('rebar.lock') }}
+      - name: Create certificates
+        run: make certs
+      - name: Run xref
+        run: ./rebar3 xref
+      - name: Run Common Test unit suites
+        if: matrix.ct_suites != ''
+        run: ./rebar3 ct --dir test --suite "${{ matrix.ct_suites }}"
+      - name: Upload unit test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-logs-${{ matrix.ref }}
+          path: _build/test/logs
+
+  pr_big_tests:
+    name: "Big Tests: ${{ matrix.label }}"
+    if: >-
+      (github.event_name == 'push' && github.ref_name == 'audiencekit-ci') ||
+      (github.event_name == 'workflow_dispatch' && inputs.mode == 'all_prs')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: "PR #1 (mam-admin-delete / pgsql)"
+            ref: mam-admin-delete
+            preset: pgsql_mnesia
+            suites: "graphql_mam_SUITE"
+          - label: "PR #2 (mam-muc-remove-user / pgsql)"
+            ref: mam-muc-remove-user
+            preset: pgsql_mnesia
+            suites: "graphql_mam_SUITE"
+          - label: "PR #3 (muc-moderated-retraction / pgsql)"
+            ref: muc-moderated-retraction
+            preset: pgsql_mnesia
+            suites: "graphql_muc_SUITE mam_SUITE muc_SUITE"
+          - label: "PR #4 (mam-retract-v1 / pgsql)"
+            ref: mam-retract-v1
+            preset: pgsql_mnesia
+            suites: "mam_SUITE"
+          - label: "PR #5 (muc-occupant-id / pgsql)"
+            ref: muc-occupant-id
+            preset: pgsql_mnesia
+            suites: "muc_SUITE"
+          - label: "PR #5 (muc-occupant-id / internal_mnesia)"
+            ref: muc-occupant-id
+            preset: internal_mnesia
+            suites: "muc_SUITE"
+          - label: "PR #8 (graphql-sse-session-resource / pgsql)"
+            ref: graphql-sse-session-resource
+            preset: pgsql_mnesia
+            suites: "graphql_stanza_SUITE"
+          - label: "PR #9 (graphql-sse-presences / pgsql)"
+            ref: graphql-sse-presences
+            preset: pgsql_mnesia
+            suites: "graphql_stanza_SUITE"
+          - label: "PR #10 (blocking-admin-api / pgsql)"
+            ref: blocking-admin-api
+            preset: pgsql_mnesia
+            suites: "graphql_blocking_SUITE"
+          - label: "PR #11 (muc-hats / pgsql)"
+            ref: muc-hats
+            preset: pgsql_mnesia
+            suites: "graphql_muc_SUITE"
+          - label: "PR #11 (muc-hats / internal_mnesia)"
+            ref: muc-hats
+            preset: internal_mnesia
+            suites: "graphql_muc_SUITE"
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/rebar3
+          key: rebar3-${{ hashFiles('rebar.lock') }}
+      - name: Create certificates
+        run: make certs
+      - name: Configure preset
+        run: tools/gh-actions-configure-preset.sh "${{ matrix.preset }}" TESTSPEC=default.spec
+      - name: Configure releases
+        run: tools/configure $REL_CONFIG
+      - name: Build releases
+        run: tools/build-releases.sh
+      - name: Build big_tests
+        run: tools/build-tests.sh
+      - name: Start backends
+        run: tools/setup-db.sh
+      - name: Select PR test suites
+        run: escript tools/select_suites_to_run.erl big_tests/default.spec ${{ matrix.suites }}
+      - name: Run big_tests
+        run: tools/test.sh -p "${{ matrix.preset }}" -s false -e false -c false
+      - name: Upload CT reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ct-reports-${{ matrix.ref }}-${{ matrix.preset }}
+          path: |
+            big_tests/ct_report
+            _build/mim1/rel/mongooseim/log
+
+  pr_docker_verify:
+    name: "Docker Smoke Test: PR #12 (audiencekit-docker)"
+    if: >-
+      (github.event_name == 'push' && github.ref_name == 'audiencekit-ci') ||
+      (github.event_name == 'workflow_dispatch' && inputs.mode == 'all_prs')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: audiencekit-docker
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: mongooseim:pr12-smoke
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Smoke-test built container release
+        run: |
+          docker run --rm mongooseim:pr12-smoke /usr/lib/mongooseim/bin/mongooseim version
+          echo "Container runtime UID: $(docker run --rm mongooseim:pr12-smoke id -u)"
