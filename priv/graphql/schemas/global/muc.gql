@@ -64,6 +64,18 @@ type MUCRoomHats{
   hats: [MUCRoomHat!]!
   "Users wearing hats"
   assignments: [MUCRoomHatAssignment!]!
+  "Users wearing scoped hats, which only one viewer sees"
+  scopedAssignments: [MUCRoomScopedHatAssignment!]!
+}
+
+"Hats worn by a user in a MUC room that only one other user (the viewer) sees"
+type MUCRoomScopedHatAssignment{
+  "Bare JID of the user wearing the hats"
+  jid: JID!
+  "Bare JID of the only user who sees the hats"
+  viewer: JID!
+  "URIs of the hats"
+  hats: [String!]!
 }
 
 "MUC room description"

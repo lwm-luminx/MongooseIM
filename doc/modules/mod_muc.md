@@ -173,6 +173,15 @@ it is disabled by default.
 Enables [XEP-0317: Hats](https://xmpp.org/extensions/xep-0317.html) in the rooms of this service.
 See [Hats](#hats-xep-0317) below.
 
+### `modules.mod_muc.scoped_hats`
+  * **Syntax:** boolean
+  * **Default:** `false`
+  * **Example:** `scoped_hats = true`
+
+Enables [scoped hats](../open-extensions/scoped-hats.md), hats that only some occupants see,
+in the rooms of this service. It has an effect only when [`hats`](#modulesmod_muchats) is enabled too.
+See [Scoped hats](#scoped-hats) below.
+
 ### `modules.mod_muc.hibernate_timeout` 
  * **Syntax:** non-negative integer or the string `"infinity"`
  * **Default:** `90000` (milliseconds, 90 seconds)
@@ -475,6 +484,25 @@ Hats are managed with the admin GraphQL API in the `muc` category:
 The ad-hoc commands described in the XEP are not supported.
 Like other room administration operations, these only work on rooms whose process is running,
 so a room stopped by [deep hibernation](#room-deep-hibernation) has to be woken up first.
+
+### Scoped hats
+
+When the `scoped_hats` option is enabled as well, a hat defined in a room can also be worn for an audience:
+a list of users who are the only ones to see it.
+A *pairwise* hat, which two users see only on each other, is a mutual assignment with an audience of one.
+This is an extension of XEP-0317 described in the [Scoped Hats ProtoXEP](../open-extensions/scoped-hats.md).
+
+The room adds a `<scoped-hats xmlns='urn:xmpp:scoped-hats:0'/>` element with the scoped hats
+only to the presences of the wearer that it sends to the audience, and advertises the `urn:xmpp:scoped-hats:0` feature.
+Nobody sees their own scoped hats, and hats the user also wears for the whole room are not repeated.
+When scoped hats change, the wearer's presence is sent again only to the affected viewers,
+so the other occupants can't tell that anything changed.
+Like room-wide hats, the wearer and the whole audience need an affiliation in the room,
+the assignments are removed with the affiliation of either of them,
+and clients can't add `scoped-hats` elements to their own presence.
+
+Scoped hats are managed with `assignScopedRoomHat` and `unassignScopedRoomHat`,
+and listed in the `scopedAssignments` field of `listRoomHats`.
 
 ## External HTTP Authentication
 

@@ -39,7 +39,11 @@ execute(_Ctx, _Obj, <<"removeRoomHat">>, Args) ->
 execute(_Ctx, _Obj, <<"assignRoomHat">>, Args) ->
     assign_room_hat(Args);
 execute(_Ctx, _Obj, <<"unassignRoomHat">>, Args) ->
-    unassign_room_hat(Args).
+    unassign_room_hat(Args);
+execute(_Ctx, _Obj, <<"assignScopedRoomHat">>, Args) ->
+    assign_scoped_room_hat(Args);
+execute(_Ctx, _Obj, <<"unassignScopedRoomHat">>, Args) ->
+    unassign_scoped_room_hat(Args).
 
 -spec create_instant_room(map()) -> {ok, map()} | {error, resolver_error()}.
 create_instant_room(#{<<"room">> := RoomJID, <<"owner">> := OwnerJID, <<"nick">> := Nick}) ->
@@ -132,5 +136,20 @@ assign_room_hat(#{<<"room">> := RoomJID, <<"user">> := UserJID, <<"uri">> := Uri
 -spec unassign_room_hat(map()) -> {ok, binary()} | {error, resolver_error()}.
 unassign_room_hat(#{<<"room">> := RoomJID, <<"user">> := UserJID, <<"uri">> := Uri}) ->
     Res = mod_muc_api:unassign_room_hat(RoomJID, UserJID, Uri),
+    format_result(Res, #{room => jid:to_binary(RoomJID), user => jid:to_binary(UserJID),
+                         uri => Uri}).
+
+-spec assign_scoped_room_hat(map()) -> {ok, binary()} | {error, resolver_error()}.
+assign_scoped_room_hat(#{<<"room">> := RoomJID, <<"user">> := UserJID, <<"uri">> := Uri,
+                         <<"audience">> := Audience, <<"mutual">> := Mutual}) ->
+    Res = mod_muc_api:assign_scoped_room_hat(RoomJID, UserJID, Uri, Audience, Mutual),
+    format_result(Res, #{room => jid:to_binary(RoomJID), user => jid:to_binary(UserJID),
+                         uri => Uri}).
+
+-spec unassign_scoped_room_hat(map()) -> {ok, binary()} | {error, resolver_error()}.
+unassign_scoped_room_hat(#{<<"room">> := RoomJID, <<"user">> := UserJID, <<"uri">> := Uri,
+                           <<"audience">> := Audience, <<"mutual">> := Mutual}) ->
+    Res = mod_muc_api:unassign_scoped_room_hat(RoomJID, UserJID, Uri,
+                                               null_to_default(Audience, all), Mutual),
     format_result(Res, #{room => jid:to_binary(RoomJID), user => jid:to_binary(UserJID),
                          uri => Uri}).

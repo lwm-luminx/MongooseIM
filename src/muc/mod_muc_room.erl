@@ -51,6 +51,8 @@
          remove_hat/2,
          assign_hat/3,
          unassign_hat/3,
+         assign_scoped_hat/5,
+         unassign_scoped_hat/5,
          get_hats/1]).
 
 %% gen_fsm callbacks
@@ -118,11 +120,16 @@
 %%%----------------------------------------------------------------------
 %%% Types
 %%%----------------------------------------------------------------------
--export_type([config/0, user/0, activity/0, hat/0, hat_uri/0]).
+-export_type([config/0, user/0, activity/0, hat/0, hat_uri/0, scoped_hat_assignments/0]).
 
 -type hat_uri() :: binary().
 -type hat() :: #{uri := hat_uri(), title := binary(), hue => binary()}.
--type hats_info() :: #{hats := [hat()], assignments := [{jid:jid(), [hat_uri()]}]}.
+%% {Wearer, Viewer} => hats the wearer shows only to the viewer (both bare JIDs)
+-type scoped_hat_assignments() :: #{{jid:simple_jid(), jid:simple_jid()} => [hat_uri()]}.
+-type hats_info() :: #{hats := [hat()], assignments := [{jid:jid(), [hat_uri()]}],
+                       scoped_assignments := [{jid:jid(), jid:jid(), [hat_uri()]}]}.
+%% Whose presence has to be sent again after a hats change, and to whom
+-type hats_targets() :: [{Wearer :: jid:simple_jid(), all | [Viewer :: jid:simple_jid()]}].
 
 -type statename() :: 'locked_state' | 'normal_state'.
 -type fsm_return() :: {'next_state', statename(), state()}
@@ -321,6 +328,29 @@ assign_hat(RoomJID, UserJID, Uri) ->
     ok | {error, not_found | hat_not_found | hats_disabled}.
 unassign_hat(RoomJID, UserJID, Uri) ->
     sync_hats_event(RoomJID, {unassign_hat, jid:to_lower(jid:to_bare(UserJID)), Uri}).
+
+%% @doc Gives a hat defined in the room to the user (bare JID), visible only to the audience.
+%% With Mutual set, every member of the audience also wears the hat, visible only to the user,
+%% which makes a pairwise hat when the audience is one user.
+-spec assign_scoped_hat(jid:jid(), jid:jid(), hat_uri(), [jid:jid()], boolean()) ->
+    ok | {error, not_found | hat_not_found | hats_disabled | scoped_hats_disabled | not_affiliated}.
+assign_scoped_hat(RoomJID, UserJID, Uri, Audience, Mutual) ->
+    sync_hats_event(RoomJID, {assign_scoped_hat, to_bare_lower(UserJID), Uri,
+                              lists:usort([to_bare_lower(J) || J <- Audience]), Mutual}).
+
+%% @doc Takes a scoped hat off the user (bare JID) for the audience, or for everyone it was
+%% shown to when Audience is `all'. With Mutual set, the audience's matching hats go too.
+-spec unassign_scoped_hat(jid:jid(), jid:jid(), hat_uri(), [jid:jid()] | all, boolean()) ->
+    ok | {error, not_found | hat_not_found | hats_disabled | scoped_hats_disabled}.
+unassign_scoped_hat(RoomJID, UserJID, Uri, Audience, Mutual) ->
+    LAudience = case Audience of
+                    all -> all;
+                    _ -> lists:usort([to_bare_lower(J) || J <- Audience])
+                end,
+    sync_hats_event(RoomJID, {unassign_scoped_hat, to_bare_lower(UserJID), Uri, LAudience, Mutual}).
+
+to_bare_lower(JID) ->
+    jid:to_lower(jid:to_bare(JID)).
 
 %% @doc Returns the hats defined in the room, and who wears them.
 -spec get_hats(jid:jid()) -> {ok, hats_info()} | {error, not_found | hats_disabled}.
@@ -1472,7 +1502,10 @@ set_affiliation(JID, none, StateData) ->
     LJID = jid:to_bare(jid:to_lower(JID)),
     %% Hats are worn only by users with an affiliation
     StateData#state{affiliations = maps:remove(LJID, StateData#state.affiliations),
-                    hat_assignments = maps:remove(LJID, StateData#state.hat_assignments)};
+                    hat_assignments = maps:remove(LJID, StateData#state.hat_assignments),
+                    scoped_hat_assignments =
+                        maps:filter(fun({Wearer, Viewer}, _) -> Wearer =/= LJID andalso Viewer =/= LJID end,
+                                    StateData#state.scoped_hat_assignments)};
 set_affiliation(JID, AffOrAffReason, StateData) ->
     LJID = jid:to_bare(jid:to_lower(JID)),
     StateData#state{affiliations = maps:put(LJID, AffOrAffReason, StateData#state.affiliations)}.
@@ -2360,7 +2393,7 @@ send_new_presence_to_single(NJID, #user{jid = RealJID, nick = Nick, last_presenc
                       Status
               end,
     Packet = jlib:append_subtags(
-               set_hats(RealJID, Presence, StateData),
+               set_hats(RealJID, ReceiverInfo#user.jid, Presence, StateData),
                [#xmlel{name = <<"x">>, attrs = #{<<"xmlns">> => ?NS_MUC_USER},
                        children = [#xmlel{name = <<"item">>, attrs = ItemAttrs,
                                           children = ItemEls} | Status2]}]),
@@ -2404,7 +2437,7 @@ send_existing_presence({_LJID, #user{jid = FromJID, nick = FromNick,
               <<"role">> => role_to_binary(FromRole)}
     end,
     Packet = jlib:append_subtags(
-               set_hats(FromJID, Presence, StateData),
+               set_hats(FromJID, RealToJID, Presence, StateData),
                [#xmlel{name = <<"x">>,
                        attrs = #{<<"xmlns">> => ?NS_MUC_USER},
                        children = [#xmlel{name = <<"item">>,
@@ -2493,8 +2526,9 @@ send_nick_change(Presence, OldNick, JID, RealJID, Affiliation, Role,
                          Info#user.jid,
                          Unavailable,
                          ?LOCATION)),
-    Available = set_hats(RealJID, nick_available_presence(Presence, MaybePublicJID, Affiliation,
-                                                          Role, MaybeSelfPresenceCode), S),
+    Available = set_hats(RealJID, Info#user.jid,
+                         nick_available_presence(Presence, MaybePublicJID, Affiliation,
+                                                 Role, MaybeSelfPresenceCode), S),
     mongoose_router:route(
         mongoose_acc:new(jid:replace_resource(S#state.jid, Nick),
                          Info#user.jid,
@@ -2577,33 +2611,40 @@ is_hats_enabled(StateData) ->
 
 -spec hats_features(state()) -> [mongoose_disco:feature()].
 hats_features(StateData) ->
-    case is_hats_enabled(StateData) of
-        true -> [?NS_HATS];
-        false -> []
+    case {is_hats_enabled(StateData), is_scoped_hats_enabled(StateData)} of
+        {true, true} -> [?NS_HATS, ?NS_SCOPED_HATS];
+        {true, false} -> [?NS_HATS];
+        {false, _} -> []
     end.
 
+%% Scoped hats extend XEP-0317 hats, so they need both options
+-spec is_scoped_hats_enabled(state()) -> boolean().
+is_scoped_hats_enabled(StateData) ->
+    is_hats_enabled(StateData) andalso get_opt(StateData, scoped_hats).
+
 -spec handle_hats_event(term(), state()) -> {term(), state()}.
-handle_hats_event(get_hats, StateData = #state{hats = Hats, hat_assignments = Assignments}) ->
+handle_hats_event(get_hats, StateData = #state{hats = Hats, hat_assignments = Assignments,
+                                                scoped_hat_assignments = Scoped}) ->
     AssignmentList = [{jid:make_noprep(LJID), Uris} || {LJID, Uris} <- maps:to_list(Assignments)],
-    {{ok, #{hats => Hats, assignments => lists:sort(AssignmentList)}}, StateData};
+    ScopedList = [{jid:make_noprep(Wearer), jid:make_noprep(Viewer), Uris}
+                  || {{Wearer, Viewer}, Uris} <- lists:sort(maps:to_list(Scoped))],
+    {{ok, #{hats => Hats, assignments => lists:sort(AssignmentList),
+            scoped_assignments => ScopedList}}, StateData};
 handle_hats_event({set_hat, Hat = #{uri := Uri}}, StateData = #state{hats = Hats}) ->
     NewHats = case find_hat(Uri, Hats) of
                   {ok, _} -> [case H of #{uri := Uri} -> Hat; _ -> H end || H <- Hats];
                   error -> Hats ++ [Hat]
               end,
-    hats_changed(wearers([Uri], StateData), StateData#state{hats = NewHats});
+    hats_changed(wearers(Uri, StateData), StateData#state{hats = NewHats});
 handle_hats_event({remove_hat, Uri}, StateData = #state{hats = Hats, hat_assignments = Assignments}) ->
     case find_hat(Uri, Hats) of
         {ok, _} ->
-            Wearers = wearers([Uri], StateData),
-            NewAssignments = maps:filtermap(fun(_LJID, Uris) ->
-                                                    case lists:delete(Uri, Uris) of
-                                                        [] -> false;
-                                                        NewUris -> {true, NewUris}
-                                                    end
-                                            end, Assignments),
-            hats_changed(Wearers, StateData#state{hats = [H || H = #{uri := U} <- Hats, U =/= Uri],
-                                                  hat_assignments = NewAssignments});
+            Wearers = wearers(Uri, StateData),
+            hats_changed(Wearers, StateData#state{
+                                    hats = [H || H = #{uri := U} <- Hats, U =/= Uri],
+                                    hat_assignments = delete_hat_uri(Uri, Assignments),
+                                    scoped_hat_assignments =
+                                        delete_hat_uri(Uri, StateData#state.scoped_hat_assignments)});
         error ->
             {{error, hat_not_found}, StateData}
     end;
@@ -2614,7 +2655,7 @@ handle_hats_event({assign_hat, LJID, Uri}, StateData = #state{hats = Hats, hat_a
         {{ok, _}, true} ->
             Uris = maps:get(LJID, Assignments, []),
             NewUris = Uris ++ [Uri || not lists:member(Uri, Uris)],
-            hats_changed([LJID], StateData#state{hat_assignments = Assignments#{LJID => NewUris}});
+            hats_changed([{LJID, all}], StateData#state{hat_assignments = Assignments#{LJID => NewUris}});
         {error, _} ->
             {{error, hat_not_found}, StateData}
     end;
@@ -2626,22 +2667,98 @@ handle_hats_event({unassign_hat, LJID, Uri}, StateData = #state{hat_assignments 
                                  [] -> maps:remove(LJID, Assignments);
                                  NewUris -> Assignments#{LJID => NewUris}
                              end,
-            hats_changed([LJID], StateData#state{hat_assignments = NewAssignments});
+            hats_changed([{LJID, all}], StateData#state{hat_assignments = NewAssignments});
         false ->
             {{error, hat_not_found}, StateData}
+    end;
+handle_hats_event(Event, StateData) when element(1, Event) =:= assign_scoped_hat;
+                                         element(1, Event) =:= unassign_scoped_hat ->
+    case is_scoped_hats_enabled(StateData) of
+        true -> handle_scoped_hats_event(Event, StateData);
+        false -> {{error, scoped_hats_disabled}, StateData}
     end.
 
-%% Stores the room, and broadcasts the presences of the occupants whose hats changed
--spec hats_changed([jid:simple_jid()], state()) -> {ok, state()}.
-hats_changed(LJIDs, StateData) ->
+-spec handle_scoped_hats_event(term(), state()) -> {term(), state()}.
+handle_scoped_hats_event({assign_scoped_hat, Wearer, Uri, Audience, Mutual},
+                         StateData = #state{hats = Hats, scoped_hat_assignments = Scoped}) ->
+    case {find_hat(Uri, Hats),
+          lists:all(fun(LJID) -> has_affiliation(LJID, StateData) end, [Wearer | Audience])} of
+        {error, _} ->
+            {{error, hat_not_found}, StateData};
+        {{ok, _}, false} ->
+            {{error, not_affiliated}, StateData};
+        {{ok, _}, true} ->
+            Pairs = [{Wearer, Viewer} || Viewer <- Audience]
+                ++ [{Viewer, Wearer} || Mutual, Viewer <- Audience],
+            NewScoped = lists:foldl(fun(Pair, Acc) ->
+                                            Uris = maps:get(Pair, Acc, []),
+                                            Acc#{Pair => Uris ++ [Uri || not lists:member(Uri, Uris)]}
+                                    end, Scoped, Pairs),
+            hats_changed(pairs_to_targets(Pairs),
+                         StateData#state{scoped_hat_assignments = NewScoped})
+    end;
+handle_scoped_hats_event({unassign_scoped_hat, Wearer, Uri, Audience, Mutual},
+                         StateData = #state{scoped_hat_assignments = Scoped}) ->
+    InAudience = fun(LJID) -> Audience =:= all orelse lists:member(LJID, Audience) end,
+    Pairs = [Pair || {{W, V} = Pair, Uris} <- maps:to_list(Scoped),
+                     lists:member(Uri, Uris),
+                     (W =:= Wearer andalso InAudience(V))
+                         orelse (Mutual andalso V =:= Wearer andalso InAudience(W))],
+    case Pairs of
+        [] ->
+            {{error, hat_not_found}, StateData};
+        _ ->
+            NewScoped = delete_hat_uri(Uri, maps:with(Pairs, Scoped)),
+            hats_changed(pairs_to_targets(Pairs),
+                         StateData#state{scoped_hat_assignments =
+                                             maps:merge(maps:without(Pairs, Scoped), NewScoped)})
+    end.
+
+%% Removes the hat from the assignments, and drops the ones left without hats
+-spec delete_hat_uri(hat_uri(), #{Key => [hat_uri()]}) -> #{Key => [hat_uri()]}.
+delete_hat_uri(Uri, Assignments) ->
+    maps:filtermap(fun(_Key, Uris) ->
+                           case lists:delete(Uri, Uris) of
+                               [] -> false;
+                               NewUris -> {true, NewUris}
+                           end
+                   end, Assignments).
+
+-spec pairs_to_targets([{jid:simple_jid(), jid:simple_jid()}]) -> hats_targets().
+pairs_to_targets(Pairs) ->
+    [{Wearer, [Viewer]} || {Wearer, Viewer} <- Pairs].
+
+%% Stores the room, and sends the presences of the occupants whose hats changed again.
+%% A scoped hat change is sent only to its viewers, so that other occupants
+%% can't even tell that something changed.
+-spec hats_changed(hats_targets(), state()) -> {ok, state()}.
+hats_changed(Targets, StateData = #state{users = Users}) ->
     store_room_if_persistent(StateData),
+    TargetMap = merge_hats_targets(Targets),
     maps_foreach(fun(_LJID, #user{jid = JID}) ->
-                         case lists:member(jid:to_bare(jid:to_lower(JID)), LJIDs) of
-                             true -> send_new_presence(JID, StateData);
-                             false -> ok
+                         case maps:get(to_bare_lower(JID), TargetMap, none) of
+                             none ->
+                                 ok;
+                             all ->
+                                 send_new_presence(JID, StateData);
+                             Viewers ->
+                                 Receivers = [{LJID, User} || {LJID, User = #user{jid = RJID}}
+                                                                  <- maps:to_list(Users),
+                                                              lists:member(to_bare_lower(RJID), Viewers)],
+                                 send_new_presence_to(JID, <<>>, Receivers, StateData)
                          end
-                 end, StateData#state.users),
+                 end, Users),
     {ok, StateData}.
+
+-spec merge_hats_targets(hats_targets()) -> #{jid:simple_jid() => all | [jid:simple_jid()]}.
+merge_hats_targets(Targets) ->
+    lists:foldl(fun({Wearer, all}, Acc) -> Acc#{Wearer => all};
+                   ({Wearer, Viewers}, Acc) ->
+                        case maps:get(Wearer, Acc, []) of
+                            all -> Acc;
+                            Old -> Acc#{Wearer => lists:usort(Old ++ Viewers)}
+                        end
+                end, #{}, Targets).
 
 -spec has_affiliation(jid:simple_jid(), state()) -> boolean().
 has_affiliation(LJID, #state{affiliations = Affiliations}) ->
@@ -2649,14 +2766,21 @@ has_affiliation(LJID, #state{affiliations = Affiliations}) ->
 
 %% Hats are worn only by users with an affiliation, so that they are removed with it
 -spec prune_hat_assignments(state()) -> state().
-prune_hat_assignments(StateData = #state{hat_assignments = Assignments}) ->
-    StateData#state{hat_assignments = maps:filter(fun(LJID, _) -> has_affiliation(LJID, StateData) end,
-                                                  Assignments)}.
+prune_hat_assignments(StateData = #state{hat_assignments = Assignments,
+                                          scoped_hat_assignments = Scoped}) ->
+    IsAffiliated = fun(LJID) -> has_affiliation(LJID, StateData) end,
+    StateData#state{hat_assignments = maps:filter(fun(LJID, _) -> IsAffiliated(LJID) end,
+                                                  Assignments),
+                    scoped_hat_assignments =
+                        maps:filter(fun({Wearer, Viewer}, _) ->
+                                            IsAffiliated(Wearer) andalso IsAffiliated(Viewer)
+                                    end, Scoped)}.
 
--spec wearers([hat_uri()], state()) -> [jid:simple_jid()].
-wearers(Uris, #state{hat_assignments = Assignments}) ->
-    [LJID || {LJID, WornUris} <- maps:to_list(Assignments),
-             lists:any(fun(Uri) -> lists:member(Uri, WornUris) end, Uris)].
+%% Everyone wearing the hat, and for scoped hats the viewers who see it
+-spec wearers(hat_uri(), state()) -> hats_targets().
+wearers(Uri, #state{hat_assignments = Assignments, scoped_hat_assignments = Scoped}) ->
+    [{LJID, all} || {LJID, Uris} <- maps:to_list(Assignments), lists:member(Uri, Uris)]
+        ++ pairs_to_targets([Pair || {Pair, Uris} <- maps:to_list(Scoped), lists:member(Uri, Uris)]).
 
 -spec find_hat(hat_uri(), [hat()]) -> {ok, hat()} | error.
 find_hat(Uri, Hats) ->
@@ -2665,14 +2789,15 @@ find_hat(Uri, Hats) ->
         [] -> error
     end.
 
-%% @doc Replaces any hats sent by the occupant with the hats the occupant wears in the room.
-%% Clients can't put on hats themselves.
--spec set_hats(jid:jid(), exml:element(), state()) -> exml:element().
+%% @doc Replaces any hats sent by the occupant (the wearer) with the hats the occupant wears
+%% in the room, as seen by the receiver of the presence. Clients can't put on hats themselves.
+-spec set_hats(Wearer :: jid:jid(), Receiver :: jid:jid(), exml:element(), state()) ->
+    exml:element().
 %% Hats sent by clients are removed even when hats are disabled, so that they can't be forged.
-set_hats(JID, Presence, StateData) ->
+set_hats(Wearer, Receiver, Presence, StateData) ->
     Stripped = #xmlel{children = Children} = strip_hats(Presence),
     case is_hats_enabled(StateData) of
-        true -> Stripped#xmlel{children = Children ++ hats_elements(JID, StateData)};
+        true -> Stripped#xmlel{children = Children ++ hats_elements(Wearer, Receiver, StateData)};
         false -> Stripped
     end.
 
@@ -2681,18 +2806,35 @@ strip_hats(Presence = #xmlel{children = Children}) ->
     Presence#xmlel{children = [Child || Child <- Children, not is_hats_element(Child)]}.
 
 is_hats_element(#xmlel{name = <<"hats">>, attrs = #{<<"xmlns">> := ?NS_HATS}}) -> true;
+is_hats_element(#xmlel{name = <<"scoped-hats">>, attrs = #{<<"xmlns">> := ?NS_SCOPED_HATS}}) -> true;
 is_hats_element(_) -> false.
 
--spec hats_elements(jid:jid(), state()) -> [exml:element()].
-hats_elements(JID, #state{hats = Hats, hat_assignments = Assignments}) ->
-    LJID = jid:to_bare(jid:to_lower(JID)),
-    case maps:get(LJID, Assignments, []) of
-        [] ->
-            [];
-        Uris ->
-            HatEls = [hat_element(Hat) || Uri <- Uris, {ok, Hat} <- [find_hat(Uri, Hats)]],
-            [#xmlel{name = <<"hats">>, attrs = #{<<"xmlns">> => ?NS_HATS}, children = HatEls}]
+-spec hats_elements(jid:jid(), jid:jid(), state()) -> [exml:element()].
+hats_elements(Wearer, Receiver, StateData = #state{hats = Hats, hat_assignments = Assignments}) ->
+    LWearer = to_bare_lower(Wearer),
+    Uris = maps:get(LWearer, Assignments, []),
+    %% Hats worn for the whole room aren't repeated as scoped hats
+    ScopedUris = [Uri || Uri <- scoped_hat_uris(LWearer, to_bare_lower(Receiver), StateData),
+                         not lists:member(Uri, Uris)],
+    hats_element(<<"hats">>, ?NS_HATS, Uris, Hats)
+        ++ hats_element(<<"scoped-hats">>, ?NS_SCOPED_HATS, ScopedUris, Hats).
+
+%% The hats the wearer shows only to the viewer. Nobody is a viewer of their own hats.
+-spec scoped_hat_uris(jid:simple_jid(), jid:simple_jid(), state()) -> [hat_uri()].
+scoped_hat_uris(LJID, LJID, _StateData) ->
+    [];
+scoped_hat_uris(LWearer, LViewer, StateData = #state{scoped_hat_assignments = Scoped}) ->
+    case is_scoped_hats_enabled(StateData) of
+        true -> maps:get({LWearer, LViewer}, Scoped, []);
+        false -> []
     end.
+
+-spec hats_element(binary(), binary(), [hat_uri()], [hat()]) -> [exml:element()].
+hats_element(_Name, _NS, [], _Hats) ->
+    [];
+hats_element(Name, NS, Uris, Hats) ->
+    HatEls = [hat_element(Hat) || Uri <- Uris, {ok, Hat} <- [find_hat(Uri, Hats)]],
+    [#xmlel{name = Name, attrs = #{<<"xmlns">> => NS}, children = HatEls}].
 
 -spec hat_element(hat()) -> exml:element().
 hat_element(Hat = #{uri := Uri, title := Title}) ->
@@ -2704,11 +2846,15 @@ hat_element(Hat = #{uri := Uri, title := Title}) ->
 
 %% Hats are stored as lists, so that the options can be encoded as JSON by the RDBMS backend
 -spec hats_opts(state()) -> [{atom(), list()}].
-hats_opts(#state{hats = [], hat_assignments = Assignments}) when map_size(Assignments) =:= 0 ->
+hats_opts(#state{hats = [], hat_assignments = Assignments, scoped_hat_assignments = Scoped})
+  when map_size(Assignments) =:= 0, map_size(Scoped) =:= 0 ->
     [];
-hats_opts(#state{hats = Hats, hat_assignments = Assignments}) ->
+hats_opts(#state{hats = Hats, hat_assignments = Assignments, scoped_hat_assignments = Scoped}) ->
     [{hats, [[Uri, Title, maps:get(hue, Hat, null)] || Hat = #{uri := Uri, title := Title} <- Hats]},
-     {hat_assignments, [[jid:to_binary(LJID) | Uris] || {LJID, Uris} <- maps:to_list(Assignments)]}].
+     {hat_assignments, [[jid:to_binary(LJID) | Uris] || {LJID, Uris} <- maps:to_list(Assignments)]}]
+        ++ [{scoped_hat_assignments,
+             [[jid:to_binary(Wearer), jid:to_binary(Viewer) | Uris]
+              || {{Wearer, Viewer}, Uris} <- maps:to_list(Scoped)]} || map_size(Scoped) > 0].
 
 decode_hat([Uri, Title, null]) -> #{uri => Uri, title => Title};
 decode_hat([Uri, Title, Hue]) -> #{uri => Uri, title => Title, hue => Hue}.
@@ -2717,6 +2863,12 @@ decode_hat([Uri, Title, Hue]) -> #{uri => Uri, title => Title, hue => Hue}.
 decode_hat_assignments(Val) ->
     maps:from_list([{jid:to_lower(Jid), Uris} || [JID | Uris] <- Val,
                                                  Jid <- [jid:from_binary(JID)], Jid =/= error]).
+
+decode_scoped_hat_assignments(Val) ->
+    maps:from_list([{{jid:to_lower(Wearer), jid:to_lower(Viewer)}, Uris}
+                    || [WearerBin, ViewerBin | Uris] <- Val,
+                       Wearer <- [jid:from_binary(WearerBin)], Wearer =/= error,
+                       Viewer <- [jid:from_binary(ViewerBin)], Viewer =/= error]).
 
 -spec lqueue_new(integer()) -> lqueue().
 lqueue_new(Max) ->
@@ -3821,6 +3973,8 @@ set_opts([{Opt, Val} | Opts], SD=#state{config = C = #config{}}) ->
             SD#state{hats = [decode_hat(Hat) || Hat <- Val]};
         hat_assignments ->
             SD#state{hat_assignments = decode_hat_assignments(Val)};
+        scoped_hat_assignments ->
+            SD#state{scoped_hat_assignments = decode_scoped_hat_assignments(Val)};
         subject_timestamp ->
             SD#state{subject_timestamp = Val};
         _ ->

@@ -413,5 +413,7 @@ kv_to_opt({<<"hats">>, Value}) ->
     {true, {hats, Value}};
 kv_to_opt({<<"hat_assignments">>, Value}) ->
     {true, {hat_assignments, Value}};
+kv_to_opt({<<"scoped_hat_assignments">>, Value}) ->
+    {true, {scoped_hat_assignments, Value}};
 kv_to_opt({_Key, _Value}) ->
     false.

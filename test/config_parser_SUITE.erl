@@ -2295,6 +2295,7 @@ mod_muc(_Config) ->
     ?cfgh(P ++ [load_permanent_rooms_at_startup], true,
           T(<<"load_permanent_rooms_at_startup">>, true)),
     ?cfgh(P ++ [hats], true, T(<<"hats">>, true)),
+    ?cfgh(P ++ [scoped_hats], true, T(<<"scoped_hats">>, true)),
     ?cfgh(P ++ [hibernate_timeout], infinity,
           T(<<"hibernate_timeout">>, <<"infinity">>)),
     ?cfgh(P ++ [hibernated_room_check_interval], 5000,
@@ -2326,6 +2327,7 @@ mod_muc(_Config) ->
     ?errh(T(<<"http_auth_pool">>, <<>>)),
     ?errh(T(<<"load_permanent_rooms_at_startup">>, <<"true">>)),
     ?errh(T(<<"hats">>, <<"yes">>)),
+    ?errh(T(<<"scoped_hats">>, <<"yes">>)),
     ?errh(T(<<"hibernate_timeout">>, <<"really big">>)),
     ?errh(T(<<"hibernated_room_check_interval">>, -1)),
     ?errh(T(<<"hibernated_room_timeout">>, false)).

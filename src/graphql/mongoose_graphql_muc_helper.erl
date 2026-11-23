@@ -61,10 +61,13 @@ format_aff({JID, Aff}) ->
     #{<<"jid">> => JID, <<"affiliation">> => Aff}.
 
 -spec format_hats(mod_muc_api:hats_result()) -> map().
-format_hats(#{hats := Hats, assignments := Assignments}) ->
+format_hats(#{hats := Hats, assignments := Assignments, scoped_assignments := Scoped}) ->
     #{<<"hats">> => [{ok, format_hat(Hat)} || Hat <- Hats],
       <<"assignments">> => [{ok, #{<<"jid">> => JID, <<"hats">> => [{ok, Uri} || Uri <- Uris]}}
-                            || {JID, Uris} <- Assignments]}.
+                            || {JID, Uris} <- Assignments],
+      <<"scopedAssignments">> => [{ok, #{<<"jid">> => JID, <<"viewer">> => Viewer,
+                                         <<"hats">> => [{ok, Uri} || Uri <- Uris]}}
+                                  || {JID, Viewer, Uris} <- Scoped]}.
 
 format_hat(Hat = #{uri := Uri, title := Title}) ->
     Hue = case Hat of

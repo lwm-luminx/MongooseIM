@@ -47,6 +47,21 @@ type MUCAdminMutation @protected @use(modules: ["mod_muc"]){
   "Take a hat off a user in a MUC room"
   unassignRoomHat(room: BareJID!, user: BareJID!, uri: String!): String
     @protected(type: DOMAIN, args: ["room"]) @use(args: ["room"])
+  """
+  Give a hat defined in a MUC room to a user, visible only to the audience (scoped hats).
+  With mutual, each member of the audience also wears the hat, visible only to the user,
+  so an audience of one user makes a pairwise hat.
+  """
+  assignScopedRoomHat(room: BareJID!, user: BareJID!, uri: String!, audience: [BareJID!]!,
+                      mutual: Boolean = false): String
+    @protected(type: DOMAIN, args: ["room"]) @use(args: ["room"])
+  """
+  Take a scoped hat off a user for the audience, or for everyone when the audience is not given.
+  With mutual, the hat is also taken off the audience members wearing it for the user.
+  """
+  unassignScopedRoomHat(room: BareJID!, user: BareJID!, uri: String!, audience: [BareJID!],
+                        mutual: Boolean = false): String
+    @protected(type: DOMAIN, args: ["room"]) @use(args: ["room"])
 }
 
 """
