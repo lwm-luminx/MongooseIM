@@ -4,13 +4,19 @@
 -export([send_chat_message/5, send_headline_message/6, send_stanza/3, lookup_recent_messages/5]).
 
 %% Event API
--export([open_session/2, close_session/1]).
+-export([open_session/3, close_session/1,
+         room_presence_sent/3, handle_room_presence/2]).
 
 -include("jlib.hrl").
 -include("mongoose_rsm.hrl").
 -include("mongoose_logger.hrl").
 
 -export_type([stream/0]).
+
+%% Marks the sessions of GraphQL message subscriptions in ejabberd_sm
+-define(SSE_SESSION_INFO, graphql_sse).
+%% Rooms entered from a subscription's session, kept in its process dictionary
+-define(ROOMS_KEY, {?MODULE, rooms}).
 
 -type stream() :: #{jid := jid:jid(),
                     sid := ejabberd_sm:sid(),
@@ -55,13 +61,18 @@ lookup_recent_messages(User, With, Before, Limit, CheckUser) ->
 
 %% Event API
 
--spec open_session(jid:jid(), boolean()) -> {unknown_user, iodata()} | {ok, stream()}.
-open_session(User, CheckUser) ->
-    M = #{user => User, check_user => CheckUser},
-    fold(M, [fun get_host_type/1, fun check_user/1, fun do_open_session/1]).
+%% @doc Opens a session for the user, with the given resource or a random one.
+%% A resource that is already in use is not taken over.
+-spec open_session(jid:jid(), boolean(), jid:resource() | undefined) ->
+          {unknown_user | invalid_resource | resource_conflict, iodata()} | {ok, stream()}.
+open_session(User, CheckUser, Resource) ->
+    M = #{user => User, check_user => CheckUser, resource => Resource},
+    fold(M, [fun get_host_type/1, fun check_user/1, fun check_resource/1,
+             fun do_open_session/1]).
 
 -spec close_session(stream()) -> {ok, closed}.
 close_session(#{jid := Jid = #jid{lserver = S}, sid := Sid, host_type := HostType}) ->
+    leave_rooms(Jid),
     Acc = mongoose_acc:new(
             #{location => ?LOCATION,
               lserver => S,
@@ -178,13 +189,70 @@ lookup_messages(#{user := UserJid, with := WithJid, before := Before, limit := L
     {ok, {_, _, Rows}} = mod_mam_pm:lookup_messages(HostType, Params),
     {ok, {Rows, Limit2}}.
 
-do_open_session(#{host_type := HostType, user := Jid}) ->
-    Sid = ejabberd_sm:make_new_sid(),
+check_resource(#{resource := undefined, user := Jid} = M) ->
     UUID = uuid:uuid_to_string(uuid:get_v4(), binary_standard),
-    Resource = <<"sse-", UUID/binary>>,
-    NewJid = jid:replace_resource(Jid, Resource),
-    ejabberd_sm:open_session(HostType, Sid, NewJid, 1, #{}),
-    {ok, #{sid => Sid, jid => NewJid, host_type => HostType}}.
+    M#{session_jid => jid:replace_resource(Jid, <<"sse-", UUID/binary>>)};
+check_resource(#{resource := <<>>}) ->
+    {invalid_resource, <<"Invalid resource">>};
+check_resource(#{resource := Resource, user := Jid} = M) ->
+    case jid:replace_resource(Jid, Resource) of
+        error ->
+            {invalid_resource, <<"Invalid resource">>};
+        SessionJid ->
+            case ejabberd_sm:get_session_pid(SessionJid) of
+                none -> M#{session_jid => SessionJid};
+                _ -> {resource_conflict, <<"Resource is already in use">>}
+            end
+    end.
+
+%% Two subscriptions racing for the same resource both pass check_resource/1.
+%% ejabberd_sm then replaces the older session, which closes its stream.
+do_open_session(#{host_type := HostType, session_jid := Jid}) ->
+    Sid = ejabberd_sm:make_new_sid(),
+    ejabberd_sm:open_session(HostType, Sid, Jid, 1, #{?SSE_SESSION_INFO => true}),
+    {ok, #{sid => Sid, jid => Jid, host_type => HostType}}.
+
+%% Rooms entered with the GraphQL API from a subscription's session
+
+%% @doc Called when the MUC API sends presence to a room on behalf of a user.
+%% If the user's full JID is a subscription's session, the session remembers the room,
+%% so that it can leave the room when the session is closed.
+%% Otherwise the occupant would stay in the room after the stream ends.
+-spec room_presence_sent(jid:jid(), jid:jid(), enter | exit) -> ok.
+room_presence_sent(#jid{lresource = <<>>}, _RoomJID, _Action) ->
+    ok;
+room_presence_sent(UserJID, RoomJID, Action) ->
+    case ejabberd_sm:get_info(UserJID, ?SSE_SESSION_INFO) of
+        {ok, true} ->
+            case ejabberd_sm:get_session_pid(UserJID) of
+                none -> ok;
+                Pid -> Pid ! {?MODULE, room_presence, Action, RoomJID}, ok
+            end;
+        _ ->
+            ok
+    end.
+
+%% @doc Runs in the subscription's process, see room_presence_sent/3
+-spec handle_room_presence(enter | exit, jid:jid()) -> ok.
+handle_room_presence(Action, RoomJID) ->
+    Rooms = get_rooms(),
+    Rooms1 = case Action of
+                 enter -> Rooms#{jid:to_bare(RoomJID) => RoomJID};
+                 exit -> maps:remove(jid:to_bare(RoomJID), Rooms)
+             end,
+    put(?ROOMS_KEY, Rooms1),
+    ok.
+
+leave_rooms(Jid) ->
+    [mod_muc_api:exit_room(RoomJID, Jid) || RoomJID <- maps:values(get_rooms())],
+    erase(?ROOMS_KEY),
+    ok.
+
+get_rooms() ->
+    case get(?ROOMS_KEY) of
+        undefined -> #{};
+        Rooms -> Rooms
+    end.
 
 %% Helpers
 

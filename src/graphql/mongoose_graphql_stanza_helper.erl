@@ -2,7 +2,7 @@
 
 -import(mongoose_graphql_helper, [null_to_undefined/1, make_error/2]).
 
--export([get_last_messages/5, row_to_map/1, handle_event/1]).
+-export([get_last_messages/5, row_to_map/1, handle_event/1, handle_event/2]).
 
 -include("mongoose.hrl").
 -include("jlib.hrl").
@@ -23,21 +23,74 @@ get_last_messages(Caller, Limit, With, Before, CheckUser) ->
             Error
     end.
 
--spec handle_event(term()) -> {ok, map() | null}.
-handle_event({route, Acc}) ->
-    {From, _To, Packet} = mongoose_acc:packet(Acc),
+-spec handle_event(term()) -> {ok, map() | null} | {ok, null, [{stream, close}]}.
+handle_event(Event) ->
+    handle_event(Event, #{presences => false}).
+
+%% @doc Converts an event for a subscription stream. Messages are always passed,
+%% and presences only when requested.
+-spec handle_event(term(), #{presences := boolean()}) ->
+          {ok, map() | null} | {ok, null, [{stream, close}]}.
+handle_event({route, Acc}, #{presences := Presences}) ->
+    {From, To, Packet} = mongoose_acc:packet(Acc),
     case Packet of
-        Stanza = #xmlel{name = <<"message">>} ->
-            StanzaID = exml_query:attr(Stanza, <<"id">>, <<>>),
-            Timestamp = os:system_time(microsecond),
-            stanza_result(From, Timestamp, StanzaID, Stanza);
+        #xmlel{name = <<"iq">>} ->
+            reply_to_iq(From, To, Packet),
+            {ok, null};
+        #xmlel{name = Name} = Stanza when Name =:= <<"message">>;
+                                          Name =:= <<"presence">> andalso Presences ->
+            %% ejabberd_sm leaves the recipient's privacy checks to the session,
+            %% so that blocked senders (XEP-0016, XEP-0191) are not delivered
+            case is_allowed_by_privacy(Acc, From, To) of
+                true -> route_result(From, Stanza);
+                false -> {ok, null}
+            end;
         _ ->
             {ok, null} % Skip other stanza types
     end;
-handle_event({message, Dir, {UserPid, Jid}, Stanza}) ->
+handle_event(Event, _Opts) ->
+    handle_other_event(Event).
+
+%% A session can't answer requests, so they get an error instead of no response (RFC 6120, 8.2.3)
+reply_to_iq(From, To, Packet) ->
+    case exml_query:attr(Packet, <<"type">>) of
+        Type when Type =:= <<"get">>; Type =:= <<"set">> ->
+            Err = jlib:make_error_reply(Packet, mongoose_xmpp_errors:service_unavailable()),
+            mongoose_router:route(mongoose_acc:new(To, From, Err, ?LOCATION)),
+            ok;
+        _ ->
+            ok
+    end.
+
+is_allowed_by_privacy(Acc, From, To = #jid{lserver = LServer}) ->
+    case mongoose_domain_api:get_domain_host_type(LServer) of
+        {ok, HostType} ->
+            PrivacyList = mongoose_hooks:privacy_get_user_list(HostType, To),
+            {Decision, _} = mongoose_privacy:privacy_check_packet(Acc, To, PrivacyList,
+                                                                  From, To, in),
+            Decision =:= allow;
+        {error, not_found} ->
+            false
+    end.
+
+route_result(From, Stanza) ->
+    StanzaID = exml_query:attr(Stanza, <<"id">>, <<>>),
+    Timestamp = os:system_time(microsecond),
+    stanza_result(From, Timestamp, StanzaID, Stanza).
+
+handle_other_event({message, Dir, {UserPid, Jid}, Stanza}) ->
     Timestamp = os:system_time(microsecond),
     trace_result(Timestamp, UserPid, Jid, Dir, Stanza);
-handle_event(Msg) ->
+handle_other_event({mongoose_stanza_api, room_presence, Action, RoomJID}) ->
+    mongoose_stanza_api:handle_room_presence(Action, RoomJID),
+    {ok, null};
+handle_other_event({'$gen_cast', {exit, Reason}}) ->
+    %% ejabberd_sm ends a session with mongoose_c2s:exit/2, e.g. when the session is kicked,
+    %% the user is removed or another session takes over the resource.
+    %% Closing the stream runs 'terminate', which closes the session.
+    ?LOG_INFO(#{what => graphql_sse_session_terminated, reason => Reason}),
+    {ok, null, [{stream, close}]};
+handle_other_event(Msg) ->
     ?UNEXPECTED_INFO(Msg),
     {ok, null}.
 

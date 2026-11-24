@@ -17,14 +17,16 @@ execute(Ctx, _Obj, <<"subscribeForTraffic">>, Args) ->
 subscribe_for_messages(#{event := terminate, stream := Session}, _) ->
     mongoose_stanza_api:close_session(Session),
     {ok, null, [{stream, closed}]};
-subscribe_for_messages(#{event := Event}, _) ->
-    mongoose_graphql_stanza_helper:handle_event(Event);
-subscribe_for_messages(_Ctx, #{<<"caller">> := Jid}) ->
-    case mongoose_stanza_api:open_session(Jid, true) of
+subscribe_for_messages(#{event := Event}, Args) ->
+    Presences = maps:get(<<"presences">>, Args, false) =:= true,
+    mongoose_graphql_stanza_helper:handle_event(Event, #{presences => Presences});
+subscribe_for_messages(_Ctx, #{<<"caller">> := Jid} = Args) ->
+    Resource = null_to_undefined(maps:get(<<"resource">>, Args, null)),
+    case mongoose_stanza_api:open_session(Jid, true, Resource) of
         {ok, Stream} ->
             {ok, null, [{stream, Stream}]};
         Error ->
-            format_result(Error, #{caller => Jid})
+            format_result(Error, #{caller => Jid, resource => Resource})
     end.
 
 subscribe_for_traffic(#{event := terminate}, _) ->
@@ -36,3 +38,6 @@ subscribe_for_traffic(#{event := Event}, _) ->
 subscribe_for_traffic(#{params := #{<<"limit">> := Limit}}, _) ->
     service_traffic:register(Limit),
     {ok, null, [{stream, make_ref()}]}.
+
+null_to_undefined(null) -> undefined;
+null_to_undefined(Value) -> Value.

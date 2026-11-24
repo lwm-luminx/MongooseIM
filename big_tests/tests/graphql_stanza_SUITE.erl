@@ -23,7 +23,8 @@ all() ->
 
 groups() ->
     [{admin_stanza_http, [], [{group, admin_mam},
-                              {group, admin_no_mam_http}]},
+                              {group, admin_no_mam_http},
+                              {group, admin_sse_modules}]},
      {admin_stanza_cli, [], [{group, admin_mam},
                              {group, admin_no_mam_cli}]},
      {domain_admin_stanza, [], [{group, admin_mam}, % same as for admin
@@ -32,6 +33,8 @@ groups() ->
                         {group, user_no_mam}]},
      {admin_mam, [parallel], admin_mam_cases()},
      {admin_no_mam_http, [parallel], admin_stanza_cases(http) ++ admin_no_mam_cases()},
+     %% Not parallel: these cases load and unload modules, which races with other cases
+     {admin_sse_modules, [], admin_sse_module_cases()},
      {admin_no_mam_cli, [], admin_stanza_cases(cli) ++ admin_no_mam_cases()},
      {domain_admin_no_mam, [parallel], domain_admin_stanza_cases() ++ admin_no_mam_cases()},
      {user_mam, [parallel], user_mam_cases()},
@@ -53,7 +56,18 @@ admin_stanza_cases() ->
 
 admin_sse_cases() ->
     [admin_subscribe_for_messages,
-     admin_subscribe_for_messages_to_unknown_user].
+     admin_subscribe_for_messages_with_resource,
+     admin_subscribe_for_messages_with_resource_in_use,
+     admin_subscribe_for_messages_with_presences,
+     admin_subscription_rejects_iq,
+     admin_subscribe_for_messages_to_unknown_user,
+     admin_subscription_closed_on_kick,
+     admin_subscription_closed_on_user_removal,
+     admin_subscription_replaced_by_client_session].
+
+admin_sse_module_cases() ->
+    [admin_subscription_skips_blocked_sender,
+     admin_subscription_leaves_rooms_on_close].
 
 admin_mam_cases() ->
     [admin_get_last_messages,
@@ -81,6 +95,9 @@ domain_admin_stanza_cases() ->
 user_stanza_cases() ->
     [user_send_message,
      user_subscribe_for_messages,
+     user_subscribe_for_messages_with_resource,
+     user_subscribe_for_messages_with_resource_in_use,
+     user_subscribe_for_messages_with_presences,
      user_send_message_without_from,
      user_send_message_with_spoofed_from,
      user_send_message_headline,
@@ -117,6 +134,7 @@ init_per_group(GN, Config) when GN =:= admin_mam;
                                 GN =:= user_mam ->
     init_mam(Config);
 init_per_group(GN, Config) when GN =:= admin_no_mam_http;
+                                GN =:= admin_sse_modules;
                                 GN =:= admin_no_mam_cli;
                                 GN =:= domain_admin_no_mam;
                                 GN =:= user_no_mam ->
@@ -190,6 +208,173 @@ admin_subscribe_for_messages_story(Config, Alice, Bob) ->
     escalus:assert(is_message, Stanza),
     sse_helper:stop_sse(Stream).
 
+admin_subscribe_for_messages_with_resource(Config) ->
+    escalus:fresh_story_with_config(Config, [{alice, 1}, {bob, 1}],
+                                    fun admin_subscribe_for_messages_with_resource_story/3).
+
+admin_subscribe_for_messages_with_resource_story(Config, Alice, Bob) ->
+    To = escalus_client:short_jid(Bob),
+    {200, Stream} = subscribe_for_messages(To, <<"sse-res">>, Config),
+    assert_message_to_resource_is_streamed(Alice, To, <<"sse-res">>, Stream).
+
+admin_subscribe_for_messages_with_resource_in_use(Config) ->
+    escalus:fresh_story_with_config(Config, [{bob, 1}],
+                                    fun admin_subscribe_for_messages_with_resource_in_use_story/2).
+
+admin_subscribe_for_messages_with_resource_in_use_story(Config, Bob) ->
+    To = escalus_client:short_jid(Bob),
+    Res = subscribe_for_messages(To, escalus_client:resource(Bob), Config),
+    ?assertEqual(<<"resource_conflict">>, get_err_code(Res)),
+    %% Bob's session was not taken over
+    escalus_client:send(Bob, escalus_stanza:chat_to(escalus_client:full_jid(Bob), <<"Hi!">>)),
+    escalus:assert(is_chat_message, [<<"Hi!">>], escalus:wait_for_stanza(Bob)).
+
+admin_subscribe_for_messages_with_presences(Config) ->
+    escalus:fresh_story_with_config(Config, [{alice, 1}, {bob, 1}],
+                                    fun admin_subscribe_for_messages_with_presences_story/3).
+
+admin_subscribe_for_messages_with_presences_story(Config, Alice, Bob) ->
+    To = escalus_client:short_jid(Bob),
+    Vars = #{caller => To, resource => <<"sse-res">>, presences => true},
+    {200, Stream} = execute_command_sse(<<"stanza">>, <<"subscribeForMessages">>, Vars, Config),
+    assert_presence_and_message_are_streamed(Alice, To, <<"sse-res">>, Stream).
+
+%% The recipient's privacy lists apply to the subscription's session too (XEP-0191)
+admin_subscription_skips_blocked_sender(Config) ->
+    HostType = domain_helper:host_type(),
+    BlockingOpts = config_parser_helper:mod_config_with_auto_backend(mod_blocking),
+    WasLoaded = rpc(gen_mod, is_loaded, [HostType, mod_blocking]),
+    dynamic_modules:ensure_modules(HostType, [{mod_blocking, BlockingOpts}]),
+    try
+        escalus:fresh_story_with_config(Config, [{alice, 1}, {bob, 1}, {kate, 1}],
+                                        fun admin_subscription_skips_blocked_sender_story/4)
+    after
+        %% Leave the other cases with the modules they started with
+        WasLoaded orelse dynamic_modules:ensure_stopped(HostType, [mod_blocking])
+    end.
+
+admin_subscription_skips_blocked_sender_story(Config, Alice, Bob, Kate) ->
+    AliceJid = escalus_utils:jid_to_lower(escalus_client:short_jid(Alice)),
+    escalus_client:send(Bob, mod_blocking_SUITE:block_users_stanza([AliceJid])),
+    escalus:assert_many([is_iq_result, fun(_) -> true end], escalus:wait_for_stanzas(Bob, 2)),
+    BobJid = escalus_client:short_jid(Bob),
+    {200, Stream} = subscribe_for_messages(BobJid, <<"sse-res">>, Config),
+    SessionJid = <<BobJid/binary, "/sse-res">>,
+    wait_helper:wait_until(fun() -> rpc(ejabberd_sm, get_session_pid, [jid:from_binary(SessionJid)])
+                                        =/= none end,
+                           true, #{name => sse_session_opened}),
+    escalus:send(Alice, escalus_stanza:chat_to(SessionJid, <<"Blocked">>)),
+    escalus:send(Kate, escalus_stanza:chat_to(SessionJid, <<"Allowed">>)),
+    Event = sse_helper:wait_for_event(Stream),
+    #{<<"stanza">> := StanzaBin} =
+        graphql_helper:get_value([data, stanza, subscribeForMessages], Event),
+    {ok, Stanza} = exml:parse(StanzaBin),
+    escalus:assert(is_chat_message, [<<"Allowed">>], Stanza),
+    sse_helper:stop_sse(Stream).
+
+%% The session can't answer requests, so they get an error
+admin_subscription_rejects_iq(Config) ->
+    escalus:fresh_story_with_config(Config, [{alice, 1}, {bob, 1}],
+                                    fun admin_subscription_rejects_iq_story/3).
+
+admin_subscription_rejects_iq_story(Config, Alice, Bob) ->
+    BobJid = escalus_client:short_jid(Bob),
+    {200, Stream} = subscribe_for_messages(BobJid, <<"sse-res">>, Config),
+    SessionJid = <<BobJid/binary, "/sse-res">>,
+    wait_helper:wait_until(fun() -> rpc(ejabberd_sm, get_session_pid, [jid:from_binary(SessionJid)])
+                                        =/= none end,
+                           true, #{name => sse_session_opened}),
+    escalus:send(Alice, escalus_stanza:to(escalus_stanza:iq_get(<<"jabber:iq:version">>, []),
+                                          SessionJid)),
+    escalus:assert(is_error, [<<"cancel">>, <<"service-unavailable">>],
+                   escalus:wait_for_stanza(Alice)),
+    sse_helper:stop_sse(Stream).
+
+%% Ending the session closes the stream, and no more messages are delivered over it
+admin_subscription_closed_on_kick(Config) ->
+    Config1 = escalus_fresh:create_users(Config, [{bob, 1}]),
+    BobJid = escalus_users:get_jid(Config1, bob),
+    {200, Stream} = subscribe_for_messages(BobJid, Config1),
+    [SessionJid] = wait_for_sse_session(BobJid),
+    {ok, _} = rpc(mongoose_session_api, kick_session, [SessionJid, <<"kicked">>]),
+    assert_sse_closed(Stream),
+    ?assertEqual([], rpc(ejabberd_sm, get_user_resources, [jid:from_binary(BobJid)])).
+
+admin_subscription_closed_on_user_removal(Config) ->
+    Config1 = escalus_fresh:create_users(Config, [{bob, 1}]),
+    BobJid = escalus_users:get_jid(Config1, bob),
+    {200, Stream} = subscribe_for_messages(BobJid, Config1),
+    [_] = wait_for_sse_session(BobJid),
+    [LUser, LServer] = binary:split(BobJid, <<"@">>),
+    {ok, _} = rpc(mongoose_account_api, unregister_user, [LUser, LServer]),
+    assert_sse_closed(Stream),
+    ?assertEqual([], rpc(ejabberd_sm, get_user_resources, [jid:from_binary(BobJid)])).
+
+%% A client binding the same resource takes over the subscription's session
+admin_subscription_replaced_by_client_session(Config) ->
+    Config1 = escalus_fresh:create_users(Config, [{bob, 1}]),
+    BobJid = escalus_users:get_jid(Config1, bob),
+    Resource = <<"res1">>, % the resource that escalus uses for Bob
+    {200, Stream} = subscribe_for_messages(BobJid, Resource, Config1),
+    [_] = wait_for_sse_session(BobJid),
+    {ok, Bob} = escalus_client:start(Config1, bob, Resource),
+    assert_sse_closed(Stream),
+    escalus_client:send(Bob, escalus_stanza:chat_to(escalus_client:full_jid(Bob), <<"Hi!">>)),
+    escalus:assert(is_chat_message, [<<"Hi!">>], escalus:wait_for_stanza(Bob)),
+    escalus_client:stop(Config1, Bob).
+
+%% Rooms entered with the GraphQL API from the subscription's session are left when it closes,
+%% so the user doesn't stay in them as an occupant without a session
+admin_subscription_leaves_rooms_on_close(Config) ->
+    muc_helper:load_muc(),
+    try
+        escalus:fresh_story_with_config(Config, [{alice, 1}, {bob, 1}],
+                                        fun admin_subscription_leaves_rooms_on_close_story/3)
+    after
+        muc_helper:unload_muc()
+    end.
+
+admin_subscription_leaves_rooms_on_close_story(Config, Alice, Bob) ->
+    RoomJID = jid:make_bare(muc_helper:fresh_room_name(), muc_helper:muc_host()),
+    AliceJid = jid:from_binary(escalus_client:full_jid(Alice)),
+    {ok, _} = rpc(mod_muc_api, create_instant_room, [RoomJID, AliceJid, <<"ali">>]),
+    BobJid = escalus_client:short_jid(Bob),
+    {200, Stream} = subscribe_for_messages(BobJid, <<"sse-res">>, Config),
+    SessionJid = jid:replace_resource(jid:from_binary(BobJid), <<"sse-res">>),
+    wait_helper:wait_until(fun() -> rpc(ejabberd_sm, get_session_pid, [SessionJid]) =/= none end,
+                           true, #{name => sse_session_opened}),
+    rpc(mod_muc_api, enter_room, [jid:replace_resource(RoomJID, <<"bobek">>), SessionJid, undefined]),
+    wait_helper:wait_until(fun() -> is_room_occupant(RoomJID, SessionJid) end, true,
+                           #{name => sse_user_entered_room}),
+    %% The session has to know about the room before the stream ends
+    wait_helper:wait_until(fun() -> session_rooms(SessionJid) end, [RoomJID],
+                           #{name => sse_session_tracks_room}),
+    sse_helper:stop_sse(Stream),
+    wait_helper:wait_until(fun() -> is_room_occupant(RoomJID, SessionJid) end, false,
+                           #{name => sse_user_left_room}).
+
+session_rooms(SessionJid) ->
+    Pid = rpc(ejabberd_sm, get_session_pid, [SessionJid]),
+    {dictionary, Dict} = rpc(erlang, process_info, [Pid, dictionary]),
+    maps:keys(proplists:get_value({mongoose_stanza_api, rooms}, Dict, #{})).
+
+is_room_occupant(RoomJID, UserJid) ->
+    {ok, Users} = rpc(mod_muc_api, get_room_users, [RoomJID]),
+    lists:any(fun(#{jid := Jid}) -> Jid =:= UserJid end, Users).
+
+wait_for_sse_session(BareJid) ->
+    Jid = jid:from_binary(BareJid),
+    wait_helper:wait_until(fun() -> length(rpc(ejabberd_sm, get_user_resources, [Jid])) end, 1,
+                           #{name => sse_session_opened}),
+    [jid:replace_resource(Jid, Resource) || Resource <- rpc(ejabberd_sm, get_user_resources, [Jid])].
+
+rpc(M, F, A) ->
+    distributed_helper:rpc(mim(), M, F, A).
+
+assert_sse_closed(Stream) ->
+    ?assertEqual(fin, lists:last([started | sse_helper:wait_for_events(Stream, 5000)])),
+    sse_helper:stop_sse(Stream).
+
 user_send_message(Config) ->
     escalus:fresh_story_with_config(Config, [{alice, 1}, {bob, 1}],
                                     fun user_send_message_story/3).
@@ -216,6 +401,67 @@ user_subscribe_for_messages_story(Config, Alice, Bob) ->
         graphql_helper:get_value([data, stanza, subscribeForMessages], Event),
     {ok, Stanza} = exml:parse(StanzaBin),
     escalus:assert(is_message, Stanza),
+    sse_helper:stop_sse(Stream).
+
+user_subscribe_for_messages_with_resource(Config) ->
+    escalus:fresh_story_with_config(Config, [{alice, 1}, {bob, 1}],
+                                    fun user_subscribe_for_messages_with_resource_story/3).
+
+user_subscribe_for_messages_with_resource_story(Config, Alice, Bob) ->
+    To = escalus_client:short_jid(Bob),
+    {200, Stream} = user_subscribe_for_messages(Bob, <<"sse-res">>, Config),
+    assert_message_to_resource_is_streamed(Alice, To, <<"sse-res">>, Stream).
+
+user_subscribe_for_messages_with_resource_in_use(Config) ->
+    escalus:fresh_story_with_config(Config, [{bob, 1}],
+                                    fun user_subscribe_for_messages_with_resource_in_use_story/2).
+
+user_subscribe_for_messages_with_resource_in_use_story(Config, Bob) ->
+    Res = user_subscribe_for_messages(Bob, escalus_client:resource(Bob), Config),
+    ?assertEqual(<<"resource_conflict">>, get_err_code(Res)),
+    %% Bob's session was not taken over
+    escalus_client:send(Bob, escalus_stanza:chat_to(escalus_client:full_jid(Bob), <<"Hi!">>)),
+    escalus:assert(is_chat_message, [<<"Hi!">>], escalus:wait_for_stanza(Bob)).
+
+user_subscribe_for_messages_with_presences(Config) ->
+    escalus:fresh_story_with_config(Config, [{alice, 1}, {bob, 1}],
+                                    fun user_subscribe_for_messages_with_presences_story/3).
+
+user_subscribe_for_messages_with_presences_story(Config, Alice, Bob) ->
+    To = escalus_client:short_jid(Bob),
+    Vars = #{resource => <<"sse-res">>, presences => true},
+    {200, Stream} = execute_user_command_sse(<<"stanza">>, <<"subscribeForMessages">>,
+                                             Bob, Vars, Config),
+    assert_presence_and_message_are_streamed(Alice, To, <<"sse-res">>, Stream).
+
+%% Both a directed presence and a message are delivered to the stream, in order
+assert_presence_and_message_are_streamed(Sender, BareJID, Resource, Stream) ->
+    From = escalus_client:full_jid(Sender),
+    To = <<BareJID/binary, "/", Resource/binary>>,
+    escalus:send(Sender, escalus_stanza:presence_direct(To, <<"available">>)),
+    escalus:send(Sender, escalus_stanza:chat(From, To, <<"Hi!">>)),
+    [Event1, Event2] = sse_helper:wait_for_events(Stream, 2, 5000),
+    [Presence, Message] = [begin
+                               #{<<"stanza">> := StanzaBin, <<"sender">> := From} =
+                                   graphql_helper:get_value([data, stanza, subscribeForMessages], E),
+                               {ok, Stanza} = exml:parse(StanzaBin),
+                               Stanza
+                           end || E <- [Event1, Event2]],
+    escalus:assert(is_presence, Presence),
+    escalus:assert(is_message, Message),
+    sse_helper:stop_sse(Stream).
+
+%% A message sent to the full JID with the chosen resource is delivered to the stream
+assert_message_to_resource_is_streamed(Sender, BareJID, Resource, Stream) ->
+    From = escalus_client:full_jid(Sender),
+    To = <<BareJID/binary, "/", Resource/binary>>,
+    escalus:send(Sender, escalus_stanza:chat(From, To, <<"Hi!">>)),
+    Event = sse_helper:wait_for_event(Stream),
+    #{<<"stanza">> := StanzaBin, <<"sender">> := From} =
+        graphql_helper:get_value([data, stanza, subscribeForMessages], Event),
+    {ok, Stanza} = exml:parse(StanzaBin),
+    escalus:assert(is_message, Stanza),
+    ?assertEqual(To, exml_query:attr(Stanza, <<"to">>)),
     sse_helper:stop_sse(Stream).
 
 user_send_message_without_from(Config) ->
@@ -584,8 +830,16 @@ subscribe_for_messages(Caller, Config) ->
     Vars = #{caller => Caller},
     execute_command_sse(<<"stanza">>, <<"subscribeForMessages">>, Vars, Config).
 
+subscribe_for_messages(Caller, Resource, Config) ->
+    Vars = #{caller => Caller, resource => Resource},
+    execute_command_sse(<<"stanza">>, <<"subscribeForMessages">>, Vars, Config).
+
 user_subscribe_for_messages(User, Config) ->
     execute_user_command_sse(<<"stanza">>, <<"subscribeForMessages">>, User, #{}, Config).
+
+user_subscribe_for_messages(User, Resource, Config) ->
+    Vars = #{resource => Resource},
+    execute_user_command_sse(<<"stanza">>, <<"subscribeForMessages">>, User, Vars, Config).
 
 get_last_messages(Caller, With, Before, Config) ->
     Vars = #{caller => Caller, with => With, before => Before},

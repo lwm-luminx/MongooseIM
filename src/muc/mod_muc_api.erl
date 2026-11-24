@@ -487,12 +487,14 @@ set_role(RoomJID, UserJID, Nick, Role) ->
 enter_room(RoomJID, UserJID, Password) ->
     Presence = presence(UserJID, RoomJID, Password),
     mongoose_router:route(mongoose_acc:new(UserJID, RoomJID, Presence, ?LOCATION)),
+    mongoose_stanza_api:room_presence_sent(UserJID, RoomJID, enter),
     {ok, ~"Entering room message sent successfully"}.
 
 -spec exit_room(jid:jid(), jid:jid()) -> {ok, binary()}.
 exit_room(RoomJID, UserJID) ->
     Presence = exit_room_presence(UserJID, RoomJID),
     mongoose_router:route(mongoose_acc:new(UserJID, RoomJID, Presence, ?LOCATION)),
+    mongoose_stanza_api:room_presence_sent(UserJID, RoomJID, exit),
     {ok, ~"Exiting room message sent successfully"}.
 
 %% Internal
