@@ -98,6 +98,9 @@
          lookup_first_and_last_messages/4,
          lookup_first_and_last_messages/5,
          incremental_delete_domain/5,
+         delete_in_batches/4,
+         prepare_delete_messages/5,
+         delete_messages_args/2,
          db_message_codec/2, db_jid_codec/2]).
 
 -callback extra_fin_element(mongooseim:host_type(),
@@ -1437,6 +1440,69 @@ incremental_delete_domain(HostType, Domain, Limit, [Query | MoreQueries] = AllQu
             incremental_delete_domain(HostType, Domain, Limit, MoreQueries, N + TotalDeleted);
         {remove_more, N} ->
             incremental_delete_domain(HostType, Domain, Limit, AllQueries, N + TotalDeleted)
+    end.
+
+%% @doc Prepare the queries deleting messages archived before a given message ID,
+%% from one archive or from all archives of a server. Both archive tables have the
+%% primary key `(ArchiveColumn, id)', and their archives are listed in `mam_server_user'.
+-spec prepare_delete_messages(#{delete_domain_limit := pos_integer() | infinity},
+                              Table :: atom(), ArchiveColumn :: atom(),
+                              ArchiveQuery :: atom(), ServerQuery :: atom()) -> ok.
+prepare_delete_messages(#{delete_domain_limit := Limit}, Table, ArchiveColumn,
+                        ArchiveQuery, ServerQuery) ->
+    ArchiveFields = ['mam_server_user.server', 'mam_server_user.user_name', id],
+    ServerFields = ['mam_server_user.server', id],
+    mongoose_rdbms:prepare(ArchiveQuery, Table, ArchiveFields,
+                           delete_messages_sql(Table, ArchiveColumn, Limit, [server, user_name])),
+    mongoose_rdbms:prepare(ServerQuery, Table, ServerFields,
+                           delete_messages_sql(Table, ArchiveColumn, Limit, [server])),
+    ok.
+
+-spec delete_messages_sql(atom(), atom(), pos_integer() | infinity, [atom()]) -> binary().
+delete_messages_sql(Table, ArchiveColumn, infinity, FilterColumns) ->
+    T = atom_to_binary(Table),
+    A = atom_to_binary(ArchiveColumn),
+    Filter = archive_filter_sql(<<>>, FilterColumns),
+    <<"DELETE FROM ", T/binary, " WHERE ", A/binary, " IN "
+      "(SELECT id FROM mam_server_user WHERE ", Filter/binary, ") AND id < ?">>;
+delete_messages_sql(Table, ArchiveColumn, Limit, FilterColumns) ->
+    %% The extra derived table lets MySQL use LIMIT in a subquery of DELETE.
+    T = atom_to_binary(Table),
+    A = atom_to_binary(ArchiveColumn),
+    Filter = archive_filter_sql(<<"msu.">>, FilterColumns),
+    LimitSQL = rdbms_queries:limit(Limit),
+    <<"DELETE FROM ", T/binary, " WHERE (", A/binary, ", id) IN "
+      "(SELECT * FROM (SELECT msg.", A/binary, ", msg.id FROM ", T/binary, " msg"
+      " INNER JOIN mam_server_user msu ON msu.id = msg.", A/binary,
+      " WHERE ", Filter/binary, " AND msg.id < ?", LimitSQL/binary, ") AS T)">>.
+
+-spec archive_filter_sql(binary(), [atom()]) -> binary().
+archive_filter_sql(Prefix, Columns) ->
+    Conditions = [<<Prefix/binary, (atom_to_binary(Column))/binary, " = ?">> || Column <- Columns],
+    iolist_to_binary(lists:join(<<" AND ">>, Conditions)).
+
+-spec delete_messages_args(mod_mam:delete_messages_scope(), mod_mam:message_id()) -> [term()].
+delete_messages_args({archive, LServer, LUser}, BeforeID) ->
+    [LServer, LUser, BeforeID];
+delete_messages_args({server, LServer}, BeforeID) ->
+    [LServer, BeforeID].
+
+%% @doc Run a prepared DELETE query that removes at most `Limit' rows per run,
+%% until it removes fewer than that. With `infinity', the query has no limit and runs once.
+%% Returns the number of deleted rows.
+-spec delete_in_batches(mongooseim:host_type(), mongoose_rdbms:query_name(), [term()],
+                        pos_integer() | infinity) -> non_neg_integer().
+delete_in_batches(HostType, Query, Args, infinity) ->
+    {updated, N} = mongoose_rdbms:execute_successfully(HostType, Query, Args),
+    N;
+delete_in_batches(HostType, Query, Args, Limit) ->
+    delete_in_batches(HostType, Query, Args, Limit, 0).
+
+delete_in_batches(HostType, Query, Args, Limit, TotalDeleted) ->
+    Result = mongoose_rdbms:execute_successfully(HostType, Query, Args),
+    case is_removing_done(Result, Limit) of
+        {done, N} -> TotalDeleted + N;
+        {remove_more, N} -> delete_in_batches(HostType, Query, Args, Limit, TotalDeleted + N)
     end.
 
 -spec is_removing_done(LastResult :: {updated, non_neg_integer()}, Limit :: non_neg_integer()) ->

@@ -40,6 +40,7 @@
 {suites, "tests", graphql_inbox_SUITE}.
 {suites, "tests", graphql_last_SUITE}.
 
+{suites, "tests", graphql_mam_SUITE}.
 {suites, "tests", graphql_muc_SUITE}.
 
 {suites, "tests", graphql_muc_light_SUITE}.

@@ -24,6 +24,7 @@
          archive_message/3,
          lookup_messages/3,
          remove_archive/3,
+         delete_messages/3,
          remove_domain/3,
          get_mam_muc_gdpr_data/3]).
 
@@ -92,6 +93,7 @@ hooks(HostType) ->
         {mam_muc_archive_size, HostType, fun ?MODULE:archive_size/3, #{}, 50},
         {mam_muc_lookup_messages, HostType, fun ?MODULE:lookup_messages/3, #{}, 50},
         {mam_muc_remove_archive, HostType, fun ?MODULE:remove_archive/3, #{}, 50},
+        {mam_muc_delete_messages, HostType, fun ?MODULE:delete_messages/3, #{}, 50},
         {get_mam_muc_gdpr_data, HostType, fun ?MODULE:get_mam_muc_gdpr_data/3, #{}, 50}
     ].
 
@@ -106,6 +108,11 @@ register_prepared_queries(Opts) ->
 
     %% Domain Removal
     prepare_remove_domain(Opts),
+
+    %% Deleting old messages
+    mod_mam_utils:prepare_delete_messages(Opts, mam_muc_message, room_id,
+                                          mam_muc_delete_archive_messages,
+                                          mam_muc_delete_server_messages),
 
     mongoose_rdbms:prepare(mam_muc_make_tombstone, mam_muc_message, [message, room_id, id],
                            <<"UPDATE mam_muc_message SET message = ?, search_body = '' "
@@ -321,6 +328,19 @@ prepare_insert(Name, NumRows) ->
 remove_archive(Acc, #{archive_id := ArcID}, #{host_type := HostType}) ->
     mongoose_rdbms:execute_successfully(HostType, mam_muc_archive_remove, [ArcID]),
     {ok, Acc}.
+
+-spec delete_messages(Acc, Params, Extra) -> {ok, Acc} when
+    Acc :: {ok, non_neg_integer()} | {error, not_supported},
+    Params :: mod_mam:delete_messages_params(),
+    Extra :: gen_hook:extra().
+delete_messages(_Acc, #{scope := Scope, before_id := BeforeID}, #{host_type := HostType}) ->
+    Query = case Scope of
+                {archive, _, _} -> mam_muc_delete_archive_messages;
+                {server, _} -> mam_muc_delete_server_messages
+            end,
+    Args = mod_mam_utils:delete_messages_args(Scope, BeforeID),
+    Limit = gen_mod:get_module_opt(HostType, ?MODULE, delete_domain_limit),
+    {ok, {ok, mod_mam_utils:delete_in_batches(HostType, Query, Args, Limit)}}.
 
 -spec remove_domain(Acc, Params, Extra) -> {ok | stop, Acc} when
     Acc :: mongoose_domain_api:remove_domain_acc(),

@@ -188,6 +188,7 @@ admin_mapping_rules() ->
         'ServerAdminMutation' => mongoose_graphql_server_admin_mutation,
         'LastAdminMutation' => mongoose_graphql_last_admin_mutation,
         'LastAdminQuery' => mongoose_graphql_last_admin_query,
+        'MAMAdminMutation' => mongoose_graphql_mam_admin_mutation,
         'AccountAdminQuery' => mongoose_graphql_account_admin_query,
         'AccountAdminMutation' => mongoose_graphql_account_admin_mutation,
         'MUCAdminMutation' => mongoose_graphql_muc_admin_mutation,
