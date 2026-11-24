@@ -405,7 +405,8 @@ init_new(#{init_type := start_new, host_type := HostType, muc_host := Host,
                    just_created = true,
                    room_shaper = Shaper,
                    http_auth_pool = HttpAuthPool,
-                   hibernate_timeout = read_hibernate_timeout(HostType)},
+                   hibernate_timeout = read_hibernate_timeout(HostType),
+                   occupant_id_salt = new_occupant_id_salt()},
     State1 = set_opts(DefRoomOpts, State),
     State2 = set_affiliation(Creator, owner, State1),
     ?LOG_INFO(ls(#{what => muc_room_started,
@@ -450,7 +451,8 @@ init_restored(#{init_type := start_restored,
                                    })),
     mongoose_instrument:execute(mod_muc_process_recreations, #{host_type => HostType},
                                 #{count => 1, jid => RoomJid}),
-    {ok, normal_state, State, State#state.hibernate_timeout}.
+    State1 = maybe_add_occupant_id_salt(State),
+    {ok, normal_state, State1, State1#state.hibernate_timeout}.
 
 %% @doc In the locked state StateData contains the same settings it previously
 %% held for the normal_state. The fsm awaits either a confirmation or a
@@ -834,7 +836,8 @@ stop_if_only_owner_is_online(RoomName, 1, #state{users = Users, jid = RoomJID} =
     case get_affiliation(LastUser, State) of
         owner ->
             ItemAttrs = #{<<"affiliation">> => <<"owner">>, <<"role">> => <<"none">>},
-            Packet = unavailable_presence(ItemAttrs, <<"Room hibernation">>),
+            Packet = set_occupant_id(LastUser, unavailable_presence(ItemAttrs, <<"Room hibernation">>),
+                                     State),
             FromRoom = jid:replace_resource(RoomJID, Nick),
             mongoose_router:route(mongoose_acc:new(FromRoom, LastUser, Packet, ?LOCATION)),
             tab_remove_online_user(LJID, State),
@@ -872,7 +875,7 @@ terminate(Reason, _StateName, StateData) ->
                           mongoose_acc:new(
                               jid:replace_resource(StateData#state.jid, Nick),
                               Info#user.jid,
-                              Packet,
+                              set_occupant_id(Info#user.jid, Packet, StateData),
                               ?LOCATION));
                   _ -> ok
               end,
@@ -991,7 +994,8 @@ can_send_broadcasts(Role, StateData) ->
     or not (StateData#state.config)#config.moderated.
 
 broadcast_room_packet(From, FromNick, Role, RMess, StateData) ->
-    #routed_message{packet = Packet, stable_stanza_id = StableID} = RMess,
+    #routed_message{packet = Packet0, stable_stanza_id = StableID} = RMess,
+    Packet = set_occupant_id(From, Packet0, StateData),
     TS = erlang:system_time(microsecond),
     Affiliation = get_affiliation(From, StateData),
     EventData = #{from_nick => FromNick, from_jid => From,
@@ -1827,7 +1831,7 @@ strip_status(#xmlel{name = <<"presence">>, attrs = Attrs,
 -spec add_user_presence(jid:jid(), exml:element(), state()) -> state().
 add_user_presence(JID, Presence, StateData) ->
     LJID = jid:to_lower(JID),
-    FPresence = strip_hats(filter_presence(Presence)),
+    FPresence = set_occupant_id(JID, strip_hats(filter_presence(Presence)), StateData),
     Users =
     maps:update_with(
       LJID,
@@ -1841,7 +1845,7 @@ add_user_presence(JID, Presence, StateData) ->
                         state()) -> state().
 add_user_presence_un(JID, Presence, StateData) ->
     LJID = jid:to_lower(JID),
-    FPresence = strip_hats(filter_presence(Presence)),
+    FPresence = set_occupant_id(JID, strip_hats(filter_presence(Presence)), StateData),
     Users =
     maps:update_with(
       LJID,
@@ -2357,8 +2361,9 @@ send_new_presence_to(NJID, Reason, Receivers, StateData) ->
       end,
     maps_or_pairs_foreach(F, Receivers).
 
-send_new_presence_to_single(NJID, #user{jid = RealJID, nick = Nick, last_presence = Presence},
+send_new_presence_to_single(NJID, #user{jid = RealJID, nick = Nick, last_presence = Presence0},
                             BAffiliation, BRole, Reason, ReceiverInfo, StateData) ->
+    Presence = set_occupant_id(RealJID, Presence0, StateData),
     ItemAttrs =
         case (ReceiverInfo#user.role == moderator) orelse
                  not (StateData#state.config)#config.anonymous of
@@ -2423,8 +2428,9 @@ send_existing_presences(ToJID, StateData) ->
 -spec send_existing_presence({jid:simple_jid(), mod_muc_room_user()}, mod_muc:role(),
                              jid:jid(), state()) -> mongoose_acc:t().
 send_existing_presence({_LJID, #user{jid = FromJID, nick = FromNick,
-                                    role = FromRole, last_presence = Presence}},
+                                    role = FromRole, last_presence = Presence0}},
                        Role, RealToJID, StateData) ->
+    Presence = set_occupant_id(FromJID, Presence0, StateData),
     FromAffiliation = get_affiliation(FromJID, StateData),
     ItemAttrs =
     case (Role == moderator) orelse not (StateData#state.config)#config.anonymous of
@@ -2519,16 +2525,22 @@ send_nick_change(Presence, OldNick, JID, RealJID, Affiliation, Role,
                                 true -> status_code(110);
                                 false -> undefined
                             end,
-    Unavailable = nick_unavailable_presence(MaybePublicJID, Nick, Affiliation,
-                                            Role, MaybeSelfPresenceCode),
+    Unavailable = set_occupant_id(RealJID,
+                                  nick_unavailable_presence(MaybePublicJID, Nick, Affiliation,
+                                                            Role, MaybeSelfPresenceCode),
+                                  S),
     mongoose_router:route(
         mongoose_acc:new(jid:replace_resource(S#state.jid, OldNick),
                          Info#user.jid,
                          Unavailable,
                          ?LOCATION)),
     Available = set_hats(RealJID, Info#user.jid,
-                         nick_available_presence(Presence, MaybePublicJID, Affiliation,
-                                                 Role, MaybeSelfPresenceCode), S),
+                         set_occupant_id(RealJID,
+                                         nick_available_presence(Presence, MaybePublicJID,
+                                                                 Affiliation, Role,
+                                                                 MaybeSelfPresenceCode),
+                                         S),
+                         S),
     mongoose_router:route(
         mongoose_acc:new(jid:replace_resource(S#state.jid, Nick),
                          Info#user.jid,
@@ -2603,6 +2615,71 @@ presence(<<"unavailable">> = Type, Children) ->
 
 
 %%%----------------------------------------------------------------------
+%%% Occupant identifiers (XEP-0421)
+
+-spec occupant_id_features(state()) -> [mongoose_disco:feature()].
+occupant_id_features(StateData) ->
+    case is_occupant_id_enabled(StateData) of
+        true -> [?NS_OCCUPANT_ID];
+        false -> []
+    end.
+
+-spec is_occupant_id_enabled(state()) -> boolean().
+is_occupant_id_enabled(StateData) ->
+    get_opt(StateData, occupant_id).
+
+%% @doc Replaces any occupant-id elements of a stanza reflected by the room with
+%% the occupant ID of its sender, if occupant IDs are enabled.
+%% Occupant-id elements sent by clients are always removed, even when occupant IDs are
+%% disabled, so that they can't be forged (XEP-0421, section 6). This also removes the IDs
+%% from stored presences if occupant IDs are disabled while the room is running.
+-spec set_occupant_id(jid:jid() | jid:simple_jid(), exml:element(), state()) -> exml:element().
+set_occupant_id(JID, Packet, StateData) ->
+    Stripped = #xmlel{children = Children} = strip_occupant_id(Packet),
+    case is_occupant_id_enabled(StateData) of
+        true ->
+            OccupantId = #xmlel{name = <<"occupant-id">>,
+                                attrs = #{<<"xmlns">> => ?NS_OCCUPANT_ID,
+                                          <<"id">> => occupant_id(JID, StateData)}},
+            Stripped#xmlel{children = Children ++ [OccupantId]};
+        false ->
+            Stripped
+    end.
+
+-spec strip_occupant_id(exml:element()) -> exml:element().
+strip_occupant_id(Packet = #xmlel{children = Children}) ->
+    Packet#xmlel{children = [Child || Child <- Children, not is_occupant_id_element(Child)]}.
+
+is_occupant_id_element(#xmlel{name = <<"occupant-id">>, attrs = #{<<"xmlns">> := ?NS_OCCUPANT_ID}}) ->
+    true;
+is_occupant_id_element(_) ->
+    false.
+
+%% The ID is stable for a user (real bare JID) in a room, and can't be computed
+%% without the room's secret salt, so it doesn't reveal the JID.
+-spec occupant_id(jid:jid() | jid:simple_jid(), state()) -> binary().
+occupant_id(JID, #state{occupant_id_salt = Salt}) ->
+    BareJID = jid:to_bare_binary(jid:to_lower(JID)),
+    Mac = crypto:mac(hmac, sha256, Salt, BareJID),
+    base64:encode(Mac, #{mode => urlsafe, padding => false}).
+
+-spec new_occupant_id_salt() -> binary().
+new_occupant_id_salt() ->
+    base64:encode(crypto:strong_rand_bytes(24)).
+
+%% Persistent rooms stored before occupant IDs were introduced have no salt.
+%% It is stored right away when occupant IDs are enabled, so that the IDs are stable.
+-spec maybe_add_occupant_id_salt(state()) -> state().
+maybe_add_occupant_id_salt(StateData = #state{occupant_id_salt = undefined}) ->
+    NewStateData = StateData#state{occupant_id_salt = new_occupant_id_salt()},
+    case is_occupant_id_enabled(NewStateData) of
+        true -> store_room_if_persistent(NewStateData);
+        false -> ok
+    end,
+    NewStateData;
+maybe_add_occupant_id_salt(StateData) ->
+    StateData.
+
 %%% Hats (XEP-0317)
 
 -spec is_hats_enabled(state()) -> boolean().
@@ -3485,7 +3562,7 @@ send_kickban_presence1(UJID, Reason, Code, Affiliation, StateData) ->
                 _ ->
                 [#xmlel{name = <<"reason">>, children = [#xmlcdata{content = Reason}]}]
                     end,
-          Packet = #xmlel{name = <<"presence">>,
+          Packet0 = #xmlel{name = <<"presence">>,
                           attrs = #{<<"type">> => <<"unavailable">>},
                           children = [#xmlel{name = <<"x">>,
                                              attrs = #{<<"xmlns">> => ?NS_MUC_USER},
@@ -3494,6 +3571,7 @@ send_kickban_presence1(UJID, Reason, Code, Affiliation, StateData) ->
                                                                 children = ItemEls},
                                                          #xmlel{name = <<"status">>,
                                                                 attrs = #{<<"code">> => Code}}]}]},
+          Packet = set_occupant_id(RealJID, Packet0, StateData),
         mongoose_router:route(
             mongoose_acc:new(
                 jid:replace_resource(StateData#state.jid, Nick),
@@ -3977,6 +4055,8 @@ set_opts([{Opt, Val} | Opts], SD=#state{config = C = #config{}}) ->
             SD#state{scoped_hat_assignments = decode_scoped_hat_assignments(Val)};
         subject_timestamp ->
             SD#state{subject_timestamp = Val};
+        occupant_id_salt ->
+            SD#state{occupant_id_salt = Val};
         _ ->
             SD
        end,
@@ -4012,7 +4092,9 @@ make_opts(StateData) ->
      {affiliations, maps:to_list(StateData#state.affiliations)},
      {subject, StateData#state.subject},
      {subject_author, StateData#state.subject_author}
-    ] ++ hats_opts(StateData).
+    ] ++ [{occupant_id_salt, Salt} || Salt <- [StateData#state.occupant_id_salt],
+                                      Salt =/= undefined]
+      ++ hats_opts(StateData).
 
 -spec destroy_room(exml:element(), state()) -> {result, [], stop}.
 destroy_room(DestroyEl, StateData) ->
@@ -4038,18 +4120,15 @@ destroy_room(DestroyEl, StateData) ->
 %% room owner, the presence stanza MUST include that information.
 %% @end
 -spec remove_each_occupant_from_room(exml:element(), state()) -> any().
-remove_each_occupant_from_room(DestroyEl, StateData) ->
+remove_each_occupant_from_room(DestroyEl, StateData = #state{jid = RoomJID}) ->
     Packet = presence_stanza_of_type_unavailable(DestroyEl),
-    send_to_occupants(Packet, StateData).
-
-
--spec send_to_occupants(exml:element(), state()) -> any().
-send_to_occupants(Packet, StateData=#state{jid=RoomJID}) ->
-    F = fun(User=#user{jid=UserJID}) ->
-        mongoose_router:route(
-            mongoose_acc:new(occupant_jid(User, RoomJID), UserJID, Packet, ?LOCATION))
+    F = fun(User = #user{jid = UserJID}) ->
+                mongoose_router:route(
+                  mongoose_acc:new(occupant_jid(User, RoomJID), UserJID,
+                                   set_occupant_id(UserJID, Packet, StateData), ?LOCATION))
         end,
     foreach_user(F, StateData).
+
 
 -spec send_to_all_users(exml:element(), state()) -> any().
 send_to_all_users(Packet, StateData=#state{jid=RoomJID}) ->
@@ -4098,6 +4177,7 @@ process_iq_disco_info(From, get, Lang, StateData) ->
     IdentityXML = mongoose_disco:identities_to_xml([identity(get_title(StateData))]),
     FeatureXML =  mongoose_disco:get_muc_features(HostType, From, RoomJID, <<>>, Lang,
                                                   room_features(Config)
+                                                  ++ occupant_id_features(StateData)
                                                   ++ hats_features(StateData)),
     InfoXML = iq_disco_info_extras(StateData),
     {result, IdentityXML ++ FeatureXML ++ InfoXML, StateData}.
@@ -4436,7 +4516,8 @@ send_decline_invitation({Packet, XEl, DEl, ToJID}, RoomJID, FromJID) ->
     DAttrs3 = DAttrs2#{<<"from">> => FromString},
     DEl2 = #xmlel{name = <<"decline">>, attrs = DAttrs3, children = DEls},
     XEl2 = jlib:replace_subelement(XEl, DEl2),
-    Packet2 = jlib:replace_subelement(Packet, XEl2),
+    %% Occupant IDs are only for stanzas reflected to the occupants
+    Packet2 = strip_occupant_id(jlib:replace_subelement(Packet, XEl2)),
     mongoose_router:route(mongoose_acc:new(RoomJID, ToJID, Packet2, ?LOCATION)).
 
 -spec send_error_only_occupants(binary(), exml:element(),
@@ -4776,7 +4857,7 @@ route_nick_message(#routed_nick_message{decide = continue_delivery, allow_pm = t
     StateData;
 route_nick_message(#routed_nick_message{decide = continue_delivery, allow_pm = true,
     online = true, packet = Packet, from = From, jid = ToJID}, StateData) ->
-    Packet1 = maybe_add_x_element(Packet),
+    Packet1 = set_occupant_id(From, maybe_add_x_element(Packet), StateData),
     {ok, #user{nick = FromNick}} = maps:find(jid:to_lower(From),
         StateData#state.users),
     mongoose_router:route(
