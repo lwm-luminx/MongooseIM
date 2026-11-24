@@ -88,6 +88,11 @@
                 room_queue = queue:new(),
                 http_auth_pool = none :: none | mongoose_http_client:pool(),
                 http_auth_pids = [] :: [pid()],
+                %% Hats (XEP-0317) defined in the room, and the hats worn by each bare JID
+                hats = [] :: [mod_muc_room:hat()],
+                hat_assignments = #{} :: #{jid:simple_jid() => [mod_muc_room:hat_uri()]},
+                %% Scoped hats: the hats each wearer (first bare JID) shows only to one viewer (second)
+                scoped_hat_assignments = #{} :: mod_muc_room:scoped_hat_assignments(),
                 hibernate_timeout = 90000 :: timeout()
                }).
 
