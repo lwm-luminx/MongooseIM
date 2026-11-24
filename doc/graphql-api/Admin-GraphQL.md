@@ -20,6 +20,7 @@ The admin per domain can be disabled by the global admin with the command <a hre
 ## Authentication
 
 MongooseIM uses *Basic Authentication* as an authentication method for the GraphQL API.
+The admin endpoints can also accept [JSON Web Tokens](#json-web-tokens).
 
 *Basic authentication* is a simple authentication scheme built into the HTTP protocol.
 Each HTTP request to the GraphQL API has to contain the Authorization header
@@ -42,6 +43,24 @@ The authorization as a domain admin the base64-encoded string should have the fo
 
 - `DOMAIN` is the domain to authorize,
 - `PASSWORD` is the password for the given domain.
+
+### JSON Web Tokens
+
+When the `jwt` section is configured for the [GraphQL handler](../listeners/listen-http.md#listenhttphandlersmongoose_graphql_handlerjwt-only-for-admin-and-domain_admin),
+both admin endpoints also accept *Bearer authentication* with a [JSON Web Token](https://jwt.io):
+the `Authorization` header contains the word `Bearer` followed by a space and the token.
+This makes it possible to issue short-lived tokens to each caller, and to rotate the signing keys without redeploying the callers.
+
+The token needs a valid signature made with the configured algorithm, an `exp` (expiration time) claim, an `aud` claim containing the configured audience, and an `iss` claim when the issuer is configured.
+The times allow for 60 seconds of difference between the clocks of the token issuer and MongooseIM.
+An SSE subscription opened with a token is closed when the token expires, and the client has to open a new one with a fresh token.
+Each successful authentication with a token is logged with its `sub`, `iss` and `jti` claims (and the domain, on the domain admin endpoint), and each failure with its reason. The token itself is never logged.
+On the domain admin endpoint, the token also needs a claim with the domain name (`domain` by default).
+The domain has to exist, and the token holder gets the same permissions as the domain admin authenticated with a password.
+The domain admin password does not need to be set for the token to work.
+
+The password authentication remains available alongside the tokens.
+A token sent to an endpoint without `jwt` configured is rejected with `401`, instead of being ignored.
 
 ## GraphiQL
 

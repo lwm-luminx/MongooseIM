@@ -59,6 +59,7 @@ run_request(GQLReq, Req, #{schema_endpoint := EpName, authorized := AuthStatus} 
             case mongoose_graphql:execute(Ep, GQLReq3) of
                 {ok, #{aux := [{stream, Stream}]}} ->
                     Ctx3 = Ctx2#{stream => Stream},
+                    schedule_token_expiry(State),
                     {ok, Req, State#{id => 1, ep => Ep, req => GQLReq3#{ctx := Ctx3}}};
                 {ok, Response} ->
                     Body = mongoose_graphql_response:term_to_json(Response),
@@ -71,7 +72,19 @@ handle_notify(Msg, State) ->
     ?UNEXPECTED_INFO(Msg),
     {nosend, State}.
 
--spec handle_info(term(), state()) -> {nosend, state()} | {send, lasse_handler:event(), state()}.
+%% A stream opened with a JWT is closed when the token expires,
+%% because the token is checked only once, when the stream is opened.
+schedule_token_expiry(#{token_expires_at := ExpiresAt}) ->
+    Delay = max(0, ExpiresAt - erlang:system_time(second)),
+    erlang:send_after(timer:seconds(Delay), self(), {?MODULE, token_expired}),
+    ok;
+schedule_token_expiry(_State) ->
+    ok.
+
+-spec handle_info(term(), state()) ->
+          {nosend, state()} | {send, lasse_handler:event(), state()} | {stop, state()}.
+handle_info({?MODULE, token_expired}, State) ->
+    {stop, State};
 handle_info(Event, State = #{ep := Ep, req := Req = #{ctx := Ctx}, id := Id}) ->
     Ctx1 = Ctx#{event => Event},
     {ok, #{data := Data} = Response} = mongoose_graphql:execute(Ep, Req#{ctx := Ctx1}),

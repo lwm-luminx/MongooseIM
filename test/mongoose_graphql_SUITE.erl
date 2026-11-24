@@ -45,7 +45,9 @@ all() ->
      {group, enum_output},
      {group, user_listener},
      {group, admin_listener},
-     {group, domain_admin_listener}].
+     {group, domain_admin_listener},
+     {group, admin_jwt_listener},
+     {group, domain_admin_jwt_listener}].
 
 groups() ->
     [{operations, [parallel], operations()},
@@ -59,6 +61,8 @@ groups() ->
      {enum_output, [parallel], [contact_enums_cover_roster_values]},
      {admin_listener, [parallel], admin_listener()},
      {domain_admin_listener, [parallel], domain_admin_listener()},
+     {admin_jwt_listener, [parallel], admin_jwt_listener()},
+     {domain_admin_jwt_listener, [parallel], domain_admin_jwt_listener()},
      {user_listener, [parallel], user_listener()}].
 
 operations() ->
@@ -161,6 +165,7 @@ user_listener() ->
 
 admin_listener() ->
     [no_creds_defined_admin_can_access_protected,
+     bearer_token_rejected_without_jwt,
      auth_admin_can_access_protected_types | common_tests()].
 
 domain_admin_listener() ->
@@ -172,6 +177,36 @@ domain_admin_listener() ->
      auth_domain_admin_can_access_owned_domain,
      use_directive_can_use_auth_domain_admin_domain
      | common_tests()].
+
+admin_jwt_listener() ->
+    [jwt_admin_can_access_protected_types,
+     jwt_admin_with_kid_can_access_protected_types,
+     jwt_admin_with_second_key_can_access_protected_types,
+     jwt_admin_password_still_accepted,
+     jwt_admin_no_creds_cannot_access_protected_types,
+     jwt_admin_wrong_signature_error,
+     jwt_admin_wrong_kid_error,
+     jwt_admin_non_string_kid_error,
+     jwt_admin_es256_token_accepted,
+     jwt_admin_der_es256_signature_error,
+     jwt_admin_hmac_token_signed_with_public_key_error,
+     jwt_admin_wrong_algorithm_error,
+     jwt_admin_malformed_token_error,
+     jwt_admin_expired_token_error,
+     jwt_admin_token_without_expiration_error,
+     jwt_admin_wrong_issuer_error,
+     jwt_admin_wrong_audience_error,
+     jwt_admin_audience_list_accepted].
+
+domain_admin_jwt_listener() ->
+    [jwt_domain_admin_can_access_owned_domain,
+     jwt_domain_admin_cannot_access_other_domain,
+     jwt_domain_admin_cannot_access_global,
+     jwt_domain_admin_domain_is_nameprepped,
+     jwt_domain_admin_nonexistent_domain_error,
+     jwt_domain_admin_missing_domain_error,
+     jwt_domain_admin_wrong_signature_error,
+     jwt_domain_admin_password_still_accepted].
 
 common_tests() ->
     [malformed_auth_header_error,
@@ -223,6 +258,25 @@ init_per_group(domain_admin_listener, Config) ->
                 end),
     ListenerOpts = #{schema_endpoint => domain_admin},
     init_ep_listener(5560, domain_admin_schema_ep, ListenerOpts, Config2);
+init_per_group(admin_jwt_listener, Config) ->
+    EcKey = public_key:generate_key({namedCurve, secp256r1}),
+    ListenerOpts = jwt_listener_opts(#{username => <<"admin">>,
+                                       password => <<"secret">>,
+                                       schema_endpoint => admin}, ec_public_pem(EcKey)),
+    init_ep_listener(5561, admin_schema_ep, ListenerOpts, [{ec_key, EcKey} | Config]);
+init_per_group(domain_admin_jwt_listener, Config) ->
+    Config1 = meck_module_and_service_checking(Config),
+    Config2 = meck_domain_api(Config1),
+    meck:expect(mongoose_domain_api, check_domain_password,
+                fun
+                    (<<"localhost">>, <<"makota">>) -> ok;
+                    (<<"localhost">>, _) -> {error, wrong_password};
+                    (_, _) -> {error, not_found}
+                end),
+    meck:expect(mongoose_domain_api, get_domain_host_type,
+                fun(Domain) -> mongoose_domain_api:get_host_type(Domain) end),
+    ListenerOpts = jwt_listener_opts(#{schema_endpoint => domain_admin}),
+    init_ep_listener(5562, domain_admin_schema_ep, ListenerOpts, Config2);
 init_per_group(domain_permissions, Config) ->
     meck:new(mongoose_domain_api, [no_link]),
     meck:expect(mongoose_domain_api, get_subdomain_info,
@@ -255,6 +309,14 @@ end_per_group(admin_listener, Config) ->
     ?config(test_process, Config) ! stop,
     Config;
 end_per_group(domain_admin_listener, Config) ->
+    unmeck_module_and_service_checking(Config),
+    unmeck_domain_api(Config),
+    ?config(test_process, Config) ! stop,
+    Config;
+end_per_group(admin_jwt_listener, Config) ->
+    ?config(test_process, Config) ! stop,
+    Config;
+end_per_group(domain_admin_jwt_listener, Config) ->
     unmeck_module_and_service_checking(Config),
     unmeck_domain_api(Config),
     ?config(test_process, Config) ! stop,
@@ -957,6 +1019,123 @@ auth_domain_admin_cannot_access_global(Config) ->
     {Status, Data} = execute(Ep, Body, {<<"admin@localhost">>, <<"makota">>}),
     assert_no_permissions(no_permissions, Status, Data).
 
+jwt_admin_can_access_protected_types(Config) ->
+    assert_jwt_access_granted(Config, valid_claims(), <<"key-a">>).
+
+jwt_admin_with_kid_can_access_protected_types(Config) ->
+    assert_jwt_access_granted(Config, valid_claims(), {<<"key-a">>, <<"a">>}).
+
+jwt_admin_with_second_key_can_access_protected_types(Config) ->
+    assert_jwt_access_granted(Config, valid_claims(), {<<"key-b">>, <<"b">>}),
+    %% The key with kid 'b' is also found when the token has no kid
+    assert_jwt_access_granted(Config, valid_claims(), <<"key-b">>).
+
+jwt_admin_password_still_accepted(Config) ->
+    Ep = ?config(endpoint_addr, Config),
+    {Status, Data} = execute(Ep, #{query => "{ field }"}, {<<"admin">>, <<"secret">>}),
+    assert_access_granted(Status, Data).
+
+jwt_admin_no_creds_cannot_access_protected_types(Config) ->
+    Ep = ?config(endpoint_addr, Config),
+    {Status, Data} = execute(Ep, #{query => "{ field }"}, undefined),
+    assert_no_permissions(no_permissions, Status, Data).
+
+jwt_admin_wrong_signature_error(Config) ->
+    assert_jwt_rejected(Config, valid_claims(), <<"key-c">>).
+
+jwt_admin_wrong_kid_error(Config) ->
+    %% Key 'a' is tried only for tokens with kid 'a' or without a kid
+    assert_jwt_rejected(Config, valid_claims(), {<<"key-a">>, <<"b">>}).
+
+jwt_admin_wrong_algorithm_error(Config) ->
+    Token = make_token(<<"HS512">>, sha512, undefined, valid_claims(), <<"key-a">>),
+    assert_bearer_rejected(Config, Token).
+
+jwt_admin_malformed_token_error(Config) ->
+    assert_bearer_rejected(Config, <<"not-a-token">>),
+    assert_bearer_rejected(Config, <<"a.b.c">>).
+
+jwt_admin_expired_token_error(Config) ->
+    %% Expired longer ago than the allowed clock skew
+    assert_jwt_rejected(Config, (valid_claims())#{exp => now_s() - 3600}, <<"key-a">>).
+
+jwt_admin_non_string_kid_error(Config) ->
+    [assert_bearer_rejected(Config, make_token(<<"HS256">>, sha256, Kid, valid_claims(), <<"key-a">>))
+     || Kid <- [123, null, [<<"a">>]]].
+
+jwt_admin_es256_token_accepted(Config) ->
+    Token = make_es256_token(valid_claims(), ?config(ec_key, Config), raw),
+    Body = #{query => "{ field }"},
+    {Status, Data} = execute_bearer(?config(endpoint_addr, Config), Body, Token),
+    assert_access_granted(Status, Data).
+
+jwt_admin_der_es256_signature_error(Config) ->
+    assert_bearer_rejected(Config, make_es256_token(valid_claims(), ?config(ec_key, Config), der)).
+
+jwt_admin_hmac_token_signed_with_public_key_error(Config) ->
+    %% The public key is known to everyone, so it must not work as an HMAC secret
+    Pem = ec_public_pem(?config(ec_key, Config)),
+    assert_bearer_rejected(Config, make_token(<<"HS256">>, sha256, <<"ec">>, valid_claims(), Pem)).
+
+bearer_token_rejected_without_jwt(Config) ->
+    %% A listener without JWT configured rejects tokens instead of ignoring them
+    assert_jwt_rejected(Config, valid_claims(), <<"key-a">>).
+
+jwt_admin_token_without_expiration_error(Config) ->
+    assert_jwt_rejected(Config, maps:remove(exp, valid_claims()), <<"key-a">>).
+
+jwt_admin_wrong_issuer_error(Config) ->
+    assert_jwt_rejected(Config, (valid_claims())#{iss => <<"other">>}, <<"key-a">>),
+    assert_jwt_rejected(Config, maps:remove(iss, valid_claims()), <<"key-a">>).
+
+jwt_admin_wrong_audience_error(Config) ->
+    assert_jwt_rejected(Config, (valid_claims())#{aud => <<"other">>}, <<"key-a">>),
+    assert_jwt_rejected(Config, (valid_claims())#{aud => [<<"other">>]}, <<"key-a">>),
+    assert_jwt_rejected(Config, maps:remove(aud, valid_claims()), <<"key-a">>).
+
+jwt_admin_audience_list_accepted(Config) ->
+    assert_jwt_access_granted(Config, (valid_claims())#{aud => [<<"other">>, <<"mim">>]},
+                              <<"key-a">>).
+
+jwt_domain_admin_can_access_owned_domain(Config) ->
+    Token = make_token((valid_claims())#{domain => <<"localhost">>}, <<"key-a">>),
+    Body = #{query => "{ fieldDP(argA: \"localhost\") }"},
+    {Status, Data} = execute_bearer(?config(endpoint_addr, Config), Body, Token),
+    assert_access_granted(Status, Data).
+
+jwt_domain_admin_cannot_access_other_domain(Config) ->
+    Token = make_token((valid_claims())#{domain => <<"localhost">>}, <<"key-a">>),
+    Body = #{query => "{ field fieldDP(argA: \"domain.com\") }"},
+    {Status, Data} = execute_bearer(?config(endpoint_addr, Config), Body, Token),
+    assert_no_permissions(no_permissions, Status, Data).
+
+jwt_domain_admin_cannot_access_global(Config) ->
+    Token = make_token((valid_claims())#{domain => <<"localhost">>}, <<"key-a">>),
+    Body = #{query => "{ fieldGlobal(argA: \"localhost\") }"},
+    {Status, Data} = execute_bearer(?config(endpoint_addr, Config), Body, Token),
+    assert_no_permissions(no_permissions, Status, Data).
+
+jwt_domain_admin_domain_is_nameprepped(Config) ->
+    Token = make_token((valid_claims())#{domain => <<"LocalHost">>}, <<"key-a">>),
+    Body = #{query => "{ fieldDP(argA: \"localhost\") }"},
+    {Status, Data} = execute_bearer(?config(endpoint_addr, Config), Body, Token),
+    assert_access_granted(Status, Data).
+
+jwt_domain_admin_nonexistent_domain_error(Config) ->
+    assert_jwt_rejected(Config, (valid_claims())#{domain => <<"localhost2">>}, <<"key-a">>).
+
+jwt_domain_admin_missing_domain_error(Config) ->
+    assert_jwt_rejected(Config, valid_claims(), <<"key-a">>),
+    assert_jwt_rejected(Config, (valid_claims())#{domain => 42}, <<"key-a">>).
+
+jwt_domain_admin_wrong_signature_error(Config) ->
+    assert_jwt_rejected(Config, (valid_claims())#{domain => <<"localhost">>}, <<"key-c">>).
+
+jwt_domain_admin_password_still_accepted(Config) ->
+    Ep = ?config(endpoint_addr, Config),
+    {Status, Data} = execute(Ep, #{query => "{ field }"}, {<<"admin@localhost">>, <<"makota">>}),
+    assert_access_granted(Status, Data).
+
 malformed_auth_header_error(Config) ->
     Ep = ?config(endpoint_addr, Config),
     % The encoded credentials value is malformed and cannot be decoded.
@@ -1400,10 +1579,16 @@ example_listener_schema_data(Config) ->
     [{atom(), term()}].
 init_ep_listener(Port, EpName, ListenerOpts, Config) ->
     Pid = spawn(fun() ->
-                    Name = list_to_atom("gql_listener_" ++ atom_to_list(EpName)),
+                    Name = list_to_atom("gql_listener_" ++ integer_to_list(Port)),
                     ok = start_listener(Name, Port, ListenerOpts),
                     {Mapping, Pattern} = example_listener_schema_data(Config),
-                    {ok, _} = mongoose_graphql:create_endpoint(EpName, Mapping, [Pattern]),
+                    %% The admin endpoints share the schema, which might be already loaded
+                    case whereis(EpName) of
+                        undefined ->
+                            {ok, _} = mongoose_graphql:create_endpoint(EpName, Mapping, [Pattern]);
+                        _ ->
+                            ok
+                    end,
                     receive
                         stop ->
                             ok
@@ -1443,6 +1628,74 @@ post_request(Ep, HeadersIn, Body) ->
 
 random_request_id() ->
     binary:encode_hex(crypto:strong_rand_bytes(8), lowercase).
+
+jwt_listener_opts(Opts) ->
+    jwt_listener_opts(Opts, undefined).
+
+jwt_listener_opts(Opts, EcPem) ->
+    EcKeys = [#{kid => <<"ec">>, algorithm => es256, secret => {value, EcPem}}
+              || EcPem =/= undefined],
+    JwtOpts = #{keys => [#{kid => <<"a">>, algorithm => hs256, secret => {value, <<"key-a">>}},
+                         #{kid => <<"b">>, algorithm => hs256, secret => {value, <<"key-b">>}}
+                         | EcKeys],
+                issuer => <<"issuer">>,
+                audience => <<"mim">>,
+                domain_key => <<"domain">>},
+    Opts#{jwt => JwtOpts, jwt_keys => mongoose_graphql_jwt:read_keys(JwtOpts)}.
+
+valid_claims() ->
+    #{iss => <<"issuer">>, aud => <<"mim">>, sub => <<"tester">>, exp => now_s() + 60}.
+
+now_s() ->
+    erlang:system_time(second).
+
+assert_jwt_access_granted(Config, Claims, Key) ->
+    Body = #{query => "{ field }"},
+    {Status, Data} = execute_bearer(?config(endpoint_addr, Config), Body, make_token(Claims, Key)),
+    assert_access_granted(Status, Data).
+
+assert_jwt_rejected(Config, Claims, Key) ->
+    assert_bearer_rejected(Config, make_token(Claims, Key)).
+
+assert_bearer_rejected(Config, Token) ->
+    Body = #{query => "{ field }"},
+    {Status, Data} = execute_bearer(?config(endpoint_addr, Config), Body, Token),
+    assert_no_permissions(wrong_credentials, Status, Data).
+
+make_token(Claims, {Key, Kid}) ->
+    make_token(<<"HS256">>, sha256, Kid, Claims, Key);
+make_token(Claims, Key) ->
+    make_token(<<"HS256">>, sha256, undefined, Claims, Key).
+
+make_token(Alg, Sha, Kid, Claims, Key) ->
+    Header = maps:merge(#{alg => Alg, typ => <<"JWT">>},
+                        case Kid of undefined -> #{}; _ -> #{kid => Kid} end),
+    Input = <<(b64(jiffy:encode(Header)))/binary, ".", (b64(jiffy:encode(Claims)))/binary>>,
+    <<Input/binary, ".", (b64(crypto:mac(hmac, Sha, Key, Input)))/binary>>.
+
+%% JWS uses R || S, each 32 bytes for P-256 (RFC 7518, section 3.4)
+make_es256_token(Claims, EcKey, SigFormat) ->
+    Header = #{alg => <<"ES256">>, typ => <<"JWT">>, kid => <<"ec">>},
+    Input = <<(b64(jiffy:encode(Header)))/binary, ".", (b64(jiffy:encode(Claims)))/binary>>,
+    Der = public_key:sign(Input, sha256, EcKey),
+    Sig = case SigFormat of
+              der ->
+                  Der;
+              raw ->
+                  {'ECDSA-Sig-Value', R, S} = public_key:der_decode('ECDSA-Sig-Value', Der),
+                  <<R:32/unit:8, S:32/unit:8>>
+          end,
+    <<Input/binary, ".", (b64(Sig))/binary>>.
+
+ec_public_pem({'ECPrivateKey', _, _, Params, Pub, _}) ->
+    Entry = public_key:pem_entry_encode('SubjectPublicKeyInfo', {{'ECPoint', Pub}, Params}),
+    public_key:pem_encode([Entry]).
+
+b64(Bin) ->
+    base64:encode(Bin, #{mode => urlsafe, padding => false}).
+
+execute_bearer(EpAddr, Body, Token) ->
+    post_request(EpAddr, [{<<"Authorization">>, <<"Bearer ", Token/binary>>}], Body).
 
 meck_domain_api(Config) ->
     Hosts = [<<"test-domain.com">>, <<"localhost">>],
