@@ -285,6 +285,7 @@ This is the perfect place to plug in custom security control.
 * mam_archive_message
 * mam_archive_size
 * mam_archive_sync
+* mam_delete_messages
 * mam_flush_messages
 * mam_get_behaviour
 * mam_get_prefs
@@ -293,6 +294,7 @@ This is the perfect place to plug in custom security control.
 * mam_muc_archive_message
 * mam_muc_archive_size
 * mam_muc_archive_sync
+* mam_muc_delete_messages
 * mam_muc_flush_messages
 * mam_muc_get_behaviour
 * mam_muc_get_prefs
