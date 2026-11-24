@@ -85,6 +85,7 @@ nav:
       - 'Smart Markers': 'open-extensions/smart-markers.md'
       - 'Token-based reconnection': 'open-extensions/token-reconnection.md'
       - 'MAM': 'open-extensions/mam.md'
+      - 'Scoped Hats (ProtoXEP)': 'open-extensions/scoped-hats.md'
   - Configuration:
       - 'Configuration Files': 'configuration/configuration-files.md'
       - 'Options: General': 'configuration/general.md'
