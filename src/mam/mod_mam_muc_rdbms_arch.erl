@@ -113,6 +113,7 @@ register_prepared_queries(Opts) ->
     mod_mam_utils:prepare_delete_messages(Opts, mam_muc_message, room_id,
                                           mam_muc_delete_archive_messages,
                                           mam_muc_delete_server_messages),
+    mod_mam_utils:prepare_delete_sender_messages(Opts, mam_muc_delete_sender_messages),
 
     mongoose_rdbms:prepare(mam_muc_make_tombstone, mam_muc_message, [message, room_id, id],
                            <<"UPDATE mam_muc_message SET message = ?, search_body = '' "
@@ -336,7 +337,8 @@ remove_archive(Acc, #{archive_id := ArcID}, #{host_type := HostType}) ->
 delete_messages(_Acc, #{scope := Scope, before_id := BeforeID}, #{host_type := HostType}) ->
     Query = case Scope of
                 {archive, _, _} -> mam_muc_delete_archive_messages;
-                {server, _} -> mam_muc_delete_server_messages
+                {server, _} -> mam_muc_delete_server_messages;
+                {sender, _, _} -> mam_muc_delete_sender_messages
             end,
     Args = mod_mam_utils:delete_messages_args(Scope, BeforeID),
     Limit = gen_mod:get_module_opt(HostType, ?MODULE, delete_domain_limit),

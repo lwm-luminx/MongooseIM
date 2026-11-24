@@ -77,8 +77,11 @@
                                     sender_id => archive_id()}.
 
 %% Which archives to delete messages from: one archive (of a user or a room),
-%% or all archives of a domain (users) or of a MUC service (rooms).
--type delete_messages_scope() :: {archive, jid:lserver(), jid:luser()} | {server, jid:lserver()}.
+%% all archives of a domain (users) or of a MUC service (rooms),
+%% or, for room archives only, the messages a user sent to any room.
+-type delete_messages_scope() :: {archive, jid:lserver(), jid:luser()}
+                               | {server, jid:lserver()}
+                               | {sender, jid:lserver(), jid:luser()}.
 -type delete_messages_params() :: #{scope := delete_messages_scope(),
                                     %% Delete messages with IDs lower than this one
                                     before_id := message_id()}.
@@ -146,7 +149,8 @@ pm_config_spec() ->
 
 muc_config_spec() ->
     #section{items = maps:merge(common_config_items(), muc_config_items()),
-             defaults = #{<<"host">> => mod_muc:default_host()}}.
+             defaults = #{<<"host">> => mod_muc:default_host(),
+                          <<"delete_messages_of_removed_users">> => false}}.
 
 root_config_items() ->
     Cache = mongoose_user_cache:config_spec(),
@@ -201,7 +205,8 @@ muc_config_items() ->
     #{<<"async_writer">> => async_config_spec(),
       <<"host">> => #option{type = string,
                             validate = subdomain_template,
-                            process = fun mongoose_subdomain_utils:make_subdomain_pattern/1}}.
+                            process = fun mongoose_subdomain_utils:make_subdomain_pattern/1},
+      <<"delete_messages_of_removed_users">> => #option{type = boolean}}.
 
 async_config_spec() ->
     #section{
@@ -258,7 +263,7 @@ mam_type_to_core_mod(muc) -> mod_mam_muc.
 valid_core_mod_opts(mod_mam_pm) ->
     [archive_groupchats, same_mam_id_for_peers] ++ common_opts();
 valid_core_mod_opts(mod_mam_muc) ->
-    [host] ++ common_opts().
+    [host, delete_messages_of_removed_users] ++ common_opts().
 
 common_opts() ->
     [async_writer,

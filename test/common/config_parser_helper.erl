@@ -559,6 +559,7 @@ all_modules() ->
                            #{async_writer => config([modules, mod_mam, async_writer],
                                                     #{enabled => false}),
                              db_message_format => mam_message_xml,
+                             delete_messages_of_removed_users => false,
                              host => {fqdn, <<"muc.example.com">>},
                              user_prefs_store => mnesia},
                        no_stanzaid_element => true,
@@ -1197,7 +1198,7 @@ default_config([modules, mod_http_upload, s3]) ->
 default_config([modules, mod_mam, pm]) ->
     #{archive_groupchats => false, same_mam_id_for_peers => false};
 default_config([modules, mod_mam, muc]) ->
-    #{host => {prefix, <<"conference.">>}};
+    #{host => {prefix, <<"conference.">>}, delete_messages_of_removed_users => false};
 default_config([modules, mod_mam, cache]) ->
     #{module => internal, strategy => fifo,
       time_to_live => 480, number_of_segments => 3};
