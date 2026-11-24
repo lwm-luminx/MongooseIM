@@ -44,6 +44,8 @@
 -define(NS_MUC_REQUEST,         <<"http://jabber.org/protocol/muc#request">>).
 -define(NS_MUC_CONFIG,          <<"http://jabber.org/protocol/muc#roomconfig">>).
 -define(NS_MUC_STABLE_ID,       <<"http://jabber.org/protocol/muc#stable_id">>).
+-define(NS_HATS,                <<"urn:xmpp:hats:0">>).
+-define(NS_SCOPED_HATS,         <<"urn:xmpp:scoped-hats:0">>).
 -define(NS_PING,                <<"urn:xmpp:ping">>).
 -define(NS_PUBSUB,              <<"http://jabber.org/protocol/pubsub">>).
 -define(NS_PUBSUB_EVENT,        <<"http://jabber.org/protocol/pubsub#event">>).
@@ -117,6 +119,7 @@
 -define(NS_RETRACT_TOMBSTONE,   <<"urn:xmpp:message-retract:0#tombstone">>).
 -define(NS_RETRACT_1,           <<"urn:xmpp:message-retract:1">>).
 -define(NS_MESSAGE_MODERATE,    <<"urn:xmpp:message-moderate:1">>).
+-define(NS_RETRACT_1_TOMBSTONE, <<"urn:xmpp:message-retract:1#tombstone">>).
 
 -define(JINGLE_NS, <<"urn:xmpp:jingle:1">>).
 -define(JINGLE_MSG_NS, <<"urn:xmpp:jingle-message:0">>).

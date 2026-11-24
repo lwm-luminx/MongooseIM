@@ -926,6 +926,8 @@ default_mod_config(mod_muc) ->
       max_user_conferences => 10,
       http_auth_pool => none,
       load_permanent_rooms_at_startup => false,
+      hats => false,
+      scoped_hats => false,
       hibernate_timeout => timer:seconds(90),
       hibernated_room_check_interval => infinity,
       hibernated_room_timeout => infinity,

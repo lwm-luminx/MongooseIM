@@ -6,7 +6,7 @@
 -import(distributed_helper, [mim/0, require_rpc_nodes/1, rpc/4, subhost_pattern/1]).
 -import(graphql_helper, [execute_command/4, execute_user_command/5, get_ok_value/2, get_err_msg/1,
                          get_coercion_err_msg/1, user_to_bin/1, user_to_full_bin/1, user_to_jid/1,
-                         get_unauthorized/1, get_not_loaded/1]).
+                         get_unauthorized/1, get_not_loaded/1, get_err_code/1]).
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -29,6 +29,8 @@ groups() ->
      {admin_muc_configured, [], admin_muc_tests()},
      {admin_muc_and_mam_configured, [], admin_muc_with_mam_tests()},
      {admin_muc_not_configured, [], admin_muc_not_configured_tests()},
+     {admin_muc_hats, [], admin_muc_hats_tests()},
+     {admin_muc_scoped_hats, [], admin_muc_scoped_hats_tests()},
      {user_muc_configured, [parallel], user_muc_tests()},
      {user_muc_and_mam_configured, [parallel], user_muc_with_mam_tests()},
      {user_muc_not_configured, [parallel], user_muc_not_configured_tests()},
@@ -42,7 +44,9 @@ user_groups() ->
 admin_groups() ->
     [{group, admin_muc_configured},
      {group, admin_muc_and_mam_configured},
-     {group, admin_muc_not_configured}].
+     {group, admin_muc_not_configured},
+     {group, admin_muc_hats},
+     {group, admin_muc_scoped_hats}].
 
 user_muc_tests() ->
     [user_create_and_delete_room,
@@ -148,8 +152,36 @@ admin_muc_tests() ->
      admin_make_user_exit_room_bare_jid,
      admin_list_room_affiliations,
      admin_try_list_nonexistent_room_affiliations,
-     admin_get_room_messages_muc_or_mam_not_configured
+     admin_get_room_messages_muc_or_mam_not_configured,
+     admin_try_set_room_hat_hats_disabled
     ].
+
+admin_muc_hats_tests() ->
+    [admin_set_and_assign_room_hat,
+     admin_update_room_hat,
+     admin_unassign_room_hat,
+     admin_remove_room_hat,
+     admin_room_hats_override_client_hats,
+     admin_room_hats_in_disco,
+     admin_try_assign_nonexistent_room_hat,
+     admin_try_assign_room_hat_to_unaffiliated_user,
+     admin_room_hats_removed_with_affiliation,
+     admin_room_hats_kept_on_nick_change,
+     admin_try_set_room_hat_with_invalid_args,
+     admin_try_set_hat_in_nonexistent_room,
+     admin_try_assign_scoped_room_hat_scoped_hats_disabled].
+
+admin_muc_scoped_hats_tests() ->
+    [admin_assign_pairwise_room_hat,
+     admin_scoped_room_hat_shown_to_audience_on_join,
+     admin_unassign_scoped_room_hat,
+     admin_unassign_scoped_room_hat_for_one_viewer,
+     admin_scoped_room_hat_not_repeated_when_worn_room_wide,
+     admin_remove_room_hat_removes_scoped_assignments,
+     admin_scoped_room_hats_removed_with_affiliation,
+     admin_scoped_room_hats_override_client_hats,
+     admin_scoped_room_hats_in_disco,
+     admin_try_assign_scoped_room_hat_with_invalid_args].
 
 admin_muc_with_mam_tests() ->
     [admin_get_room_messages,
@@ -173,7 +205,8 @@ admin_muc_not_configured_tests() ->
      admin_set_user_role_muc_not_configured,
      admin_make_user_enter_room_muc_not_configured,
      admin_make_user_exit_room_muc_not_configured,
-     admin_list_room_affiliations_muc_not_configured].
+     admin_list_room_affiliations_muc_not_configured,
+     admin_set_room_hat_muc_not_configured].
 
 domain_admin_muc_tests() ->
     [admin_list_rooms,
@@ -217,7 +250,8 @@ domain_admin_muc_tests() ->
      admin_make_user_exit_room_bare_jid,
      domain_admin_make_user_exit_room_no_permission,
      admin_list_room_affiliations,
-     domain_admin_list_room_affiliations_no_permission
+     domain_admin_list_room_affiliations_no_permission,
+     domain_admin_room_hats_no_permission
     ].
 
 init_per_suite(Config) ->
@@ -263,6 +297,16 @@ init_per_group(Group, Config) when Group =:= admin_muc_and_mam_configured;
         false ->
             {skip, "No MAM backend available"}
     end;
+init_per_group(admin_muc_hats, Config) ->
+    disable_mam(),
+    muc_helper:load_muc(domain_helper:host_type(), #{hats => true}),
+    mongoose_helper:ensure_muc_clean(),
+    Config;
+init_per_group(admin_muc_scoped_hats, Config) ->
+    disable_mam(),
+    muc_helper:load_muc(domain_helper:host_type(), #{hats => true, scoped_hats => true}),
+    mongoose_helper:ensure_muc_clean(),
+    Config;
 init_per_group(Group, Config) when Group =:= admin_muc_not_configured;
                                    Group =:= user_muc_not_configured ->
     maybe_enable_mam(),
@@ -333,6 +377,10 @@ end_per_group(Group, _Config) when Group =:= admin_muc_and_mam_configured;
                                    Group =:= user_muc_and_mam_configured ->
     ensure_muc_light_stopped(),
     escalus_fresh:clean();
+end_per_group(Group, _Config) when Group =:= admin_muc_hats;
+                                   Group =:= admin_muc_scoped_hats ->
+    ensure_muc_started(),
+    escalus_fresh:clean();
 end_per_group(_Group, _Config) ->
     escalus_fresh:clean().
 
@@ -359,6 +407,17 @@ end_per_testcase(TC, Config) ->
 -define(SET_ROLE_PATH, [data, muc, setUserRole]).
 -define(ENTER_ROOM_PATH, [data, muc, enterRoom]).
 -define(EXIT_ROOM_PATH, [data, muc, exitRoom]).
+-define(SET_ROOM_HAT_PATH, [data, muc, setRoomHat]).
+-define(REMOVE_ROOM_HAT_PATH, [data, muc, removeRoomHat]).
+-define(ASSIGN_ROOM_HAT_PATH, [data, muc, assignRoomHat]).
+-define(UNASSIGN_ROOM_HAT_PATH, [data, muc, unassignRoomHat]).
+-define(ASSIGN_SCOPED_ROOM_HAT_PATH, [data, muc, assignScopedRoomHat]).
+-define(UNASSIGN_SCOPED_ROOM_HAT_PATH, [data, muc, unassignScopedRoomHat]).
+-define(LIST_ROOM_HATS_PATH, [data, muc, listRoomHats]).
+-define(NS_HATS, <<"urn:xmpp:hats:0">>).
+-define(HOST_HAT, <<"http://example.com/hats#host">>).
+-define(NS_SCOPED_HATS, <<"urn:xmpp:scoped-hats:0">>).
+-define(MATCH_HAT, <<"http://example.com/hats#match">>).
 
 -define(NONEXISTENT_ROOM, <<"room@room">>).
 -define(NONEXISTENT_ROOM2, <<"room@", (muc_helper:muc_host())/binary>>).
@@ -564,6 +623,501 @@ admin_try_kick_user_from_room_without_moderators(Config, _Alice, Bob) ->
 admin_try_kick_user_from_nonexistent_room(Config) ->
     Res = kick_user(?NONEXISTENT_ROOM, <<"ali">>, null, Config),
     ?assertNotEqual(nomatch, binary:match(get_err_msg(Res), <<"not found">>)).
+
+%% Hats (XEP-0317)
+
+admin_set_and_assign_room_hat(Config) ->
+    muc_helper:story_with_room(Config, [], [{alice, 1}, {bob, 1}],
+                               fun admin_set_and_assign_room_hat_story/3).
+
+admin_set_and_assign_room_hat_story(Config, Alice, Bob) ->
+    RoomJID = jid:from_binary(?config(room_jid, Config)),
+    make_member(RoomJID, Bob, Config),
+    enter_room_and_flush(RoomJID, [{Alice, <<"ali">>}, {Bob, <<"bobek">>}]),
+    Res = set_room_hat(RoomJID, ?HOST_HAT, <<"Host">>, 120.5, Config),
+    assert_success(?SET_ROOM_HAT_PATH, Res),
+    %% Nobody wears the hat yet, so no presence is broadcast
+    escalus_assert:has_no_stanzas(Bob),
+    Res2 = assign_room_hat(RoomJID, Bob, ?HOST_HAT, Config),
+    assert_success(?ASSIGN_ROOM_HAT_PATH, Res2),
+    [assert_hats(RoomJID, <<"bobek">>, [{?HOST_HAT, <<"Host">>, <<"120.5">>}], Client)
+     || Client <- [Alice, Bob]],
+    Res3 = list_room_hats(RoomJID, Config),
+    BobJID = escalus_utils:jid_to_lower(escalus_client:short_jid(Bob)),
+    ?assertEqual(#{<<"hats">> => [#{<<"uri">> => ?HOST_HAT, <<"title">> => <<"Host">>,
+                                    <<"hue">> => 120.5}],
+                   <<"assignments">> => [#{<<"jid">> => BobJID, <<"hats">> => [?HOST_HAT]}],
+                   <<"scopedAssignments">> => []},
+                 get_ok_value(?LIST_ROOM_HATS_PATH, Res3)),
+    %% Assigning the same hat again changes nothing
+    assert_success(?ASSIGN_ROOM_HAT_PATH, assign_room_hat(RoomJID, Bob, ?HOST_HAT, Config)),
+    ?assertEqual(get_ok_value(?LIST_ROOM_HATS_PATH, Res3),
+                 get_ok_value(?LIST_ROOM_HATS_PATH, list_room_hats(RoomJID, Config))).
+
+admin_update_room_hat(Config) ->
+    muc_helper:story_with_room(Config, [], [{alice, 1}, {bob, 1}],
+                               fun admin_update_room_hat_story/3).
+
+admin_update_room_hat_story(Config, Alice, Bob) ->
+    RoomJID = jid:from_binary(?config(room_jid, Config)),
+    make_member(RoomJID, Bob, Config),
+    enter_room_and_flush(RoomJID, [{Alice, <<"ali">>}, {Bob, <<"bobek">>}]),
+    assert_success(?SET_ROOM_HAT_PATH, set_room_hat(RoomJID, ?HOST_HAT, <<"Host">>, null, Config)),
+    assert_success(?ASSIGN_ROOM_HAT_PATH, assign_room_hat(RoomJID, Bob, ?HOST_HAT, Config)),
+    [assert_hats(RoomJID, <<"bobek">>, [{?HOST_HAT, <<"Host">>, undefined}], Client)
+     || Client <- [Alice, Bob]],
+    %% Wearers get their presence broadcast again with the new title
+    assert_success(?SET_ROOM_HAT_PATH,
+                   set_room_hat(RoomJID, ?HOST_HAT, <<"Head host">>, 0, Config)),
+    [assert_hats(RoomJID, <<"bobek">>, [{?HOST_HAT, <<"Head host">>, <<"0.0">>}], Client)
+     || Client <- [Alice, Bob]].
+
+admin_unassign_room_hat(Config) ->
+    muc_helper:story_with_room(Config, [], [{alice, 1}, {bob, 1}],
+                               fun admin_unassign_room_hat_story/3).
+
+admin_unassign_room_hat_story(Config, Alice, Bob) ->
+    RoomJID = jid:from_binary(?config(room_jid, Config)),
+    make_member(RoomJID, Bob, Config),
+    enter_room_and_flush(RoomJID, [{Alice, <<"ali">>}, {Bob, <<"bobek">>}]),
+    assert_success(?SET_ROOM_HAT_PATH, set_room_hat(RoomJID, ?HOST_HAT, <<"Host">>, null, Config)),
+    assert_success(?ASSIGN_ROOM_HAT_PATH, assign_room_hat(RoomJID, Bob, ?HOST_HAT, Config)),
+    [assert_hats(RoomJID, <<"bobek">>, [{?HOST_HAT, <<"Host">>, undefined}], Client)
+     || Client <- [Alice, Bob]],
+    assert_success(?UNASSIGN_ROOM_HAT_PATH, unassign_room_hat(RoomJID, Bob, ?HOST_HAT, Config)),
+    [assert_hats(RoomJID, <<"bobek">>, [], Client) || Client <- [Alice, Bob]],
+    ?assertMatch(#{<<"assignments">> := []},
+                 get_ok_value(?LIST_ROOM_HATS_PATH, list_room_hats(RoomJID, Config))),
+    %% Bob no longer wears the hat
+    Res = unassign_room_hat(RoomJID, Bob, ?HOST_HAT, Config),
+    ?assertNotEqual(nomatch, binary:match(get_err_msg(Res), <<"Hat not found">>)).
+
+admin_remove_room_hat(Config) ->
+    muc_helper:story_with_room(Config, [], [{alice, 1}, {bob, 1}],
+                               fun admin_remove_room_hat_story/3).
+
+admin_remove_room_hat_story(Config, Alice, Bob) ->
+    RoomJID = jid:from_binary(?config(room_jid, Config)),
+    make_member(RoomJID, Bob, Config),
+    enter_room_and_flush(RoomJID, [{Alice, <<"ali">>}, {Bob, <<"bobek">>}]),
+    assert_success(?SET_ROOM_HAT_PATH, set_room_hat(RoomJID, ?HOST_HAT, <<"Host">>, null, Config)),
+    assert_success(?ASSIGN_ROOM_HAT_PATH, assign_room_hat(RoomJID, Bob, ?HOST_HAT, Config)),
+    [assert_hats(RoomJID, <<"bobek">>, [{?HOST_HAT, <<"Host">>, undefined}], Client)
+     || Client <- [Alice, Bob]],
+    assert_success(?REMOVE_ROOM_HAT_PATH, remove_room_hat(RoomJID, ?HOST_HAT, Config)),
+    [assert_hats(RoomJID, <<"bobek">>, [], Client) || Client <- [Alice, Bob]],
+    ?assertEqual(#{<<"hats">> => [], <<"assignments">> => [], <<"scopedAssignments">> => []},
+                 get_ok_value(?LIST_ROOM_HATS_PATH, list_room_hats(RoomJID, Config))),
+    Res = remove_room_hat(RoomJID, ?HOST_HAT, Config),
+    ?assertNotEqual(nomatch, binary:match(get_err_msg(Res), <<"Hat not found">>)).
+
+admin_room_hats_override_client_hats(Config) ->
+    muc_helper:story_with_room(Config, [], [{alice, 1}, {bob, 1}],
+                               fun admin_room_hats_override_client_hats_story/3).
+
+admin_room_hats_override_client_hats_story(Config, Alice, Bob) ->
+    RoomJID = jid:from_binary(?config(room_jid, Config)),
+    make_member(RoomJID, Bob, Config),
+    enter_room_and_flush(RoomJID, [{Alice, <<"ali">>}, {Bob, <<"bobek">>}]),
+    FakeHats = #xmlel{name = <<"hats">>, attrs = #{<<"xmlns">> => ?NS_HATS},
+                      children = [#xmlel{name = <<"hat">>,
+                                         attrs = #{<<"uri">> => <<"urn:fake">>,
+                                                   <<"title">> => <<"Owner">>}}]},
+    BobRoomJID = jid:to_binary(jid:replace_resource(RoomJID, <<"bobek">>)),
+    escalus:send(Bob, escalus_stanza:to(escalus_stanza:presence(<<"available">>, [FakeHats]),
+                                        BobRoomJID)),
+    %% Clients can't put on hats themselves
+    [assert_hats(RoomJID, <<"bobek">>, [], Client) || Client <- [Alice, Bob]],
+    assert_success(?SET_ROOM_HAT_PATH, set_room_hat(RoomJID, ?HOST_HAT, <<"Host">>, null, Config)),
+    assert_success(?ASSIGN_ROOM_HAT_PATH, assign_room_hat(RoomJID, Bob, ?HOST_HAT, Config)),
+    [assert_hats(RoomJID, <<"bobek">>, [{?HOST_HAT, <<"Host">>, undefined}], Client)
+     || Client <- [Alice, Bob]],
+    escalus:send(Bob, escalus_stanza:to(escalus_stanza:presence(<<"available">>, [FakeHats]),
+                                        BobRoomJID)),
+    [assert_hats(RoomJID, <<"bobek">>, [{?HOST_HAT, <<"Host">>, undefined}], Client)
+     || Client <- [Alice, Bob]].
+
+admin_room_hats_in_disco(Config) ->
+    muc_helper:story_with_room(Config, [], [{alice, 1}], fun admin_room_hats_in_disco_story/2).
+
+admin_room_hats_in_disco_story(Config, Alice) ->
+    RoomJID = ?config(room_jid, Config),
+    escalus:send(Alice, escalus_stanza:disco_info(RoomJID)),
+    Stanza = escalus:wait_for_stanza(Alice),
+    escalus:assert(has_feature, [?NS_HATS], Stanza),
+    %% Scoped hats have their own option
+    ?assertNot(escalus_pred:has_feature(?NS_SCOPED_HATS, Stanza)).
+
+admin_try_assign_nonexistent_room_hat(Config) ->
+    muc_helper:story_with_room(Config, [], [{alice, 1}, {bob, 1}],
+                               fun admin_try_assign_nonexistent_room_hat_story/3).
+
+admin_try_assign_nonexistent_room_hat_story(Config, Alice, Bob) ->
+    RoomJID = jid:from_binary(?config(room_jid, Config)),
+    enter_room_and_flush(RoomJID, [{Alice, <<"ali">>}]),
+    Res = assign_room_hat(RoomJID, Bob, ?HOST_HAT, Config),
+    ?assertNotEqual(nomatch, binary:match(get_err_msg(Res), <<"Hat not found">>)).
+
+admin_try_assign_room_hat_to_unaffiliated_user(Config) ->
+    muc_helper:story_with_room(Config, [], [{alice, 1}, {bob, 1}],
+                               fun admin_try_assign_room_hat_to_unaffiliated_user_story/3).
+
+admin_try_assign_room_hat_to_unaffiliated_user_story(Config, Alice, Bob) ->
+    RoomJID = jid:from_binary(?config(room_jid, Config)),
+    enter_room_and_flush(RoomJID, [{Alice, <<"ali">>}]),
+    assert_success(?SET_ROOM_HAT_PATH, set_room_hat(RoomJID, ?HOST_HAT, <<"Host">>, null, Config)),
+    Res = assign_room_hat(RoomJID, Bob, ?HOST_HAT, Config),
+    ?assertEqual(<<"not_affiliated">>, get_err_code(Res)).
+
+%% Hats are removed with the affiliation, so a recycled username can't inherit them
+admin_room_hats_removed_with_affiliation(Config) ->
+    muc_helper:story_with_room(Config, [], [{alice, 1}, {bob, 1}],
+                               fun admin_room_hats_removed_with_affiliation_story/3).
+
+admin_room_hats_removed_with_affiliation_story(Config, Alice, Bob) ->
+    RoomJID = jid:from_binary(?config(room_jid, Config)),
+    make_member(RoomJID, Bob, Config),
+    enter_room_and_flush(RoomJID, [{Alice, <<"ali">>}]),
+    assert_success(?SET_ROOM_HAT_PATH, set_room_hat(RoomJID, ?HOST_HAT, <<"Host">>, null, Config)),
+    assert_success(?ASSIGN_ROOM_HAT_PATH, assign_room_hat(RoomJID, Bob, ?HOST_HAT, Config)),
+    set_user_affiliation(RoomJID, Bob, none, Config),
+    ?assertMatch(#{<<"assignments">> := []},
+                 get_ok_value(?LIST_ROOM_HATS_PATH, list_room_hats(RoomJID, Config))).
+
+%% Changing the nick must neither drop the hats nor let a client put on its own
+admin_room_hats_kept_on_nick_change(Config) ->
+    muc_helper:story_with_room(Config, [], [{alice, 1}, {bob, 1}],
+                               fun admin_room_hats_kept_on_nick_change_story/3).
+
+admin_room_hats_kept_on_nick_change_story(Config, Alice, Bob) ->
+    RoomJID = jid:from_binary(?config(room_jid, Config)),
+    make_member(RoomJID, Bob, Config),
+    enter_room_and_flush(RoomJID, [{Alice, <<"ali">>}]),
+    FakeHats = #xmlel{name = <<"hats">>, attrs = #{<<"xmlns">> => ?NS_HATS},
+                      children = [#xmlel{name = <<"hat">>,
+                                         attrs = #{<<"uri">> => <<"urn:fake">>,
+                                                   <<"title">> => <<"Owner">>}}]},
+    %% Bob joins with forged hats, then changes his nick
+    MucX = #xmlel{name = <<"x">>, attrs = #{<<"xmlns">> => <<"http://jabber.org/protocol/muc">>}},
+    escalus:send(Bob, escalus_stanza:to(escalus_stanza:presence(<<"available">>, [MucX, FakeHats]),
+                                        jid:to_binary(jid:replace_resource(RoomJID, <<"bobek">>)))),
+    Joined = escalus:wait_for_stanza(Alice),
+    ?assertEqual([], exml_query:subelements_with_ns(Joined, ?NS_HATS)),
+    escalus_client:wait_for_stanzas(Bob, 10, 500),
+    escalus:send(Bob, escalus_stanza:to(escalus_stanza:presence(<<"available">>),
+                                        jid:to_binary(jid:replace_resource(RoomJID, <<"robert">>)))),
+    [_Unavailable, Available] = escalus:wait_for_stanzas(Alice, 2),
+    ?assertEqual([], exml_query:subelements_with_ns(Available, ?NS_HATS)),
+    escalus:wait_for_stanzas(Bob, 2),
+    %% With a hat assigned, the new nick wears it
+    assert_success(?SET_ROOM_HAT_PATH, set_room_hat(RoomJID, ?HOST_HAT, <<"Host">>, -0.0, Config)),
+    assert_success(?ASSIGN_ROOM_HAT_PATH, assign_room_hat(RoomJID, Bob, ?HOST_HAT, Config)),
+    [assert_hats(RoomJID, <<"robert">>, [{?HOST_HAT, <<"Host">>, <<"0.0">>}], Client)
+     || Client <- [Alice, Bob]],
+    escalus:send(Bob, escalus_stanza:to(escalus_stanza:presence(<<"available">>),
+                                        jid:to_binary(jid:replace_resource(RoomJID, <<"bob">>)))),
+    [_, Available2] = escalus:wait_for_stanzas(Alice, 2),
+    ?assertEqual([?HOST_HAT], [exml_query:attr(Hat, <<"uri">>)
+                               || Hat <- exml_query:paths(Available2, [{element_with_ns, <<"hats">>, ?NS_HATS},
+                                                                      {element, <<"hat">>}])]).
+
+admin_try_assign_scoped_room_hat_scoped_hats_disabled(Config) ->
+    muc_helper:story_with_room(Config, [], [{alice, 1}, {bob, 1}, {kate, 1}],
+                               fun admin_try_assign_scoped_room_hat_scoped_hats_disabled_story/4).
+
+admin_try_assign_scoped_room_hat_scoped_hats_disabled_story(Config, Alice, Bob, Kate) ->
+    RoomJID = jid:from_binary(?config(room_jid, Config)),
+    make_member(RoomJID, Bob, Config),
+    make_member(RoomJID, Kate, Config),
+    enter_room_and_flush(RoomJID, [{Alice, <<"ali">>}]),
+    assert_success(?SET_ROOM_HAT_PATH, set_room_hat(RoomJID, ?MATCH_HAT, <<"Match">>, null, Config)),
+    Res = assign_scoped_room_hat(RoomJID, Bob, ?MATCH_HAT, [Kate], true, Config),
+    ?assertNotEqual(nomatch, binary:match(get_err_msg(Res), <<"Scoped hats are not enabled">>)),
+    Res2 = unassign_scoped_room_hat(RoomJID, Bob, ?MATCH_HAT, null, false, Config),
+    ?assertNotEqual(nomatch, binary:match(get_err_msg(Res2), <<"Scoped hats are not enabled">>)).
+
+%% Scoped hats (an extension of XEP-0317, see doc/open-extensions/scoped-hats.md)
+
+%% A mutual hat with an audience of one is pairwise: Bob and Kate see it on each other,
+%% and Alice sees nothing at all, not even a presence update
+admin_assign_pairwise_room_hat(Config) ->
+    muc_helper:story_with_room(Config, [], [{alice, 1}, {bob, 1}, {kate, 1}],
+                               fun admin_assign_pairwise_room_hat_story/4).
+
+admin_assign_pairwise_room_hat_story(Config, Alice, Bob, Kate) ->
+    RoomJID = jid:from_binary(?config(room_jid, Config)),
+    make_member(RoomJID, Bob, Config),
+    make_member(RoomJID, Kate, Config),
+    enter_room_and_flush(RoomJID, [{Alice, <<"ali">>}, {Bob, <<"bobek">>}, {Kate, <<"kate">>}]),
+    assert_success(?SET_ROOM_HAT_PATH, set_room_hat(RoomJID, ?MATCH_HAT, <<"Match">>, 300, Config)),
+    Res = assign_scoped_room_hat(RoomJID, Bob, ?MATCH_HAT, [Kate], true, Config),
+    assert_success(?ASSIGN_SCOPED_ROOM_HAT_PATH, Res),
+    assert_scoped_hats(RoomJID, <<"bobek">>, [{?MATCH_HAT, <<"Match">>, <<"300.0">>}], Kate),
+    assert_scoped_hats(RoomJID, <<"kate">>, [{?MATCH_HAT, <<"Match">>, <<"300.0">>}], Bob),
+    escalus_assert:has_no_stanzas(Alice),
+    escalus_assert:has_no_stanzas(Bob),
+    escalus_assert:has_no_stanzas(Kate),
+    BobJID = user_to_lower_bin(Bob),
+    KateJID = user_to_lower_bin(Kate),
+    ?assertEqual(lists:sort([#{<<"jid">> => BobJID, <<"viewer">> => KateJID,
+                               <<"hats">> => [?MATCH_HAT]},
+                             #{<<"jid">> => KateJID, <<"viewer">> => BobJID,
+                               <<"hats">> => [?MATCH_HAT]}]),
+                 lists:sort(get_scoped_assignments(RoomJID, Config))),
+    %% Scoped hats are not room-wide hats
+    ?assertMatch(#{<<"assignments">> := []},
+                 get_ok_value(?LIST_ROOM_HATS_PATH, list_room_hats(RoomJID, Config))).
+
+%% Occupants who join later get the hat only if they are in its audience
+admin_scoped_room_hat_shown_to_audience_on_join(Config) ->
+    muc_helper:story_with_room(Config, [], [{alice, 1}, {bob, 1}, {kate, 1}],
+                               fun admin_scoped_room_hat_shown_to_audience_on_join_story/4).
+
+admin_scoped_room_hat_shown_to_audience_on_join_story(Config, Alice, Bob, Kate) ->
+    RoomJID = jid:from_binary(?config(room_jid, Config)),
+    make_member(RoomJID, Bob, Config),
+    make_member(RoomJID, Kate, Config),
+    assert_success(?SET_ROOM_HAT_PATH, set_room_hat(RoomJID, ?MATCH_HAT, <<"Match">>, null, Config)),
+    %% Not mutual: only Bob wears the hat, for Kate
+    assert_success(?ASSIGN_SCOPED_ROOM_HAT_PATH,
+                   assign_scoped_room_hat(RoomJID, Bob, ?MATCH_HAT, [Kate], false, Config)),
+    BobSelf = enter_room_and_collect(RoomJID, Bob, <<"bobek">>),
+    %% Nobody is in the audience of their own hats
+    ?assertEqual([], scoped_hats(presence_from(RoomJID, <<"bobek">>, BobSelf))),
+    KateGot = enter_room_and_collect(RoomJID, Kate, <<"kate">>),
+    ?assertEqual([{?MATCH_HAT, <<"Match">>, undefined}],
+                 scoped_hats(presence_from(RoomJID, <<"bobek">>, KateGot))),
+    BobGot = escalus_client:wait_for_stanzas(Bob, 10, 500),
+    ?assertEqual([], scoped_hats(presence_from(RoomJID, <<"kate">>, BobGot))),
+    AliceGot = enter_room_and_collect(RoomJID, Alice, <<"ali">>),
+    BobPresence = presence_from(RoomJID, <<"bobek">>, AliceGot),
+    ?assertEqual([], scoped_hats(BobPresence)),
+    ?assertEqual([], exml_query:subelements_with_ns(BobPresence, ?NS_SCOPED_HATS)).
+
+admin_unassign_scoped_room_hat(Config) ->
+    muc_helper:story_with_room(Config, [], [{alice, 1}, {bob, 1}, {kate, 1}],
+                               fun admin_unassign_scoped_room_hat_story/4).
+
+admin_unassign_scoped_room_hat_story(Config, Alice, Bob, Kate) ->
+    RoomJID = jid:from_binary(?config(room_jid, Config)),
+    make_member(RoomJID, Bob, Config),
+    make_member(RoomJID, Kate, Config),
+    enter_room_and_flush(RoomJID, [{Alice, <<"ali">>}, {Bob, <<"bobek">>}, {Kate, <<"kate">>}]),
+    assert_success(?SET_ROOM_HAT_PATH, set_room_hat(RoomJID, ?MATCH_HAT, <<"Match">>, null, Config)),
+    assert_success(?ASSIGN_SCOPED_ROOM_HAT_PATH,
+                   assign_scoped_room_hat(RoomJID, Bob, ?MATCH_HAT, [Kate], true, Config)),
+    assert_scoped_hats(RoomJID, <<"bobek">>, [{?MATCH_HAT, <<"Match">>, undefined}], Kate),
+    assert_scoped_hats(RoomJID, <<"kate">>, [{?MATCH_HAT, <<"Match">>, undefined}], Bob),
+    %% Without an audience, the hat is taken off for everyone, and mutual takes Kate's off too
+    Res = unassign_scoped_room_hat(RoomJID, Bob, ?MATCH_HAT, null, true, Config),
+    assert_success(?UNASSIGN_SCOPED_ROOM_HAT_PATH, Res),
+    assert_scoped_hats(RoomJID, <<"bobek">>, [], Kate),
+    assert_scoped_hats(RoomJID, <<"kate">>, [], Bob),
+    escalus_assert:has_no_stanzas(Alice),
+    ?assertEqual([], get_scoped_assignments(RoomJID, Config)),
+    Res2 = unassign_scoped_room_hat(RoomJID, Bob, ?MATCH_HAT, null, true, Config),
+    ?assertNotEqual(nomatch, binary:match(get_err_msg(Res2), <<"Hat not found">>)).
+
+admin_unassign_scoped_room_hat_for_one_viewer(Config) ->
+    muc_helper:story_with_room(Config, [], [{alice, 1}, {bob, 1}, {kate, 1}],
+                               fun admin_unassign_scoped_room_hat_for_one_viewer_story/4).
+
+admin_unassign_scoped_room_hat_for_one_viewer_story(Config, Alice, Bob, Kate) ->
+    RoomJID = jid:from_binary(?config(room_jid, Config)),
+    make_member(RoomJID, Bob, Config),
+    make_member(RoomJID, Kate, Config),
+    enter_room_and_flush(RoomJID, [{Alice, <<"ali">>}, {Bob, <<"bobek">>}, {Kate, <<"kate">>}]),
+    assert_success(?SET_ROOM_HAT_PATH, set_room_hat(RoomJID, ?MATCH_HAT, <<"Match">>, null, Config)),
+    %% Bob shows the hat to both Alice (the owner) and Kate
+    assert_success(?ASSIGN_SCOPED_ROOM_HAT_PATH,
+                   assign_scoped_room_hat(RoomJID, Bob, ?MATCH_HAT, [Alice, Kate], false, Config)),
+    [assert_scoped_hats(RoomJID, <<"bobek">>, [{?MATCH_HAT, <<"Match">>, undefined}], Client)
+     || Client <- [Alice, Kate]],
+    escalus_assert:has_no_stanzas(Bob),
+    assert_success(?UNASSIGN_SCOPED_ROOM_HAT_PATH,
+                   unassign_scoped_room_hat(RoomJID, Bob, ?MATCH_HAT, [Kate], false, Config)),
+    assert_scoped_hats(RoomJID, <<"bobek">>, [], Kate),
+    escalus_assert:has_no_stanzas(Alice),
+    escalus_assert:has_no_stanzas(Bob),
+    ?assertEqual([#{<<"jid">> => user_to_lower_bin(Bob), <<"viewer">> => user_to_lower_bin(Alice),
+                    <<"hats">> => [?MATCH_HAT]}],
+                 get_scoped_assignments(RoomJID, Config)).
+
+admin_scoped_room_hat_not_repeated_when_worn_room_wide(Config) ->
+    muc_helper:story_with_room(Config, [], [{alice, 1}, {bob, 1}, {kate, 1}],
+                               fun admin_scoped_room_hat_not_repeated_when_worn_room_wide_story/4).
+
+admin_scoped_room_hat_not_repeated_when_worn_room_wide_story(Config, Alice, Bob, Kate) ->
+    RoomJID = jid:from_binary(?config(room_jid, Config)),
+    make_member(RoomJID, Bob, Config),
+    make_member(RoomJID, Kate, Config),
+    enter_room_and_flush(RoomJID, [{Alice, <<"ali">>}, {Bob, <<"bobek">>}, {Kate, <<"kate">>}]),
+    assert_success(?SET_ROOM_HAT_PATH, set_room_hat(RoomJID, ?HOST_HAT, <<"Host">>, null, Config)),
+    assert_success(?SET_ROOM_HAT_PATH, set_room_hat(RoomJID, ?MATCH_HAT, <<"Match">>, null, Config)),
+    assert_success(?ASSIGN_ROOM_HAT_PATH, assign_room_hat(RoomJID, Bob, ?HOST_HAT, Config)),
+    [assert_hats(RoomJID, <<"bobek">>, [{?HOST_HAT, <<"Host">>, undefined}], Client)
+     || Client <- [Alice, Bob, Kate]],
+    assert_success(?ASSIGN_SCOPED_ROOM_HAT_PATH,
+                   assign_scoped_room_hat(RoomJID, Bob, ?HOST_HAT, [Kate], false, Config)),
+    assert_success(?ASSIGN_SCOPED_ROOM_HAT_PATH,
+                   assign_scoped_room_hat(RoomJID, Bob, ?MATCH_HAT, [Kate], false, Config)),
+    [_, Presence] = escalus:wait_for_stanzas(Kate, 2),
+    ?assertEqual([{?HOST_HAT, <<"Host">>, undefined}], room_hats(Presence)),
+    ?assertEqual([{?MATCH_HAT, <<"Match">>, undefined}], scoped_hats(Presence)),
+    escalus_assert:has_no_stanzas(Alice).
+
+admin_remove_room_hat_removes_scoped_assignments(Config) ->
+    muc_helper:story_with_room(Config, [], [{alice, 1}, {bob, 1}, {kate, 1}],
+                               fun admin_remove_room_hat_removes_scoped_assignments_story/4).
+
+admin_remove_room_hat_removes_scoped_assignments_story(Config, Alice, Bob, Kate) ->
+    RoomJID = jid:from_binary(?config(room_jid, Config)),
+    make_member(RoomJID, Bob, Config),
+    make_member(RoomJID, Kate, Config),
+    enter_room_and_flush(RoomJID, [{Alice, <<"ali">>}, {Bob, <<"bobek">>}, {Kate, <<"kate">>}]),
+    assert_success(?SET_ROOM_HAT_PATH, set_room_hat(RoomJID, ?MATCH_HAT, <<"Match">>, null, Config)),
+    assert_success(?ASSIGN_SCOPED_ROOM_HAT_PATH,
+                   assign_scoped_room_hat(RoomJID, Bob, ?MATCH_HAT, [Kate], false, Config)),
+    assert_scoped_hats(RoomJID, <<"bobek">>, [{?MATCH_HAT, <<"Match">>, undefined}], Kate),
+    %% Renaming the hat updates only its audience
+    assert_success(?SET_ROOM_HAT_PATH, set_room_hat(RoomJID, ?MATCH_HAT, <<"Crush">>, null, Config)),
+    assert_scoped_hats(RoomJID, <<"bobek">>, [{?MATCH_HAT, <<"Crush">>, undefined}], Kate),
+    escalus_assert:has_no_stanzas(Alice),
+    assert_success(?REMOVE_ROOM_HAT_PATH, remove_room_hat(RoomJID, ?MATCH_HAT, Config)),
+    assert_scoped_hats(RoomJID, <<"bobek">>, [], Kate),
+    escalus_assert:has_no_stanzas(Alice),
+    escalus_assert:has_no_stanzas(Bob),
+    ?assertEqual([], get_scoped_assignments(RoomJID, Config)).
+
+%% Scoped hats go with the affiliation of either the wearer or the viewer
+admin_scoped_room_hats_removed_with_affiliation(Config) ->
+    muc_helper:story_with_room(Config, [], [{alice, 1}, {bob, 1}, {kate, 1}],
+                               fun admin_scoped_room_hats_removed_with_affiliation_story/4).
+
+admin_scoped_room_hats_removed_with_affiliation_story(Config, Alice, Bob, Kate) ->
+    RoomJID = jid:from_binary(?config(room_jid, Config)),
+    make_member(RoomJID, Bob, Config),
+    make_member(RoomJID, Kate, Config),
+    enter_room_and_flush(RoomJID, [{Alice, <<"ali">>}]),
+    assert_success(?SET_ROOM_HAT_PATH, set_room_hat(RoomJID, ?MATCH_HAT, <<"Match">>, null, Config)),
+    assert_success(?ASSIGN_SCOPED_ROOM_HAT_PATH,
+                   assign_scoped_room_hat(RoomJID, Bob, ?MATCH_HAT, [Kate], true, Config)),
+    ?assertMatch([_, _], get_scoped_assignments(RoomJID, Config)),
+    assert_success(?SET_AFFILIATION_PATH, set_user_affiliation(RoomJID, Kate, none, Config)),
+    ?assertEqual([], get_scoped_assignments(RoomJID, Config)),
+    %% An unaffiliated user can't be in the audience either
+    Res = assign_scoped_room_hat(RoomJID, Bob, ?MATCH_HAT, [Kate], false, Config),
+    ?assertEqual(<<"not_affiliated">>, get_err_code(Res)).
+
+%% Clients can't put on scoped hats themselves, even for one viewer
+admin_scoped_room_hats_override_client_hats(Config) ->
+    muc_helper:story_with_room(Config, [], [{alice, 1}, {bob, 1}],
+                               fun admin_scoped_room_hats_override_client_hats_story/3).
+
+admin_scoped_room_hats_override_client_hats_story(Config, Alice, Bob) ->
+    RoomJID = jid:from_binary(?config(room_jid, Config)),
+    make_member(RoomJID, Bob, Config),
+    enter_room_and_flush(RoomJID, [{Alice, <<"ali">>}]),
+    FakeHats = #xmlel{name = <<"scoped-hats">>, attrs = #{<<"xmlns">> => ?NS_SCOPED_HATS},
+                      children = [#xmlel{name = <<"hat">>,
+                                         attrs = #{<<"uri">> => <<"urn:fake">>,
+                                                   <<"title">> => <<"Owner">>}}]},
+    MucX = #xmlel{name = <<"x">>, attrs = #{<<"xmlns">> => <<"http://jabber.org/protocol/muc">>}},
+    escalus:send(Bob, escalus_stanza:to(escalus_stanza:presence(<<"available">>, [MucX, FakeHats]),
+                                        jid:to_binary(jid:replace_resource(RoomJID, <<"bobek">>)))),
+    Joined = escalus:wait_for_stanza(Alice),
+    ?assertEqual([], exml_query:subelements_with_ns(Joined, ?NS_SCOPED_HATS)).
+
+admin_scoped_room_hats_in_disco(Config) ->
+    muc_helper:story_with_room(Config, [], [{alice, 1}], fun admin_scoped_room_hats_in_disco_story/2).
+
+admin_scoped_room_hats_in_disco_story(Config, Alice) ->
+    RoomJID = ?config(room_jid, Config),
+    escalus:send(Alice, escalus_stanza:disco_info(RoomJID)),
+    Stanza = escalus:wait_for_stanza(Alice),
+    escalus:assert(has_feature, [?NS_HATS], Stanza),
+    escalus:assert(has_feature, [?NS_SCOPED_HATS], Stanza).
+
+admin_try_assign_scoped_room_hat_with_invalid_args(Config) ->
+    muc_helper:story_with_room(Config, [], [{alice, 1}, {bob, 1}, {kate, 1}],
+                               fun admin_try_assign_scoped_room_hat_with_invalid_args_story/4).
+
+admin_try_assign_scoped_room_hat_with_invalid_args_story(Config, Alice, Bob, Kate) ->
+    RoomJID = jid:from_binary(?config(room_jid, Config)),
+    make_member(RoomJID, Bob, Config),
+    enter_room_and_flush(RoomJID, [{Alice, <<"ali">>}]),
+    Res1 = assign_scoped_room_hat(RoomJID, Bob, ?MATCH_HAT, [Alice], false, Config),
+    ?assertNotEqual(nomatch, binary:match(get_err_msg(Res1), <<"Hat not found">>)),
+    assert_success(?SET_ROOM_HAT_PATH, set_room_hat(RoomJID, ?MATCH_HAT, <<"Match">>, null, Config)),
+    Res2 = assign_scoped_room_hat(RoomJID, Bob, ?MATCH_HAT, [], false, Config),
+    ?assertNotEqual(nomatch, binary:match(get_err_msg(Res2), <<"audience cannot be empty">>)),
+    Res3 = assign_scoped_room_hat(RoomJID, Bob, ?MATCH_HAT, [Alice, Bob], false, Config),
+    ?assertNotEqual(nomatch, binary:match(get_err_msg(Res3), <<"own hats">>)),
+    %% Kate has no affiliation
+    Res4 = assign_scoped_room_hat(RoomJID, Bob, ?MATCH_HAT, [Kate], false, Config),
+    ?assertEqual(<<"not_affiliated">>, get_err_code(Res4)),
+    ?assertEqual([], get_scoped_assignments(RoomJID, Config)).
+
+make_member(RoomJID, User, Config) ->
+    assert_success(?SET_AFFILIATION_PATH, set_user_affiliation(RoomJID, User, member, Config)).
+
+admin_try_set_room_hat_with_invalid_args(Config) ->
+    muc_helper:story_with_room(Config, [], [{alice, 1}],
+                               fun admin_try_set_room_hat_with_invalid_args_story/2).
+
+admin_try_set_room_hat_with_invalid_args_story(Config, Alice) ->
+    RoomJID = jid:from_binary(?config(room_jid, Config)),
+    enter_room_and_flush(RoomJID, [{Alice, <<"ali">>}]),
+    Res1 = set_room_hat(RoomJID, <<>>, <<"Host">>, null, Config),
+    ?assertNotEqual(nomatch, binary:match(get_err_msg(Res1), <<"URI cannot be empty">>)),
+    Res2 = set_room_hat(RoomJID, ?HOST_HAT, <<>>, null, Config),
+    ?assertNotEqual(nomatch, binary:match(get_err_msg(Res2), <<"title cannot be empty">>)),
+    Res3 = set_room_hat(RoomJID, ?HOST_HAT, <<"Host">>, 360, Config),
+    ?assertNotEqual(nomatch, binary:match(get_err_msg(Res3), <<"less than 360">>)),
+    Res4 = set_room_hat(RoomJID, ?HOST_HAT, <<"Host">>, -1, Config),
+    ?assertNotEqual(nomatch, binary:match(get_err_msg(Res4), <<"less than 360">>)).
+
+admin_try_set_hat_in_nonexistent_room(Config) ->
+    Res = set_room_hat(jid:from_binary(?NONEXISTENT_ROOM2), ?HOST_HAT, <<"Host">>, null, Config),
+    ?assertNotEqual(nomatch, binary:match(get_err_msg(Res), <<"not found">>)),
+    Res2 = list_room_hats(jid:from_binary(?NONEXISTENT_ROOM2), Config),
+    ?assertNotEqual(nomatch, binary:match(get_err_msg(Res2), <<"not found">>)).
+
+admin_try_set_room_hat_hats_disabled(Config) ->
+    muc_helper:story_with_room(Config, [], [{alice, 1}],
+                               fun admin_try_set_room_hat_hats_disabled_story/2).
+
+admin_try_set_room_hat_hats_disabled_story(Config, Alice) ->
+    RoomJID = jid:from_binary(?config(room_jid, Config)),
+    enter_room_and_flush(RoomJID, [{Alice, <<"ali">>}]),
+    Res = set_room_hat(RoomJID, ?HOST_HAT, <<"Host">>, null, Config),
+    ?assertNotEqual(nomatch, binary:match(get_err_msg(Res), <<"not enabled">>)),
+    Res2 = list_room_hats(RoomJID, Config),
+    ?assertNotEqual(nomatch, binary:match(get_err_msg(Res2), <<"not enabled">>)).
+
+admin_set_room_hat_muc_not_configured(Config) ->
+    RoomJID = jid:from_binary(get_room_name()),
+    get_not_loaded(set_room_hat(RoomJID, ?HOST_HAT, <<"Host">>, null, Config)),
+    get_not_loaded(assign_scoped_room_hat(RoomJID, <<"alice@localhost">>, ?HOST_HAT,
+                                          [<<"bob@localhost">>], false, Config)),
+    get_not_loaded(list_room_hats(RoomJID, Config)).
+
+domain_admin_room_hats_no_permission(Config) ->
+    escalus:fresh_story_with_config(Config, [{alice, 1}],
+                                    fun domain_admin_room_hats_no_permission_story/2).
+
+domain_admin_room_hats_no_permission_story(Config, Alice) ->
+    [begin
+         RoomJID = jid:from_binary(Room),
+         get_unauthorized(set_room_hat(RoomJID, ?HOST_HAT, <<"Host">>, null, Config)),
+         get_unauthorized(remove_room_hat(RoomJID, ?HOST_HAT, Config)),
+         get_unauthorized(assign_room_hat(RoomJID, Alice, ?HOST_HAT, Config)),
+         get_unauthorized(unassign_room_hat(RoomJID, Alice, ?HOST_HAT, Config)),
+         get_unauthorized(assign_scoped_room_hat(RoomJID, Alice, ?HOST_HAT, [Alice], false,
+                                                 Config)),
+         get_unauthorized(unassign_scoped_room_hat(RoomJID, Alice, ?HOST_HAT, null, false, Config)),
+         get_unauthorized(list_room_hats(RoomJID, Config))
+     end || Room <- [?NONEXISTENT_ROOM, ?EXTERNAL_DOMAIN_ROOM]].
 
 admin_send_message_to_room(Config) ->
     muc_helper:story_with_room(Config, [], [{alice, 1}, {bob, 1}],
@@ -2077,6 +2631,103 @@ invite_user(Room, Sender, Recipient, Reason, Config) ->
     Vars = #{room => jid:to_binary(Room), sender => user_to_bin(Sender),
              recipient => user_to_bin(Recipient), reason => Reason},
     execute_command(<<"muc">>, <<"inviteUser">>, Vars, Config).
+
+set_room_hat(Room, Uri, Title, Hue, Config) ->
+    Vars = #{room => jid:to_binary(Room), uri => Uri, title => Title, hue => Hue},
+    execute_command(<<"muc">>, <<"setRoomHat">>, Vars, Config).
+
+remove_room_hat(Room, Uri, Config) ->
+    Vars = #{room => jid:to_binary(Room), uri => Uri},
+    execute_command(<<"muc">>, <<"removeRoomHat">>, Vars, Config).
+
+assign_room_hat(Room, User, Uri, Config) ->
+    Vars = #{room => jid:to_binary(Room), user => user_to_bin(User), uri => Uri},
+    execute_command(<<"muc">>, <<"assignRoomHat">>, Vars, Config).
+
+unassign_room_hat(Room, User, Uri, Config) ->
+    Vars = #{room => jid:to_binary(Room), user => user_to_bin(User), uri => Uri},
+    execute_command(<<"muc">>, <<"unassignRoomHat">>, Vars, Config).
+
+list_room_hats(Room, Config) ->
+    Vars = #{room => jid:to_binary(Room)},
+    execute_command(<<"muc">>, <<"listRoomHats">>, Vars, Config).
+
+assign_scoped_room_hat(Room, User, Uri, Audience, Mutual, Config) ->
+    Vars = #{room => jid:to_binary(Room), user => user_to_bin(User), uri => Uri,
+             audience => [user_to_bin(Viewer) || Viewer <- Audience], mutual => Mutual},
+    execute_command(<<"muc">>, <<"assignScopedRoomHat">>, Vars, Config).
+
+unassign_scoped_room_hat(Room, User, Uri, Audience, Mutual, Config) ->
+    AudienceBin = case Audience of
+                      null -> null;
+                      _ -> [user_to_bin(Viewer) || Viewer <- Audience]
+                  end,
+    Vars = #{room => jid:to_binary(Room), user => user_to_bin(User), uri => Uri,
+             audience => AudienceBin, mutual => Mutual},
+    execute_command(<<"muc">>, <<"unassignScopedRoomHat">>, Vars, Config).
+
+get_scoped_assignments(RoomJID, Config) ->
+    #{<<"scopedAssignments">> := Scoped} =
+        get_ok_value(?LIST_ROOM_HATS_PATH, list_room_hats(RoomJID, Config)),
+    Scoped.
+
+user_to_lower_bin(Client) ->
+    escalus_utils:jid_to_lower(escalus_client:short_jid(Client)).
+
+%% Enters the room, and returns everything received while joining
+enter_room_and_collect(RoomJID, Client, Nick) ->
+    MucX = #xmlel{name = <<"x">>, attrs = #{<<"xmlns">> => <<"http://jabber.org/protocol/muc">>}},
+    escalus:send(Client, escalus_stanza:to(escalus_stanza:presence(<<"available">>, [MucX]),
+                                           jid:to_binary(jid:replace_resource(RoomJID, Nick)))),
+    escalus_client:wait_for_stanzas(Client, 10, 500).
+
+presence_from(RoomJID, Nick, Stanzas) ->
+    From = jid:to_binary(jid:replace_resource(RoomJID, Nick)),
+    [Presence] = [S || S = #xmlel{name = <<"presence">>} <- Stanzas,
+                       exml_query:attr(S, <<"from">>) =:= From],
+    Presence.
+
+room_hats(Presence) ->
+    hats_in(Presence, <<"hats">>, ?NS_HATS).
+
+scoped_hats(Presence) ->
+    hats_in(Presence, <<"scoped-hats">>, ?NS_SCOPED_HATS).
+
+hats_in(Presence, Name, NS) ->
+    [{exml_query:attr(Hat, <<"uri">>), exml_query:attr(Hat, <<"title">>),
+      exml_query:attr(Hat, <<"hue">>)}
+     || Hat <- exml_query:paths(Presence, [{element_with_ns, Name, NS}, {element, <<"hat">>}])].
+
+%% Waits for the presence of Nick sent by the room, and checks the scoped hats it carries
+assert_scoped_hats(RoomJID, Nick, ExpectedHats, Client) ->
+    From = jid:to_binary(jid:replace_resource(RoomJID, Nick)),
+    Presence = escalus:wait_for_stanza(Client),
+    escalus:assert(is_presence, Presence),
+    ?assertEqual(From, exml_query:attr(Presence, <<"from">>)),
+    ?assertEqual(ExpectedHats, scoped_hats(Presence)),
+    ?assertEqual(length(exml_query:subelements_with_name_and_ns(Presence, <<"scoped-hats">>,
+                                                                ?NS_SCOPED_HATS)),
+                 min(1, length(ExpectedHats))).
+
+%% Enters the room with each client in turn, and drops the presences and subject they receive
+enter_room_and_flush(RoomJID, ClientsAndNicks) ->
+    [enter_room(RoomJID, Client, Nick) || {Client, Nick} <- ClientsAndNicks],
+    [escalus_client:wait_for_stanzas(Client, 10, 500) || {Client, _} <- ClientsAndNicks],
+    ok.
+
+%% Waits for the presence of Nick broadcast by the room, and checks the hats it carries
+assert_hats(RoomJID, Nick, ExpectedHats, Client) ->
+    From = jid:to_binary(jid:replace_resource(RoomJID, Nick)),
+    Presence = escalus:wait_for_stanza(Client),
+    escalus:assert(is_presence, Presence),
+    ?assertEqual(From, exml_query:attr(Presence, <<"from">>)),
+    Hats = [{exml_query:attr(Hat, <<"uri">>), exml_query:attr(Hat, <<"title">>),
+             exml_query:attr(Hat, <<"hue">>)}
+            || Hat <- exml_query:paths(Presence, [{element_with_ns, <<"hats">>, ?NS_HATS},
+                                                  {element, <<"hat">>}])],
+    ?assertEqual(ExpectedHats, Hats),
+    ?assertEqual(length(exml_query:subelements_with_name_and_ns(Presence, <<"hats">>, ?NS_HATS)),
+                 min(1, length(ExpectedHats))).
 
 kick_user(Room, Nick, Reason, Config) ->
     Vars = #{room => jid:to_binary(Room), nick => Nick, reason => Reason},
