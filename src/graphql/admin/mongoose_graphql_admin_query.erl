@@ -9,6 +9,8 @@
 
 execute(_Ctx, _Obj, <<"account">>, _Args) ->
     {ok, account};
+execute(_Ctx, _Obj, <<"blocking">>, _Args) ->
+    {ok, blocking};
 execute(_Ctx, _Obj, <<"blocklist">>, _Args) ->
     {ok, blocklist};
 execute(_Ctx, _Obj, <<"checkAuth">>, _Args) ->

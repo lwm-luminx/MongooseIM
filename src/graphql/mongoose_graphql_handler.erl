@@ -368,7 +368,7 @@ allowed_categories() ->
     [<<"checkAuth">>, <<"account">>, <<"domain">>, <<"last">>, <<"mam">>, <<"muc">>, <<"muc_light">>,
      <<"session">>, <<"stanza">>, <<"roster">>, <<"vcard">>, <<"private">>, <<"metric">>,
      <<"stat">>, <<"gdpr">>, <<"mnesia">>, <<"server">>, <<"inbox">>, <<"http_upload">>,
-     <<"offline">>, <<"token">>, <<"cets">>, <<"broadcast">>, <<"blocklist">>].
+     <<"offline">>, <<"token">>, <<"cets">>, <<"broadcast">>, <<"blocklist">>, <<"blocking">>].
 
 -spec check_password(jid:jid() | error, binary()) -> {true, mongoose_credentials:t()} | false.
 -ifdef(TEST).
