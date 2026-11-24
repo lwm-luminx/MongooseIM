@@ -18,6 +18,7 @@
          send_private_message/4,
          kick_user_from_room/3,
          kick_user_from_room/4,
+         moderate_message/3,
          set_affiliation/3,
          set_affiliation/4,
          enter_room/3,
@@ -257,6 +258,18 @@ kick_user_from_room(RoomJID, UserJID, Nick, ReasonIn) ->
             ?MODERATOR_RES_NOT_FOUND_RESULT;
         {ok, SenderJID} ->
             kick_user_from_room_raw(RoomJID, SenderJID, Nick, ReasonIn);
+        {error, not_found} ->
+            ?ROOM_NOT_FOUND_RESULT
+    end.
+
+-spec moderate_message(jid:jid(), binary(), binary() | undefined) ->
+    {ok | room_not_found | message_not_found, iolist()}.
+moderate_message(RoomJID, StanzaID, Reason) ->
+    case mod_muc_room:moderate_message(RoomJID, StanzaID, Reason) of
+        ok ->
+            {ok, "Message retracted successfully"};
+        {error, item_not_found} ->
+            {message_not_found, "Message not found in the room archive"};
         {error, not_found} ->
             ?ROOM_NOT_FOUND_RESULT
     end.

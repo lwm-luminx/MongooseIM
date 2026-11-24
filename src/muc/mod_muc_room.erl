@@ -42,6 +42,7 @@
          change_room_config/2,
          delete_room/2,
          remove_user/3,
+         moderate_message/3,
          is_room_owner/2,
          can_access_room/2,
          can_access_identity/2]).
@@ -167,6 +168,14 @@
        }.
 -export_type([update_inbox_for_muc_payload/0]).
 
+-type moderate_message_params() :: #{
+        room_jid := jid:jid(),
+        stanza_id := binary(),
+        by := jid:jid(),
+        reason := binary() | undefined
+       }.
+-export_type([moderate_message_params/0]).
+
 -define(MAX_USERS_DEFAULT_LIST,
         [5, 10, 20, 30, 50, 100, 200, 500, 1000, 2000, 5000]).
 
@@ -281,6 +290,40 @@ delete_room(RoomJID, ReasonIn) ->
             gen_fsm_compat:send_all_state_event(Pid, {destroy, ReasonIn});
         {error, Reason} ->
             {error, Reason}
+    end.
+
+%% @doc Retracts a message from a room on behalf of the room itself (XEP-0425).
+%% The message is replaced in the room archive with a tombstone, removed from the room
+%% history, and the retraction is broadcast to the occupants.
+%% A persistent room that is not running only has its archive updated.
+-spec moderate_message(jid:jid(), binary(), binary() | undefined) ->
+    ok | {error, not_found | item_not_found}.
+moderate_message(RoomJID, StanzaID, Reason) ->
+    case mod_muc:room_jid_to_pid(RoomJID) of
+        {ok, Pid} ->
+            gen_fsm_compat:sync_send_all_state_event(Pid, {moderate_message, StanzaID, Reason});
+        {error, not_found} ->
+            moderate_message_in_stopped_room(RoomJID, StanzaID, Reason)
+    end.
+
+moderate_message_in_stopped_room(RoomJID = #jid{luser = Room, lserver = MucHost},
+                                 StanzaID, Reason) ->
+    case mongoose_domain_api:get_subdomain_host_type(MucHost) of
+        {ok, HostType} ->
+            case mod_muc:restore_room(HostType, MucHost, Room) of
+                {ok, _} ->
+                    Params = #{room_jid => RoomJID, stanza_id => StanzaID,
+                               by => RoomJID, reason => Reason},
+                    %% Without an archive that supports it, there is nothing to moderate
+                    case moderate_archived_message(HostType, Params) of
+                        ok -> ok;
+                        {error, _} -> {error, item_not_found}
+                    end;
+                _ ->
+                    {error, not_found}
+            end;
+        _ ->
+            {error, not_found}
     end.
 
 -spec remove_user(jid:jid(), jid:luser(), jid:lserver()) -> ok | {error, not_found}.
@@ -749,6 +792,9 @@ handle_sync_event({can_access_identity, UserJID}, _From, StateName, StateData) -
 handle_sync_event({change_config, Config}, _From, StateName, StateData) ->
     {result, [], NSD} = change_config(Config, StateData),
     reply_with_timeout({ok, NSD#state.config}, StateName, NSD);
+handle_sync_event({moderate_message, StanzaID, Reason}, _From, StateName, StateData) ->
+    {Reply, NSD} = moderate_message(StateData#state.jid, StanzaID, Reason, StateData),
+    reply_with_timeout(Reply, StateName, NSD);
 handle_sync_event({hats, Event}, _From, StateName, StateData) ->
     {Reply, NewStateData} = case is_hats_enabled(StateData) of
                                 true -> handle_hats_event(Event, StateData);
@@ -995,7 +1041,7 @@ can_send_broadcasts(Role, StateData) ->
 
 broadcast_room_packet(From, FromNick, Role, RMess, StateData) ->
     #routed_message{packet = Packet0, stable_stanza_id = StableID} = RMess,
-    Packet = set_occupant_id(From, Packet0, StateData),
+    Packet = set_occupant_id(From, strip_moderation_elements(Packet0), StateData),
     TS = erlang:system_time(microsecond),
     Affiliation = get_affiliation(From, StateData),
     EventData = #{from_nick => FromNick, from_jid => From,
@@ -2615,6 +2661,157 @@ presence(<<"unavailable">> = Type, Children) ->
 
 
 %%%----------------------------------------------------------------------
+%%% Message moderation (XEP-0425)
+
+-spec process_iq_moderate(jid:jid(), exml:element(), state()) ->
+    {ok | {error, exml:element()}, state()}.
+process_iq_moderate(From, SubEl, StateData) ->
+    case is_user_moderator(From, StateData) of
+        true ->
+            case parse_moderate_request(SubEl) of
+                {ok, StanzaID, Reason} ->
+                    {FromNick, _Role} = get_participant_data(From, StateData),
+                    ByJID = jid:replace_resource(StateData#state.jid, FromNick),
+                    case moderate_message(ByJID, StanzaID, Reason, StateData) of
+                        {ok, NewStateData} ->
+                            {ok, NewStateData};
+                        {{error, item_not_found}, NewStateData} ->
+                            ErrText = <<"Message not found in this room">>,
+                            {{error, mongoose_xmpp_errors:item_not_found(ErrText)}, NewStateData}
+                    end;
+                {error, ErrText} ->
+                    {{error, mongoose_xmpp_errors:bad_request(ErrText)}, StateData}
+            end;
+        false ->
+            ErrText = <<"Only moderators are allowed to retract messages of other occupants">>,
+            {{error, mongoose_xmpp_errors:forbidden(ErrText)}, StateData}
+    end.
+
+-spec parse_moderate_request(exml:element()) ->
+    {ok, StanzaID :: binary(), Reason :: binary() | undefined} | {error, binary()}.
+parse_moderate_request(SubEl) ->
+    StanzaID = exml_query:attr(SubEl, <<"id">>, <<>>),
+    Retract = exml_query:path(SubEl, [{element_with_ns, <<"retract">>, ?NS_RETRACT_1}]),
+    Reason = exml_query:path(SubEl, [{element, <<"reason">>}, cdata]),
+    case {StanzaID, Retract} of
+        {<<>>, _} -> {error, <<"Missing stanza ID of the message to retract">>};
+        {_, undefined} -> {error, <<"Missing retract element">>};
+        _ -> {ok, StanzaID, Reason}
+    end.
+
+-spec moderate_message(jid:jid(), binary(), binary() | undefined, state()) ->
+    {ok | {error, item_not_found}, state()}.
+moderate_message(ByJID, StanzaID, Reason, StateData = #state{host_type = HostType,
+                                                             jid = RoomJID}) ->
+    Params = #{room_jid => RoomJID, stanza_id => StanzaID, by => ByJID, reason => Reason},
+    InHistory = is_message_in_history(StanzaID, StateData),
+    %% A message that is only in the room history (e.g. the room is not archived)
+    %% can still be moderated there
+    case {moderate_archived_message(HostType, Params), InHistory} of
+        {ok, _} ->
+            {ok, apply_moderation(Params, StateData)};
+        {{error, _}, true} ->
+            {ok, apply_moderation(Params, StateData)};
+        {{error, _}, false} ->
+            {{error, item_not_found}, StateData}
+    end.
+
+%% The async writer can still hold the message, so flush it first.
+%% Otherwise the message is not found, and is written unmoderated after the moderation.
+-spec moderate_archived_message(mongooseim:host_type(), moderate_message_params()) ->
+    ok | {error, item_not_found | not_supported}.
+moderate_archived_message(HostType, Params) ->
+    mongoose_hooks:mam_muc_archive_sync(HostType),
+    mongoose_hooks:moderate_room_message(HostType, Params).
+
+-spec apply_moderation(moderate_message_params(), state()) -> state().
+apply_moderation(Params = #{stanza_id := StanzaID, by := ByJID}, StateData) ->
+    ?LOG_INFO(ls(#{what => muc_message_moderated, stanza_id => StanzaID,
+                   moderator => jid:to_binary(ByJID)}, StateData)),
+    broadcast_moderation(Params, StateData),
+    remove_message_from_history(StanzaID, StateData).
+
+%% The moderation message goes through the same hooks as other room messages, so that it is
+%% archived (clients catching up with MAM learn about it) and updates the inbox
+-spec broadcast_moderation(moderate_message_params(), state()) -> ok.
+broadcast_moderation(Params, StateData = #state{jid = RoomJID, host_type = HostType}) ->
+    Packet = moderation_packet(Params),
+    EventData = #{from_nick => <<>>, from_jid => RoomJID, room_jid => RoomJID,
+                  role => moderator, affiliation => owner,
+                  timestamp => erlang:system_time(microsecond)},
+    FilteredPacket = mongoose_hooks:filter_room_packet(HostType, Packet, EventData),
+    run_update_inbox_for_muc_hook(HostType, #{host_type => HostType,
+                                              room_jid => RoomJID,
+                                              from_jid => RoomJID,
+                                              from_room_jid => RoomJID,
+                                              packet => FilteredPacket,
+                                              affiliations_map => StateData#state.affiliations}),
+    maps_foreach(fun(_LJID, #user{jid = JID}) ->
+                         mongoose_router:route(mongoose_acc:new(RoomJID, JID, FilteredPacket, ?LOCATION))
+                 end, StateData#state.users).
+
+-spec moderation_packet(moderate_message_params()) -> exml:element().
+moderation_packet(#{stanza_id := StanzaID, by := ByJID, reason := Reason}) ->
+    Moderated = #xmlel{name = <<"moderated">>,
+                       attrs = #{<<"xmlns">> => ?NS_MESSAGE_MODERATE,
+                                 <<"by">> => jid:to_binary(ByJID)}},
+    ReasonEls = [#xmlel{name = <<"reason">>, children = [#xmlcdata{content = Reason}]}
+                 || is_binary(Reason)],
+    Retract = #xmlel{name = <<"retract">>,
+                     attrs = #{<<"xmlns">> => ?NS_RETRACT_1, <<"id">> => StanzaID},
+                     children = [Moderated | ReasonEls]},
+    %% It has no body, so ask for it to be archived (XEP-0334)
+    Store = #xmlel{name = <<"store">>, attrs = #{<<"xmlns">> => ?NS_HINTS}},
+    #xmlel{name = <<"message">>,
+           attrs = #{<<"type">> => <<"groupchat">>, <<"id">> => mongoose_bin:gen_from_crypto()},
+           children = [Retract, Store]}.
+
+%% Only the room can say that a message was moderated (XEP-0425, section 5), so these elements
+%% are removed from the occupants' messages
+-spec strip_moderation_elements(exml:element()) -> exml:element().
+strip_moderation_elements(Packet = #xmlel{children = Children}) ->
+    Packet#xmlel{children = [Child || Child <- Children, not is_moderation_element(Child)]}.
+
+is_moderation_element(#xmlel{attrs = #{<<"xmlns">> := ?NS_MESSAGE_MODERATE}}) ->
+    true;
+is_moderation_element(#xmlel{name = <<"retracted">>, attrs = #{<<"xmlns">> := ?NS_RETRACT_1}}) ->
+    true;
+is_moderation_element(El = #xmlel{name = <<"retract">>, attrs = #{<<"xmlns">> := ?NS_RETRACT_1}}) ->
+    exml_query:path(El, [{element_with_ns, <<"moderated">>, ?NS_MESSAGE_MODERATE}]) =/= undefined;
+is_moderation_element(_) ->
+    false.
+
+%% Messages can only be moderated by their stanza ID, which room messages get from MUC MAM
+%% or from mod_stanzaid
+-spec moderation_features(state()) -> [mongoose_disco:feature()].
+moderation_features(#state{host_type = HostType, jid = #jid{lserver = MucHost}}) ->
+    case gen_mod:is_loaded(HostType, mod_stanzaid) orelse
+         (gen_mod:is_loaded(HostType, mod_mam_muc)
+          andalso mod_mam_utils:is_mam_muc_enabled(MucHost, HostType)) of
+        true -> [?NS_MESSAGE_MODERATE];
+        false -> []
+    end.
+
+-spec is_message_in_history(binary(), state()) -> boolean().
+is_message_in_history(StanzaID, StateData) ->
+    lists:any(fun(Item) -> is_history_item_with_stanza_id(StanzaID, StateData, Item) end,
+              lqueue_to_list(StateData#state.history)).
+
+-spec remove_message_from_history(binary(), state()) -> state().
+remove_message_from_history(StanzaID, StateData = #state{history = LQ = #lqueue{queue = Q}}) ->
+    Q1 = queue:filter(fun(Item) -> not is_history_item_with_stanza_id(StanzaID, StateData, Item) end,
+                      Q),
+    StateData#state{history = LQ#lqueue{queue = Q1, len = queue:len(Q1)}}.
+
+is_history_item_with_stanza_id(StanzaID, #state{jid = RoomJID}, {_Nick, Packet, _, _, _}) ->
+    RoomBin = jid:to_bare_binary(RoomJID),
+    lists:any(fun(#xmlel{name = <<"stanza-id">>, attrs = Attrs}) ->
+                      maps:get(<<"id">>, Attrs, undefined) =:= StanzaID andalso
+                          maps:get(<<"by">>, Attrs, undefined) =:= RoomBin;
+                 (_) ->
+                      false
+              end, Packet#xmlel.children).
+
 %%% Occupant identifiers (XEP-0421)
 
 -spec occupant_id_features(state()) -> [mongoose_disco:feature()].
@@ -4176,7 +4373,7 @@ process_iq_disco_info(From, get, Lang, StateData) ->
     HostType = StateData#state.host_type,
     IdentityXML = mongoose_disco:identities_to_xml([identity(get_title(StateData))]),
     FeatureXML =  mongoose_disco:get_muc_features(HostType, From, RoomJID, <<>>, Lang,
-                                                  room_features(Config)
+                                                  room_features(Config, StateData)
                                                   ++ occupant_id_features(StateData)
                                                   ++ hats_features(StateData)),
     InfoXML = iq_disco_info_extras(StateData),
@@ -4187,8 +4384,9 @@ identity(Name) ->
       type => <<"text">>,
       name => Name}.
 
--spec room_features(config()) -> [mongoose_disco:feature()].
-room_features(Config) ->
+-spec room_features(config(), state()) -> [mongoose_disco:feature()].
+room_features(Config, StateData) ->
+    moderation_features(StateData) ++
     [?NS_MUC,
      ?NS_MUC_STABLE_ID,
      config_opt_to_feature((Config#config.public),
@@ -4774,6 +4972,16 @@ route_iq(Acc, #routed_iq{iq = #iq{type = Type, xmlns = ?NS_MUC_OWNER, sub_el = S
     from = From} = Routed, StateData) ->
     Res = process_iq_owner(From, Type, SubEl, StateData, normal_state),
     do_route_iq(Acc, Res, Routed, StateData);
+route_iq(Acc, #routed_iq{iq = #iq{type = set, xmlns = ?NS_MESSAGE_MODERATE, sub_el = SubEl} = IQ,
+                         from = From}, StateData) ->
+    {Result, NewStateData} = process_iq_moderate(From, SubEl, StateData),
+    IQRes = case Result of
+                ok -> IQ#iq{type = result, sub_el = []};
+                {error, Error} -> IQ#iq{type = error, sub_el = [SubEl, Error]}
+            end,
+    mongoose_router:route(
+        mongoose_acc:update(StateData#state.jid, From, jlib:iq_to_xml(IQRes), Acc)),
+    {ok, NewStateData};
 route_iq(Acc, #routed_iq{iq = #iq{type = Type, xmlns = ?NS_DISCO_INFO, lang = Lang},
     from = From} = Routed, StateData) ->
     Res = process_iq_disco_info(From, Type, Lang, StateData),

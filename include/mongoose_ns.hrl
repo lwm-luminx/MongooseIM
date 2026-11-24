@@ -119,6 +119,7 @@
 -define(NS_RETRACT,             <<"urn:xmpp:message-retract:0">>).
 -define(NS_RETRACT_TOMBSTONE,   <<"urn:xmpp:message-retract:0#tombstone">>).
 -define(NS_RETRACT_1,           <<"urn:xmpp:message-retract:1">>).
+-define(NS_MESSAGE_MODERATE,    <<"urn:xmpp:message-moderate:1">>).
 -define(NS_RETRACT_1_TOMBSTONE, <<"urn:xmpp:message-retract:1#tombstone">>).
 
 -define(JINGLE_NS, <<"urn:xmpp:jingle:1">>).

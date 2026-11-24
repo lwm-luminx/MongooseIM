@@ -71,6 +71,7 @@
 -define(NS_MUC_REQUEST, <<"http://jabber.org/protocol/muc#request">>).
 -define(NS_MUC_ROOMCONFIG, <<"http://jabber.org/protocol/muc#roomconfig">>).
 -define(NS_MUC_STABLE_ID, <<"http://jabber.org/protocol/muc#stable_id">>).
+-define(NS_MESSAGE_MODERATE, <<"urn:xmpp:message-moderate:1">>).
 
 
 -define(assert_equal(E, V), (
@@ -3649,10 +3650,20 @@ disco_rooms(Config) ->
     end).
 
 disco_info(Config) ->
-    muc_helper:disco_info_story(Config, muc_namespaces()).
+    muc_helper:disco_info_story(Config, muc_namespaces() ++ moderation_namespaces()).
 
 disco_info_with_mam(Config) ->
-    muc_helper:disco_info_story(Config, muc_namespaces() ++ mam_helper:namespaces()).
+    muc_helper:disco_info_story(Config, muc_namespaces() ++ mam_helper:namespaces()
+                                        ++ [?NS_MESSAGE_MODERATE]).
+
+%% Moderation (XEP-0425) needs stanza IDs, from MUC MAM or mod_stanzaid
+moderation_namespaces() ->
+    HostType = domain_helper:host_type(),
+    case lists:any(fun(Mod) -> rpc(mim(), gen_mod, is_loaded, [HostType, Mod]) end,
+                   [mod_mam_muc, mod_stanzaid]) of
+        true -> [?NS_MESSAGE_MODERATE];
+        false -> []
+    end.
 
 muc_namespaces() ->
     [?NS_MUC,
@@ -3881,7 +3892,8 @@ disco_info_locked_room(Config) ->
                      Alice, stanza_to_room(escalus_stanza:iq_get(?NS_DISCO_INFO,[]), RoomName)),
 
         %% THEN receives MUC features
-        Namespaces = [?NS_MUC, ?NS_MUC_STABLE_ID, <<"muc_public">>, <<"muc_temporary">>,
+        Namespaces = [?NS_MUC, ?NS_MUC_STABLE_ID | moderation_namespaces()] ++
+                     [<<"muc_public">>, <<"muc_temporary">>,
                       <<"muc_open">>, <<"muc_semianonymous">>, <<"muc_moderated">>,
                       <<"muc_unsecured">>],
         has_features(Stanza, Namespaces)

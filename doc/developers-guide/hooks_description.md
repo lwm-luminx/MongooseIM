@@ -308,6 +308,7 @@ This is the perfect place to plug in custom security control.
 * message_routed
 * mod_global_distrib_known_recipient
 * mod_global_distrib_unknown_recipient
+* moderate_room_message
 * node_cleanup
 * offline_groupchat_message
 * offline_message
