@@ -27,8 +27,9 @@ type StanzaAdminSubscription @protected{
   A resource that is already in use is not taken over, but a client that binds the same resource
   later takes over the session, which ends the subscription. Kicking the session or removing the user
   ends it too.
+  Presences sent to the session are included when 'presences' is true.
   """
-  subscribeForMessages(caller: JID!, resource: ResourceName): StanzaMap
+  subscribeForMessages(caller: JID!, resource: ResourceName, presences: Boolean = false): StanzaMap
     @protected(type: DOMAIN, args: ["caller"])
   "Subscribe for XMPP traffic"
   subscribeForTraffic(limit: Int!): TraceMap
