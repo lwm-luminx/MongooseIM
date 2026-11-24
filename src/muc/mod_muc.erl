@@ -249,6 +249,7 @@ config_spec() ->
                  <<"http_auth_pool">> => #option{type = atom,
                                                  validate = pool_name},
                  <<"load_permanent_rooms_at_startup">> => #option{type = boolean},
+                 <<"occupant_id">> => #option{type = boolean},
                  <<"hats">> => #option{type = boolean},
                  <<"scoped_hats">> => #option{type = boolean},
                  <<"hibernate_timeout">> => #option{type = int_or_infinity,
@@ -284,6 +285,7 @@ defaults() ->
       <<"max_user_conferences">> => 10,
       <<"http_auth_pool">> => none,
       <<"load_permanent_rooms_at_startup">> => false,
+      <<"occupant_id">> => false,
       <<"hats">> => false,
       <<"scoped_hats">> => false,
       <<"hibernate_timeout">> => timer:seconds(90),
@@ -773,7 +775,7 @@ route_by_type(<<"iq">>, {From, To, Acc, Packet}, #muc_state{} = State) ->
         #iq{type = get, xmlns = ?NS_DISCO_INFO = XMLNS, lang = Lang} = IQ ->
             IdentityXML = mongoose_disco:identities_to_xml([identity()]),
             FeatureXML =  mongoose_disco:get_muc_features(HostType, From, To, <<>>, Lang,
-                                                          features()),
+                                                          features(HostType)),
             InfoXML = mongoose_disco:get_info(HostType, ?MODULE, <<>>, Lang),
             Res = IQ#iq{type = result,
                         sub_el = [#xmlel{name = <<"query">>,
@@ -933,8 +935,16 @@ identity() ->
       type => <<"text">>,
       name => <<"Chatrooms">>}.
 
-features() ->
-    [?NS_DISCO_INFO, ?NS_DISCO_ITEMS, ?NS_MUC, ?NS_MUC_UNIQUE, ?NS_REGISTER, ?NS_RSM, ?NS_VCARD, ?NS_CONFERENCE].
+features(HostType) ->
+    [?NS_DISCO_INFO, ?NS_DISCO_ITEMS, ?NS_MUC, ?NS_MUC_UNIQUE, ?NS_REGISTER, ?NS_RSM, ?NS_VCARD,
+     ?NS_CONFERENCE] ++ occupant_id_features(HostType).
+
+%% Occupant IDs (XEP-0421) are enabled for all rooms, so the service advertises them as well
+occupant_id_features(HostType) ->
+    case gen_mod:get_module_opt(HostType, ?MODULE, occupant_id) of
+        true -> [?NS_OCCUPANT_ID];
+        false -> []
+    end.
 
 %% Disco for rooms
 -spec iq_disco_items(muc_host(), jid:jid(), Rsm :: none | jlib:rsm_in()) -> any().

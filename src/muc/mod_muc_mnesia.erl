@@ -125,6 +125,7 @@ known_room_opt_keys() ->
      subject,
      subject_author,
      affiliations,
+     occupant_id_salt,
      hats,
      hat_assignments,
      scoped_hat_assignments].
